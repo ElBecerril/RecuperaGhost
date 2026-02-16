@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+            artifact: recupe_ghost.exe
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: recupe_ghost-linux
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: recupe_ghost-macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Compilar
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Renombrar binario (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: cp target/${{ matrix.target }}/release/recupe_ghost ${{ matrix.artifact }}
+
+      - name: Renombrar binario (macOS)
+        if: matrix.os == 'macos-latest'
+        run: cp target/${{ matrix.target }}/release/recupe_ghost ${{ matrix.artifact }}
+
+      - name: Renombrar binario (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cp target/${{ matrix.target }}/release/recupe_ghost.exe ${{ matrix.artifact }}
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar artefactos
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Subir binarios al Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/recupe_ghost.exe/recupe_ghost.exe
+            artifacts/recupe_ghost-linux/recupe_ghost-linux
+            artifacts/recupe_ghost-macos/recupe_ghost-macos
