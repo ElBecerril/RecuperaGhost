@@ -4,6 +4,7 @@ use anyhow::Result;
 use colored::Colorize;
 use dialoguer::{Confirm, Input, MultiSelect, Select};
 
+use crate::drives;
 use crate::signatures::FileCategory;
 
 /// Opciones del menú principal
@@ -63,38 +64,57 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     );
     println!();
 
-    // 1. Seleccionar origen
-    println!(
-        "{}",
-        "  Ingresa la ruta del archivo de imagen de disco (.img, .dd, .raw)".bright_yellow()
-    );
-    println!(
-        "{}",
-        "  o la ruta de un disco/partición para escanear:".bright_yellow()
-    );
-    println!(
-        "{}",
-        "  Ejemplos: /dev/sdb1, \\\\.\\PhysicalDrive1, disco.img".bright_black()
-    );
-    println!();
+    // 1. Seleccionar origen con menú inteligente
+    let source_path = match select_source()? {
+        Some(path) => path,
+        None => return Ok(None),
+    };
 
-    let source: String = Input::new()
-        .with_prompt("  📁 Ruta de origen")
-        .interact_text()?;
-
-    let source_path = PathBuf::from(source.trim());
-
-    // Verificar que existe (solo si no es un dispositivo raw)
-    if !source_path.to_string_lossy().starts_with("\\\\.\\")
-        && !source_path.to_string_lossy().starts_with("/dev/")
-        && !source_path.exists()
-    {
+    // Verificar permisos si es un disco físico
+    let src_str = source_path.to_string_lossy();
+    let is_physical = src_str.starts_with("\\\\.\\") || src_str.starts_with("/dev/");
+    if is_physical && !drives::is_admin() {
+        println!();
         println!(
             "{}",
-            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
-                .bright_red()
+            "  ⚠️  No tienes permisos de Administrador.".bright_yellow()
         );
-        return Ok(None);
+        println!(
+            "{}",
+            "     El escaneo de discos físicos requiere permisos elevados.".bright_yellow()
+        );
+        println!();
+        #[cfg(target_os = "windows")]
+        println!(
+            "{}",
+            "  💡 Cierra el programa, haz clic derecho en el .exe".bright_cyan()
+        );
+        #[cfg(target_os = "windows")]
+        println!(
+            "{}",
+            "     y selecciona \"Ejecutar como administrador\".".bright_cyan()
+        );
+        #[cfg(not(target_os = "windows"))]
+        println!(
+            "{}",
+            "  💡 Ejecuta el programa con: sudo ./recupe_ghost".bright_cyan()
+        );
+        println!();
+
+        let retry_options = vec![
+            "🔄 Intentar de todas formas",
+            "↩️  Volver al menú",
+        ];
+
+        let choice = Select::new()
+            .with_prompt("  ¿Qué deseas hacer?")
+            .items(&retry_options)
+            .default(1)
+            .interact()?;
+
+        if choice == 1 {
+            return Ok(None);
+        }
     }
 
     println!();
@@ -187,6 +207,311 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
         output_dir,
         categories,
     }))
+}
+
+/// Menú inteligente para seleccionar la fuente de escaneo.
+/// Presenta 3 opciones: USB/disco externo, archivo de imagen, o ruta manual.
+fn select_source() -> Result<Option<PathBuf>> {
+    let options = vec![
+        "💾 Memoria USB / disco externo",
+        "📁 Archivo de imagen (.img, .dd, .raw)",
+        "🔧 Escribir ruta manualmente",
+    ];
+
+    let selection = Select::new()
+        .with_prompt("  ¿Qué deseas escanear?")
+        .items(&options)
+        .default(0)
+        .interact()?;
+
+    match selection {
+        0 => select_removable_drive(),
+        1 => select_image_file(),
+        2 => select_manual_path(),
+        _ => Ok(None),
+    }
+}
+
+/// Detecta y lista discos removibles (USB, externos) para que el usuario elija.
+fn select_removable_drive() -> Result<Option<PathBuf>> {
+    println!();
+    println!(
+        "{}",
+        "  🔎 Detectando dispositivos...".bright_cyan()
+    );
+
+    // Verificar permisos de administrador en Windows
+    #[cfg(target_os = "windows")]
+    if !drives::is_admin() {
+        println!();
+        println!(
+            "{}",
+            "  ⚠️  Para escanear discos físicos, ejecuta como Administrador"
+                .bright_yellow()
+        );
+        println!(
+            "{}",
+            "     (clic derecho → Ejecutar como administrador)"
+                .bright_yellow()
+        );
+        println!();
+        println!(
+            "{}",
+            "  Intentando detectar dispositivos de todas formas...".bright_black()
+        );
+    }
+
+    let removable = drives::list_removable();
+
+    if removable.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "  😔 No se detectaron memorias USB ni discos externos."
+                .bright_yellow()
+        );
+        println!();
+
+        let fallback_options = vec![
+            "📋 Ver TODOS los discos del sistema",
+            "📁 Buscar archivo de imagen en su lugar",
+            "🔧 Escribir ruta manualmente",
+            "↩️  Volver",
+        ];
+
+        let fallback = Select::new()
+            .with_prompt("  ¿Qué deseas hacer?")
+            .items(&fallback_options)
+            .default(0)
+            .interact()?;
+
+        return match fallback {
+            0 => select_all_drives(),
+            1 => select_image_file(),
+            2 => select_manual_path(),
+            _ => Ok(None),
+        };
+    }
+
+    println!();
+    show_drive_list(&removable)
+}
+
+/// Muestra todos los discos del sistema (fallback cuando no hay removibles).
+fn select_all_drives() -> Result<Option<PathBuf>> {
+    let all_drives = drives::list_drives();
+
+    if all_drives.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "  ❌ No se pudieron detectar discos en el sistema.".bright_red()
+        );
+        println!(
+            "{}",
+            "     Intenta escribir la ruta manualmente.".bright_black()
+        );
+        println!();
+        return select_manual_path();
+    }
+
+    println!();
+    println!(
+        "{}",
+        "  ⚠️  Se muestran TODOS los discos. Ten cuidado de no escanear"
+            .bright_yellow()
+    );
+    println!(
+        "{}",
+        "     el disco del sistema operativo.".bright_yellow()
+    );
+    println!();
+
+    show_drive_list(&all_drives)
+}
+
+/// Muestra una lista de discos para que el usuario seleccione uno.
+fn show_drive_list(drive_list: &[drives::DriveInfo]) -> Result<Option<PathBuf>> {
+    let mut display_items: Vec<String> = drive_list
+        .iter()
+        .map(|d| format!("  {}", d.display_name))
+        .collect();
+    display_items.push("  ↩️  Volver".to_string());
+
+    let selection = Select::new()
+        .with_prompt("  Selecciona el dispositivo")
+        .items(&display_items)
+        .default(0)
+        .interact()?;
+
+    if selection >= drive_list.len() {
+        return Ok(None);
+    }
+
+    let selected = &drive_list[selection];
+    println!(
+        "  ✅ Seleccionado: {}",
+        selected.display_name.bright_green()
+    );
+
+    Ok(Some(PathBuf::from(&selected.path)))
+}
+
+/// Busca archivos de imagen de disco (.img, .dd, .raw) en el directorio actual
+/// y permite al usuario seleccionar uno o escribir la ruta manualmente.
+fn select_image_file() -> Result<Option<PathBuf>> {
+    println!();
+    println!(
+        "{}",
+        "  🔎 Buscando archivos de imagen en el directorio actual..."
+            .bright_cyan()
+    );
+
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut image_files: Vec<PathBuf> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&current_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    if ext_lower == "img" || ext_lower == "dd" || ext_lower == "raw" || ext_lower == "iso" {
+                        image_files.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    if image_files.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "  😔 No se encontraron archivos de imagen (.img, .dd, .raw) en el directorio actual."
+                .bright_yellow()
+        );
+        println!();
+
+        let source: String = Input::new()
+            .with_prompt("  📁 Escribe la ruta del archivo de imagen")
+            .interact_text()?;
+
+        let path = PathBuf::from(source.trim());
+        if !path.exists() {
+            println!(
+                "{}",
+                "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
+                    .bright_red()
+            );
+            return Ok(None);
+        }
+
+        return Ok(Some(path));
+    }
+
+    println!();
+
+    let mut display_items: Vec<String> = image_files
+        .iter()
+        .map(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+            format!("  📄 {} ({})", name, format_file_size(size))
+        })
+        .collect();
+    display_items.push("  ✏️  Escribir ruta manualmente".to_string());
+    display_items.push("  ↩️  Volver".to_string());
+
+    let selection = Select::new()
+        .with_prompt("  Selecciona el archivo de imagen")
+        .items(&display_items)
+        .default(0)
+        .interact()?;
+
+    if selection < image_files.len() {
+        let selected = &image_files[selection];
+        println!(
+            "  ✅ Seleccionado: {}",
+            selected.display().to_string().bright_green()
+        );
+        return Ok(Some(selected.clone()));
+    }
+
+    if selection == image_files.len() {
+        // Escribir ruta manualmente
+        let source: String = Input::new()
+            .with_prompt("  📁 Ruta del archivo de imagen")
+            .interact_text()?;
+
+        let path = PathBuf::from(source.trim());
+        if !path.exists() {
+            println!(
+                "{}",
+                "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
+                    .bright_red()
+            );
+            return Ok(None);
+        }
+
+        return Ok(Some(path));
+    }
+
+    // Volver
+    Ok(None)
+}
+
+/// Permite escribir una ruta manualmente (comportamiento original).
+fn select_manual_path() -> Result<Option<PathBuf>> {
+    println!();
+    println!(
+        "{}",
+        "  Ingresa la ruta del disco, partición o archivo de imagen:".bright_yellow()
+    );
+    println!(
+        "{}",
+        "  Ejemplos: /dev/sdb1, \\\\.\\PhysicalDrive1, disco.img".bright_black()
+    );
+    println!();
+
+    let source: String = Input::new()
+        .with_prompt("  📁 Ruta de origen")
+        .interact_text()?;
+
+    let source_path = PathBuf::from(source.trim());
+
+    // Verificar que existe (solo si no es un dispositivo raw)
+    if !source_path.to_string_lossy().starts_with("\\\\.\\")
+        && !source_path.to_string_lossy().starts_with("/dev/")
+        && !source_path.exists()
+    {
+        println!(
+            "{}",
+            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
+                .bright_red()
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(source_path))
+}
+
+/// Formatea bytes a una cadena legible para archivos.
+fn format_file_size(bytes: u64) -> String {
+    const GB: f64 = 1_073_741_824.0;
+    const MB: f64 = 1_048_576.0;
+    const KB: f64 = 1_024.0;
+
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Pregunta si el usuario quiere recuperar los archivos encontrados
@@ -327,7 +652,7 @@ pub fn show_goodbye() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  ¿Te sirvió Salva Godínez?                     "
+        "  👻 ¿Te sirvió RecupeGhost?                    "
             .bright_white()
             .bold(),
         "║".bright_cyan()
@@ -341,21 +666,21 @@ pub fn show_goodbye() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  Esta herramienta es 100% gratis. Si quieres   "
+        "  RecupeGhost es 100% gratis y open source.     "
             .bright_yellow(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  apoyar su desarrollo, ver mis videos me        "
+        "  Si te ayudó a recuperar tus archivos,         "
             .bright_yellow(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  ayuda muchísimo.                               "
+        "  apóyanos viendo nuestros videos.              "
             .bright_yellow(),
         "║".bright_cyan()
     );

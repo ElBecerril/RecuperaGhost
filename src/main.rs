@@ -1,4 +1,5 @@
 mod banner;
+mod drives;
 mod recovery;
 mod scanner;
 mod signatures;
@@ -144,6 +145,7 @@ fn main() -> Result<()> {
                 "{}",
                 format!("  ❌ La ruta '{}' no existe.", src).bright_red()
             );
+            wait_for_keypress();
             process::exit(1);
         }
 
@@ -161,7 +163,27 @@ fn main() -> Result<()> {
         );
         println!();
 
-        run_scan(config, true)?;
+        if let Err(e) = run_scan(config, true) {
+            eprintln!(
+                "{}",
+                format!("  ❌ Error: {}", e).bright_red()
+            );
+            let mut source = e.source();
+            while let Some(cause) = source {
+                eprintln!(
+                    "{}",
+                    format!("     Causa: {}", cause).bright_red()
+                );
+                source = cause.source();
+            }
+            eprintln!();
+            eprintln!(
+                "{}",
+                "  💡 Si estás escaneando un disco físico, ejecuta como Administrador."
+                    .bright_yellow()
+            );
+        }
+        wait_for_keypress();
     } else {
         // ── Modo interactivo (comportamiento original) ──
         banner::show_banner();
@@ -170,7 +192,29 @@ fn main() -> Result<()> {
             match ui::main_menu()? {
                 MainMenuChoice::Scan => {
                     if let Some(config) = ui::scan_menu()? {
-                        run_scan(config, false)?;
+                        if let Err(e) = run_scan(config, false) {
+                            eprintln!();
+                            eprintln!(
+                                "{}",
+                                format!("  ❌ Error durante el escaneo: {}", e).bright_red()
+                            );
+                            // Mostrar causa raíz si existe
+                            let mut source = e.source();
+                            while let Some(cause) = source {
+                                eprintln!(
+                                    "{}",
+                                    format!("     Causa: {}", cause).bright_red()
+                                );
+                                source = cause.source();
+                            }
+                            eprintln!();
+                            eprintln!(
+                                "{}",
+                                "  💡 Si estás escaneando un disco físico, ejecuta como Administrador."
+                                    .bright_yellow()
+                            );
+                            eprintln!();
+                        }
                     }
                 }
                 MainMenuChoice::About => {
@@ -185,6 +229,16 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Espera a que el usuario presione ENTER antes de cerrar.
+/// Útil cuando se ejecuta con doble clic en Windows.
+fn wait_for_keypress() {
+    println!(
+        "{}",
+        "  Presiona ENTER para cerrar...".bright_black()
+    );
+    let _ = std::io::stdin().read_line(&mut String::new());
 }
 
 fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {

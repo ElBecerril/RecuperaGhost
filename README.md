@@ -51,8 +51,11 @@ El binario queda en `target/release/recupe_ghost.exe` (Windows) o `target/releas
 ./recupe_ghost
 ```
 
-Presenta un menu donde puedes:
-1. Seleccionar una imagen de disco o dispositivo
+Presenta un menu inteligente donde puedes:
+1. **Seleccionar origen con deteccion automatica:**
+   - Memorias USB / discos externos (auto-detectados)
+   - Archivos de imagen (.img, .dd, .raw) encontrados en el directorio actual
+   - Ruta manual para usuarios avanzados
 2. Elegir que tipos de archivo buscar (fotos, videos, audio)
 3. Escanear con barra de progreso en tiempo real
 4. Recuperar los archivos encontrados a una carpeta organizada
@@ -96,8 +99,20 @@ RecupeGhost escanea byte por byte buscando **firmas de archivo** (magic bytes) e
 
 1. Lee el disco en bloques de 1 MB con overlap para no perder firmas en fronteras
 2. Cuando encuentra una cabecera conocida, valida con verificaciones adicionales para desambiguar formatos que comparten firma (ej. RIFF -> WebP vs AVI vs WAV)
-3. Busca el footer del archivo (si existe) o usa el tamano maximo del formato
+3. Busca el footer del archivo dentro del buffer actual (sin seeks extra) o usa el tamano maximo del formato
 4. Extrae los bytes y los guarda organizados por categoria
+
+**Escaneo multi-hilo inteligente:**
+- **Discos fisicos (USB/HDD):** 1 hilo, 100% secuencial (sin seeks aleatorios), eficiente incluso en memorias USB lentas
+- **Imagenes de disco (SSD/NVMe):** auto-detecta CPU cores y divide el archivo en segmentos paralelos (hasta 8 hilos), acelerando el escaneo 2-6x
+- Overlap entre segmentos garantiza que ninguna firma se pierda en fronteras
+- Barra de progreso y tiempo estimado en tiempo real
+
+**Compatibilidad con discos fisicos (Windows):**
+- Detecta automaticamente memorias USB y discos externos
+- Obtiene el tamano del disco via `IOCTL_DISK_GET_LENGTH_INFO`
+- Lecturas alineadas a 512 bytes (sector size) como requiere Windows
+- Requiere ejecucion como Administrador para acceder a discos fisicos
 
 ## Auto-actualizacion
 
@@ -117,10 +132,11 @@ La actualizacion funciona en Windows, Linux y macOS. En Windows usa la tecnica d
 src/
   main.rs              -> Punto de entrada, CLI con clap, modo interactivo/batch
   banner.rs            -> Banner ASCII y branding
+  drives.rs            -> Deteccion de discos por plataforma (Windows/Linux/macOS)
   signatures/mod.rs    -> 21 firmas de archivo (magic bytes, extra_check, footer)
-  scanner/mod.rs       -> Motor de escaneo por file carving + 5 tests
+  scanner/mod.rs       -> Motor de escaneo multi-hilo por file carving + IOCTL + 9 tests
   recovery/mod.rs      -> Extraccion de archivos a carpetas organizadas
-  ui/mod.rs            -> Menus interactivos con dialoguer
+  ui/mod.rs            -> Menus interactivos con seleccion inteligente de origen
   updater.rs           -> Sistema de auto-actualizacion via GitHub Releases
 ```
 
@@ -130,20 +146,25 @@ src/
 cargo test
 ```
 
-10 tests automatizados:
-- Deteccion de firmas principales
+14 tests automatizados:
+- Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
 - Deteccion de footer JPEG
 - Flujo completo de recuperacion
-- Parseo de versiones (con y sin prefijo "v")
-- Parseo de versiones invalidas
-- Comparacion de versiones (is_newer)
-- Busqueda de asset por plataforma
+- Calculo de segmentos para escaneo paralelo
+- Seleccion automatica de hilos (dispositivo vs archivo)
+- Consistencia multi-hilo (1 vs N hilos, todas las categorias)
+- Deteccion de firmas en frontera de segmento
+- Parseo de versiones y busqueda de assets (updater)
+
+## Contribuir
+
+Las contribuciones son bienvenidas. Consulta [CONTRIBUTING.md](CONTRIBUTING.md) para la guia de contribucion.
 
 ## Licencia
 
-MIT
+Este proyecto esta licenciado bajo la **GNU General Public License v3.0**. Consulta el archivo [LICENSE](LICENSE) para los detalles completos.
 
 ## Autor
 
