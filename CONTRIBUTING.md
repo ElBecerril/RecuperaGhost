@@ -4,7 +4,7 @@ Gracias por tu interes en contribuir a RecupeGhost. Esta guia te ayudara a comen
 
 ## Requisitos de desarrollo
 
-- [Rust](https://rustup.rs/) 1.70+
+- [Rust](https://rustup.rs/) 1.74+
 - En Windows con toolchain GNU: agregar MinGW al PATH antes de compilar
 
 ## Configurar el entorno

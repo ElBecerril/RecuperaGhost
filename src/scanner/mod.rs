@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -8,7 +9,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::signatures::{format_size, FileCategory, FileSignature};
+use crate::signatures::{FileCategory, FileSignature};
+use crate::util::format_size;
 
 /// Archivo encontrado durante el escaneo
 #[derive(Debug, Clone)]
@@ -17,6 +19,11 @@ pub struct FoundFile {
     pub offset: u64,
     pub size: u64,
     pub index: usize,
+    /// true si el tamaño real se determinó encontrando el footer (o el campo de tamaño del
+    /// header, para formatos como BMP); false si se quedó en `max_size` a falta de footer.
+    /// Usado por `refine_footers` (A2) para saber a qué archivos vale la pena reintentarles
+    /// una búsqueda de footer más profunda, fuera del buffer/chunk original.
+    pub footer_found: bool,
 }
 
 impl std::fmt::Display for FoundFile {
@@ -57,10 +64,15 @@ impl ScanResult {
 /// Obtiene el tamaño de la fuente (archivo o disco físico).
 /// En discos físicos de Windows, `seek(End)` no funciona; se usa `IOCTL_DISK_GET_LENGTH_INFO`.
 fn get_source_size(file: &mut File, source_path: &Path) -> Result<u64> {
-    // Intentar seek(End) primero (funciona en archivos normales y en Linux/macOS)
-    match file.seek(SeekFrom::End(0)) {
-        Ok(size) if size > 0 => return Ok(size),
-        _ => {}
+    // Intentar seek(End) primero (funciona en archivos normales y en Linux/macOS).
+    // Nota: en discos físicos de Windows esto puede devolver 0 en vez de fallar, por eso el
+    // caso Ok(0) no se trata como error aquí mismo — solo se sabrá que el origen está
+    // realmente vacío si además no aplica (o falla) el fallback de Windows de abajo.
+    let seek_result = file.seek(SeekFrom::End(0)).ok();
+    if let Some(size) = seek_result {
+        if size > 0 {
+            return Ok(size);
+        }
     }
 
     // Fallback para discos físicos en Windows
@@ -72,8 +84,14 @@ fn get_source_size(file: &mut File, source_path: &Path) -> Result<u64> {
         }
     }
 
-    // Último intento: leer hasta EOF contando bytes (lento pero funcional)
     let _ = source_path; // evitar warning en no-windows
+    if seek_result == Some(0) {
+        // B2: distinguir un origen vacío (0 bytes) de un fallo genérico al determinar el
+        // tamaño — antes ambos casos caían en el mismo mensaje genérico. El comentario viejo
+        // ("leer hasta EOF contando bytes") no reflejaba código real: nunca se implementó ese
+        // último intento, así que se elimina en vez de dejarlo como promesa falsa.
+        anyhow::bail!("El origen está vacío, no hay nada que escanear");
+    }
     anyhow::bail!("No se pudo determinar el tamaño del origen")
 }
 
@@ -180,8 +198,7 @@ fn calculate_segments(file_size: u64, num_threads: usize, overlap_size: u64) -> 
 /// - Dispositivos físicos: siempre 1 (I/O secuencial es óptimo)
 /// - Archivos: min(CPU cores, 8, file_size / 16MB), mínimo 1
 fn select_thread_count(source_path: &Path, file_size: u64) -> usize {
-    let src = source_path.to_string_lossy();
-    if src.starts_with("\\\\.\\") || src.starts_with("/dev/") {
+    if crate::util::is_physical_device(source_path) {
         return 1;
     }
 
@@ -209,7 +226,15 @@ fn max_signature_reach(signatures: &[FileSignature]) -> usize {
                 .extra_check
                 .map(|(bytes, offset)| offset + bytes.len())
                 .unwrap_or(0);
-            std::cmp::max(header_end, extra_end)
+            let validator_end = s.validator.map(|(_, needed)| needed).unwrap_or(0);
+            let size_field_end = s
+                .size_from_header
+                .map(|(offset, len)| offset + len)
+                .unwrap_or(0);
+            std::cmp::max(
+                std::cmp::max(header_end, extra_end),
+                std::cmp::max(validator_end, size_field_end),
+            )
         })
         .max()
         .unwrap_or(16)
@@ -218,6 +243,11 @@ fn max_signature_reach(signatures: &[FileSignature]) -> usize {
 /// Escanea un segmento del archivo buscando firmas multimedia.
 /// Cada hilo abre su propio File handle y escanea secuencialmente dentro del segmento.
 /// Solo retiene resultados con offset en [claim_start, claim_end).
+///
+/// Limitación conocida (M7, no resuelta aquí): `file.read()` más abajo no tiene timeout ni
+/// forma de cancelarse. Si el dispositivo de origen deja de responder (ej. un USB que se cae
+/// a media lectura), este read puede bloquear indefinidamente y el hilo nunca retorna.
+/// Implementar cancelación está fuera de alcance de este cambio.
 fn scan_segment(
     source_path: &Path,
     segment: &Segment,
@@ -235,6 +265,9 @@ fn scan_segment(
     let mut found_files: Vec<FoundFile> = Vec::new();
     let mut position = segment.start;
     let mut file_index: usize = 0;
+    // Claves (offset absoluto, extensión) ya registradas en este segmento, para deduplicar
+    // hits repetidos por overlap en O(1) en vez de un scan O(n) de found_files (ver C2).
+    let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
 
     loop {
         if position >= segment.end {
@@ -262,6 +295,7 @@ fn scan_segment(
                 &mut found_files,
                 &mut file_index,
                 source_size,
+                &mut seen,
             );
             overlap.clear();
         } else {
@@ -272,6 +306,7 @@ fn scan_segment(
                 &mut found_files,
                 &mut file_index,
                 source_size,
+                &mut seen,
             );
         }
 
@@ -343,10 +378,7 @@ fn scan_source_impl(
     );
 
     // Estimar tiempo con velocidad ajustada por hilos
-    let is_device = {
-        let src = source_path.to_string_lossy();
-        src.starts_with("\\\\.\\") || src.starts_with("/dev/")
-    };
+    let is_device = crate::util::is_physical_device(source_path);
     let speed: u64 = if is_device { 40 } else { 150 };
     let effective_speed = if num_threads > 1 {
         speed * std::cmp::min(num_threads as u64, 4)
@@ -410,7 +442,7 @@ fn scan_source_impl(
 
     let max_header_len = max_signature_reach(signatures);
 
-    let found_files = if num_threads <= 1 {
+    let (mut found_files, bytes_scanned_actual) = if num_threads <= 1 {
         // ── Fast path: 1 hilo, sin overhead de threads ──
         let segment = Segment {
             start: 0,
@@ -419,7 +451,11 @@ fn scan_source_impl(
             claim_end: file_size,
         };
         let progress = AtomicU64::new(0);
-        scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb))?
+        let files = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb))?;
+        // B3: reportar lo realmente leído, no file_size fijo — un EOF prematuro (bytes_read
+        // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo.
+        let scanned = progress.load(Ordering::Relaxed);
+        (files, scanned)
     } else {
         // ── Multi-hilo ──
         let segments = calculate_segments(file_size, num_threads, max_header_len as u64);
@@ -475,6 +511,10 @@ fn scan_source_impl(
             }
         }
 
+        // B3: capturar lo realmente acumulado ANTES de forzar el atomic a file_size (eso
+        // último solo es para que el hilo de progreso se detenga, no refleja lo leído).
+        let scanned = progress.load(Ordering::Relaxed);
+
         // Siempre señalar al monitor que termine
         progress.store(file_size, Ordering::Relaxed);
         let _ = monitor_handle.join();
@@ -492,8 +532,12 @@ fn scan_source_impl(
             f.index = i + 1;
         }
 
-        all_files
+        (all_files, scanned)
     };
+
+    // A2: segundo pase de footer, en un solo hilo, para archivos cuyo footer no apareció
+    // dentro del buffer/chunk original — ver `refine_footers`.
+    refine_footers(source_path, &mut found_files);
 
     pb.finish_with_message("✅ Escaneo completado");
     println!();
@@ -513,7 +557,7 @@ fn scan_source_impl(
 
     Ok(ScanResult {
         found_files,
-        bytes_scanned: file_size,
+        bytes_scanned: bytes_scanned_actual,
         photos_count,
         videos_count,
         audios_count,
@@ -530,6 +574,7 @@ fn check_signatures_in_buffer(
     found_files: &mut Vec<FoundFile>,
     file_index: &mut usize,
     source_size: u64,
+    seen: &mut HashSet<(u64, &'static str)>,
 ) {
     for i in 0..buf.len() {
         for sig in signatures {
@@ -552,36 +597,74 @@ fn check_signatures_in_buffer(
                     }
                 }
 
+                // Verificar validator bit-level si existe (ver C2: MP3 Sync / AAC ADTS).
+                // `needed_len` es el mínimo de bytes indispensable para el chequeo básico de
+                // bits reservados; se le pasa al validador TODO lo que queda del buffer (no
+                // solo `needed_len`) para que pueda además hacer frame chaining (calcular el
+                // largo del frame y verificar un segundo syncword más adelante) cuando haya
+                // suficientes datos — si no los hay, el validador decide aceptar sin ese
+                // chequeo extra en vez de rechazar por falta de datos (ver C2 fix v2).
+                if let Some((validator_fn, needed_len)) = sig.validator {
+                    if check_pos + needed_len > buf.len() || !validator_fn(&buf[check_pos..]) {
+                        continue;
+                    }
+                }
+
                 let absolute_offset = base_offset + i as u64;
 
-                // Verificar que no está ya registrado (evitar duplicados del overlap)
-                if found_files
-                    .iter()
-                    .any(|f| f.offset == absolute_offset && f.signature.extension == sig.extension)
-                {
+                // Verificar que no está ya registrado (evitar duplicados del overlap).
+                // HashSet en vez de scan lineal de found_files: O(1) en vez de O(n) por hit,
+                // crítico ahora que los falsos positivos de header corto ya no explotan pero
+                // el volumen de hits legítimos + overlaps sigue pudiendo ser alto (ver C2).
+                if !seen.insert((absolute_offset, sig.extension)) {
                     continue;
                 }
 
-                // Determinar tamaño buscando footer en el buffer (sin I/O extra)
                 let max_possible = std::cmp::min(
                     sig.max_size as u64,
                     source_size.saturating_sub(absolute_offset),
                 );
-                let size = if let Some(footer) = sig.footer {
-                    let remaining = &buf[i..];
-                    if let Some(pos) = find_last_subsequence(remaining, footer) {
-                        let found_size = pos as u64 + footer.len() as u64;
-                        if found_size <= max_possible {
-                            found_size
+
+                // Determinar tamaño: campo de tamaño en el header (BMP), footer, o max_size.
+                let (size, footer_found) = if let Some((sf_offset, sf_len)) = sig.size_from_header
+                {
+                    let sf_start = i + sf_offset;
+                    let sf_end = sf_start + sf_len;
+                    if sf_end <= buf.len() {
+                        let mut val: u64 = 0;
+                        for (idx, b) in buf[sf_start..sf_end].iter().enumerate() {
+                            val |= (*b as u64) << (8 * idx);
+                        }
+                        if val > 0 && val <= max_possible {
+                            (val, true)
                         } else {
-                            max_possible
+                            (max_possible, false)
                         }
                     } else {
-                        // Footer no está en este buffer → usar max_size
-                        max_possible
+                        (max_possible, false)
+                    }
+                } else if let Some(footer) = sig.footer {
+                    // Buscar el footer que realmente cierra ESTE header, tolerando anidamiento
+                    // del mismo formato (ej. thumbnail EXIF embebido: un JPEG completo SOI..EOI
+                    // dentro del segmento APP1, antes del EOI real de la foto) sin por eso
+                    // absorber un segundo archivo distinto que caiga en el mismo buffer (ver
+                    // A1 fix v2 — combina la búsqueda "última ocurrencia" que resuelve
+                    // thumbnails con la acotación que evita englobar el siguiente archivo).
+                    let search_start = check_pos + sig.header.len();
+                    if let Some(pos) = find_footer_nested(buf, sig.header, footer, search_start) {
+                        let found_size = (pos - i) as u64 + footer.len() as u64;
+                        if found_size <= max_possible {
+                            (found_size, true)
+                        } else {
+                            (max_possible, false)
+                        }
+                    } else {
+                        // Footer no está en este buffer → usar max_size por ahora; se
+                        // reintenta con más alcance en `refine_footers` (ver A2).
+                        (max_possible, false)
                     }
                 } else {
-                    max_possible
+                    (max_possible, false)
                 };
 
                 if size > 512 {
@@ -592,6 +675,7 @@ fn check_signatures_in_buffer(
                         offset: absolute_offset,
                         size,
                         index: *file_index,
+                        footer_found,
                     });
                 }
             }
@@ -599,17 +683,167 @@ fn check_signatures_in_buffer(
     }
 }
 
-/// Busca la última ocurrencia de una subsecuencia en un buffer
-fn find_last_subsequence(buf: &[u8], pattern: &[u8]) -> Option<usize> {
-    if pattern.is_empty() || buf.len() < pattern.len() {
+/// Busca el footer que cierra el header ya encontrado (en `header_start`, implícito por
+/// `start` = fin del header), tolerando anidamiento del MISMO formato entre medio — ej. un
+/// thumbnail EXIF embebido en JPEG: un SOI+EOI (FFD8...FFD9) completo dentro del segmento
+/// APP1, antes del EOI real de la foto (ver A1 fix v2).
+///
+/// Algoritmo: profundidad de anidamiento, empezando en 1 (el header ya encontrado por el
+/// caller, anterior a `start`). Escaneando hacia adelante desde `start`: cada nueva ocurrencia
+/// del MISMO `header` suma 1 (se asume un archivo embebido tipo thumbnail) y cada ocurrencia
+/// de `footer` resta 1; el footer que hace bajar la profundidad a 0 es el que cierra este
+/// archivo. Esto resuelve dos problemas con una sola pasada:
+/// - JPEG con thumbnail EXIF: el EOI del thumbnail interno no baja la profundidad a 0 (sigue
+///   en 1, por el SOI del thumbnail que la subió a 2 antes), así que se sigue buscando hasta
+///   el EOI real.
+/// - Dos archivos del mismo formato en el mismo buffer: si no hay anidamiento real, el primer
+///   footer encontrado SÍ baja la profundidad a 0 de inmediato, así que no se sigue buscando
+///   más allá y no se engloba el siguiente archivo.
+fn find_footer_nested(buf: &[u8], header: &[u8], footer: &[u8], start: usize) -> Option<usize> {
+    // depth arranca en 1 (el header ya encontrado por el caller); `start` también sirve como
+    // `skip_before` para `scan_nesting` porque no queremos contar nada antes de él.
+    scan_nesting(buf, header, footer, 1, start).1
+}
+
+/// Motor compartido de conteo de anidamiento usado por `find_footer_nested` (pasada en buffer,
+/// A1 fix v2) y por `find_footer_sequential` (segundo pase A2, cross-chunk). Escanea `buf`
+/// completo desde el índice 0 buscando `header` y `footer`, ajustando `depth` como se describe
+/// en `find_footer_nested`, pero ignorando matches que caen ENTERAMENTE antes de `skip_before`
+/// — usado por `find_footer_sequential` para no re-contar, en cada chunk, bytes de overlap que
+/// ya fueron contados en la iteración anterior. Retorna la profundidad resultante y, si llegó a
+/// 0, la posición (índice en `buf`) del footer que cerró el archivo.
+fn scan_nesting(
+    buf: &[u8],
+    header: &[u8],
+    footer: &[u8],
+    mut depth: i32,
+    skip_before: usize,
+) -> (i32, Option<usize>) {
+    if footer.is_empty() {
+        return (depth, None);
+    }
+    let mut i = 0usize;
+    while i < buf.len() {
+        if i + footer.len() <= buf.len() && &buf[i..i + footer.len()] == footer {
+            if i + footer.len() > skip_before {
+                depth -= 1;
+                if depth == 0 {
+                    return (depth, Some(i));
+                }
+            }
+            i += footer.len();
+            continue;
+        }
+        if !header.is_empty() && i + header.len() <= buf.len() && &buf[i..i + header.len()] == header
+        {
+            if i + header.len() > skip_before {
+                depth += 1;
+            }
+            i += header.len();
+            continue;
+        }
+        i += 1;
+    }
+    (depth, None)
+}
+
+/// Segundo pase de footer (A2): para archivos cuyo tamaño quedó en `max_size` porque el
+/// footer no apareció dentro del buffer/chunk original (típicamente 1 MB), reabre la fuente
+/// y busca el footer secuencialmente, en chunks de 4 MB, desde el offset del header hasta
+/// `max_size` bytes después. Corre en un solo hilo, después de juntar los resultados de todos
+/// los workers, para no complicar el paralelismo y porque el volumen de candidatos aquí ya es
+/// pequeño (solo los que no encontraron footer). Esto también hace el resultado determinista
+/// entre 1 hilo y N hilos: antes, un archivo cuyo header caía cerca del final de un chunk se
+/// carveaba a max_size de forma distinta según dónde cayeran las fronteras de segmento/chunk.
+fn refine_footers(source_path: &Path, found_files: &mut [FoundFile]) {
+    const REFINE_CHUNK: usize = 4 * 1024 * 1024;
+
+    for f in found_files.iter_mut() {
+        if f.footer_found {
+            continue;
+        }
+        let Some(footer) = f.signature.footer else {
+            continue;
+        };
+
+        let header_end = f.offset
+            + f.signature.header_offset as u64
+            + f.signature.header.len() as u64;
+        let search_end = f.offset + f.signature.max_size as u64;
+
+        if let Some(new_size) = find_footer_sequential(
+            source_path,
+            f.offset,
+            header_end,
+            search_end,
+            f.signature.header,
+            footer,
+            REFINE_CHUNK,
+        ) {
+            f.size = new_size;
+            f.footer_found = true;
+        }
+    }
+}
+
+/// Busca `footer` leyendo secuencialmente desde `search_start` hasta `search_end` (exclusivo),
+/// en chunks de `chunk_size` bytes con solapamiento de `max(header.len(), footer.len()) - 1`
+/// entre chunks para no perder coincidencias en la frontera. Igual que `find_footer_nested`,
+/// trackea profundidad de anidamiento del mismo `header` para no cortar en el footer de un
+/// thumbnail embebido (ver A1 fix v2), manteniendo la profundidad entre chunks y evitando
+/// recontar matches ya vistos en el overlap del chunk anterior. Retorna el tamaño del archivo
+/// (relativo a `header_offset`) si lo encuentra.
+fn find_footer_sequential(
+    source_path: &Path,
+    header_offset: u64,
+    search_start: u64,
+    search_end: u64,
+    header: &[u8],
+    footer: &[u8],
+    chunk_size: usize,
+) -> Option<u64> {
+    if search_start >= search_end {
         return None;
     }
 
-    for i in (0..=buf.len() - pattern.len()).rev() {
-        if &buf[i..i + pattern.len()] == pattern {
-            return Some(i);
+    let mut file = File::open(source_path).ok()?;
+    file.seek(SeekFrom::Start(search_start)).ok()?;
+
+    let mut pos = search_start;
+    let mut overlap: Vec<u8> = Vec::new();
+    let mut depth: i32 = 1;
+
+    while pos < search_end {
+        let to_read = std::cmp::min(chunk_size as u64, search_end - pos) as usize;
+        let mut buf = vec![0u8; to_read];
+        let bytes_read = file.read(&mut buf).ok()?;
+        if bytes_read == 0 {
+            break;
         }
+        buf.truncate(bytes_read);
+
+        let combined_start = pos - overlap.len() as u64;
+        let skip_before = overlap.len(); // bytes ya contados en la iteración anterior
+        let mut combined = overlap.clone();
+        combined.extend_from_slice(&buf);
+
+        let (new_depth, footer_pos) =
+            scan_nesting(&combined, header, footer, depth, skip_before);
+        depth = new_depth;
+        if let Some(rel_pos) = footer_pos {
+            let abs_pos = combined_start + rel_pos as u64;
+            return Some((abs_pos + footer.len() as u64).saturating_sub(header_offset));
+        }
+
+        let keep = std::cmp::max(header.len(), footer.len()).saturating_sub(1);
+        overlap = if buf.len() >= keep {
+            buf[buf.len() - keep..].to_vec()
+        } else {
+            buf.clone()
+        };
+        pos += bytes_read as u64;
     }
+
     None
 }
 
@@ -1144,5 +1378,128 @@ mod tests {
             "\nFirma en frontera de segmento 0x{:X} detectada correctamente.",
             boundary
         );
+    }
+
+    // ═══════════════ Tests de regresión: fix v2 de A1 (footer JPEG) y C2 (validators) ═══
+
+    #[test]
+    fn test_jpeg_with_embedded_exif_thumbnail_recovers_full_size() {
+        let mut data = vec![0u8; 200 * 1024];
+        let pos = 1000usize;
+        // Header real
+        data[pos..pos + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        // Un thumbnail EXIF embebido: SOI...EOI completo poco después del header real
+        let thumb = pos + 50;
+        data[thumb..thumb + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        for i in 3..200 {
+            data[thumb + i] = ((i * 3) % 256) as u8;
+        }
+        data[thumb + 200..thumb + 202].copy_from_slice(&[0xFF, 0xD9]); // EOI del thumbnail
+        // Resto de datos de la foto real, más largo, con el EOI real mucho más lejos
+        for i in (thumb + 202)..pos + 100_000 {
+            data[i] = ((i * 5) % 256) as u8;
+        }
+        let real_footer = pos + 100_000;
+        data[real_footer..real_footer + 2].copy_from_slice(&[0xFF, 0xD9]); // EOI real
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+        let jpeg = result
+            .found_files
+            .iter()
+            .find(|f| f.signature.extension == "jpg" && f.offset == pos as u64)
+            .expect("JPEG no encontrado");
+
+        println!("size = {}, expected = {}", jpeg.size, real_footer + 2 - pos);
+        assert_eq!(jpeg.size as usize, real_footer + 2 - pos);
+    }
+
+    #[test]
+    fn test_two_jpegs_in_same_buffer_do_not_englobe() {
+        let mut data = vec![0u8; 20 * 1024];
+        let pos1 = 100usize;
+        data[pos1..pos1 + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        for i in 3..2000 {
+            data[pos1 + i] = ((i * 7) % 256) as u8;
+        }
+        data[pos1 + 2000..pos1 + 2002].copy_from_slice(&[0xFF, 0xD9]);
+
+        let pos2 = pos1 + 2100;
+        data[pos2..pos2 + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        for i in 3..2000 {
+            data[pos2 + i] = ((i * 11) % 256) as u8;
+        }
+        data[pos2 + 2000..pos2 + 2002].copy_from_slice(&[0xFF, 0xD9]);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+        let jpeg1 = result
+            .found_files
+            .iter()
+            .find(|f| f.offset == pos1 as u64)
+            .unwrap();
+        println!("jpeg1 size = {} expected 2002", jpeg1.size);
+        assert_eq!(jpeg1.size, 2002, "jpeg1 englobó al segundo archivo");
+    }
+
+    #[test]
+    fn test_mp3_aac_frame_chaining_rejects_most_random_data() {
+        let sigs = signatures_for_categories(&[FileCategory::Audio]);
+        let mp3_sig = sigs.iter().find(|s| s.name == "MP3 (Sync)").unwrap();
+        let aac_sig = sigs.iter().find(|s| s.name == "AAC").unwrap();
+
+        // xorshift64 simple, sin dependencias externas, solo para este test de verificación.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let trials = 200_000usize;
+        let mut mp3_pass = 0usize;
+        let mut aac_pass = 0usize;
+        // Suficientemente grande para cubrir el frame_len máximo posible (MP3 320kbps/32kHz
+        // ~1441 bytes; AAC frame_length es un campo de 13 bits, hasta 8191 bytes) y así
+        // ejercitar de verdad el chequeo de frame chaining, no solo el camino de "no hay
+        // suficiente buffer, aceptar".
+        let mut buf = [0u8; 8300];
+        for _ in 0..trials {
+            for chunk in buf.chunks_mut(8) {
+                let v = next().to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+            buf[0] = 0xFF;
+            buf[1] = 0xFB;
+            if let Some((f, _)) = mp3_sig.validator {
+                if f(&buf) {
+                    mp3_pass += 1;
+                }
+            }
+            buf[1] = 0xF1;
+            if let Some((f, _)) = aac_sig.validator {
+                if f(&buf) {
+                    aac_pass += 1;
+                }
+            }
+        }
+        let mp3_pct = mp3_pass as f64 / trials as f64 * 100.0;
+        let aac_pct = aac_pass as f64 / trials as f64 * 100.0;
+        println!("mp3 pass rate = {:.4}%  aac pass rate = {:.4}%", mp3_pct, aac_pct);
+
+        // Antes del frame chaining (solo bits reservados) pasaba ~60-65% de datos aleatorios;
+        // con frame chaining debe caer a un porcentaje marginal (umbral generoso para no ser
+        // frágil ante variaciones del PRNG determinístico usado arriba).
+        assert!(mp3_pct < 5.0, "MP3 sync validator deja pasar demasiados falsos positivos: {:.4}%", mp3_pct);
+        assert!(aac_pct < 5.0, "AAC ADTS validator deja pasar demasiados falsos positivos: {:.4}%", aac_pct);
     }
 }

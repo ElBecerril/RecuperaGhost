@@ -5,6 +5,7 @@ mod scanner;
 mod signatures;
 mod ui;
 mod updater;
+mod util;
 
 use std::path::PathBuf;
 use std::process;
@@ -41,12 +42,18 @@ struct CliArgs {
     /// Directorio de salida para archivos recuperados
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
+
+    /// No buscar actualizaciones ni mostrar prompts interactivos relacionados
+    /// (útil para scripts/cron; se activa automáticamente sin TTY o en modo batch)
+    #[arg(long = "no-update")]
+    no_update: bool,
 }
 
 impl CliArgs {
     /// Convierte los argumentos CLI en un ScanConfig para modo batch.
-    fn into_scan_config(self) -> ScanConfig {
-        let source_path = PathBuf::from(self.source.unwrap());
+    /// Recibe `source` ya extraído y validado por el call site (nunca hace unwrap interno).
+    fn into_scan_config(self, source: String) -> ScanConfig {
+        let source_path = PathBuf::from(source);
 
         let categories = if !self.fotos && !self.videos && !self.audio {
             // Ningún flag = buscar todo
@@ -125,28 +132,61 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     enable_windows_ansi();
 
-    updater::cleanup_old_binary();
-    updater::check_for_updates();
-
+    // CliArgs::parse() debe correr ANTES que cualquier llamada de red o prompt
+    // interactivo: así --help/--version responden de inmediato sin tocar la red.
     let args = CliArgs::parse();
     args.validate();
 
-    if args.source.is_some() {
+    // Modo batch (con source) o sin TTY (script/cron/redirección) => sin red ni prompts.
+    let is_tty = console::Term::stdout().is_term();
+    let is_batch = args.source.is_some();
+    let skip_update_check = args.no_update || is_batch || !is_tty;
+
+    updater::cleanup_old_binary();
+    if !skip_update_check {
+        updater::check_for_updates();
+    }
+
+    if let Some(source) = args.source.clone() {
         // ── Modo batch ──
         banner::show_banner();
 
-        let config = args.into_scan_config();
+        let config = args.into_scan_config(source);
 
         // Validar que la ruta existe (excepto dispositivos raw)
         let src = config.source_path.to_string_lossy();
-        if !src.starts_with("\\\\.\\") && !src.starts_with("/dev/") && !config.source_path.exists()
+        if !util::is_physical_device(&config.source_path) && !config.source_path.exists()
         {
             eprintln!(
                 "{}",
                 format!("  ❌ La ruta '{}' no existe.", src).bright_red()
             );
-            wait_for_keypress();
+            if is_tty {
+                wait_for_keypress();
+            }
             process::exit(1);
+        }
+
+        // Advertencia best-effort: no recuperar sobre el mismo disco que se escanea.
+        if let Some(warning) = ui::same_device_warning(&config.source_path, &config.output_dir) {
+            eprintln!("{}", warning.bright_yellow());
+            if is_tty {
+                let continuar = dialoguer::Confirm::new()
+                    .with_prompt("  ¿Continuar de todas formas?")
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                if !continuar {
+                    println!("  ⏹️  Escaneo cancelado.");
+                    wait_for_keypress();
+                    return Ok(());
+                }
+            } else {
+                eprintln!(
+                    "{}",
+                    "  ⚠️  Continuando en modo no interactivo (sin confirmación).".bright_yellow()
+                );
+            }
         }
 
         println!("{}", "  ═══ Modo batch ═══".bright_cyan());
@@ -183,7 +223,10 @@ fn main() -> Result<()> {
                     .bright_yellow()
             );
         }
-        wait_for_keypress();
+        // Un cron/script sin TTY nunca debe quedar colgado esperando ENTER.
+        if is_tty {
+            wait_for_keypress();
+        }
     } else {
         // ── Modo interactivo (comportamiento original) ──
         banner::show_banner();

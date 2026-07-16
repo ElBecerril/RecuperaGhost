@@ -31,7 +31,7 @@ Herramienta CLI de recuperacion de archivos multimedia borrados, escrita en Rust
 
 ### Requisitos
 
-- [Rust](https://rustup.rs/) 1.70+
+- [Rust](https://rustup.rs/) 1.74+
 
 ### Compilar desde fuente
 
@@ -146,16 +146,18 @@ src/
 cargo test
 ```
 
-14 tests automatizados:
+17 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
-- Deteccion de footer JPEG
+- Deteccion de footer JPEG (incluye fotos con thumbnail EXIF embebido)
 - Flujo completo de recuperacion
 - Calculo de segmentos para escaneo paralelo
 - Seleccion automatica de hilos (dispositivo vs archivo)
 - Consistencia multi-hilo (1 vs N hilos, todas las categorias)
 - Deteccion de firmas en frontera de segmento
+- No-englobing de archivos adyacentes en el mismo buffer
+- Rechazo de falsos positivos MP3/AAC via frame-chaining
 - Parseo de versiones y busqueda de assets (updater)
 
 ## Contribuir

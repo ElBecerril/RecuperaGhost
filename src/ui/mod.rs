@@ -71,8 +71,7 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     };
 
     // Verificar permisos si es un disco físico
-    let src_str = source_path.to_string_lossy();
-    let is_physical = src_str.starts_with("\\\\.\\") || src_str.starts_with("/dev/");
+    let is_physical = crate::util::is_physical_device(&source_path);
     if is_physical && !drives::is_admin() {
         println!();
         println!(
@@ -192,6 +191,12 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     );
     println!();
 
+    // Advertencia best-effort: no recuperar sobre el mismo disco que se escanea.
+    if let Some(warning) = same_device_warning(&source_path, &output_dir) {
+        println!("{}", warning.bright_yellow());
+        println!();
+    }
+
     let confirm = Confirm::new()
         .with_prompt("  ¿Iniciar escaneo?")
         .default(true)
@@ -207,6 +212,153 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
         output_dir,
         categories,
     }))
+}
+
+/// Verificación best-effort (no bloqueante): advierte si el directorio de salida
+/// parece estar en el mismo dispositivo físico que se va a escanear. No pretende
+/// detectar todos los casos, solo el escenario típico de herramienta portable
+/// (ej: correr el .exe desde el mismo USB que se quiere recuperar).
+/// Normaliza el path de un dispositivo de partición al path del disco completo
+/// que lo contiene, para poder compararlo contra `drives::list_drives()` (que
+/// solo enumera discos completos, nunca particiones individuales).
+///
+/// Patrones reconocidos:
+/// - Linux: `/dev/sdXN` -> `/dev/sdX` (ej. `/dev/sdb1` -> `/dev/sdb`)
+/// - Linux: `/dev/nvmeXnYpZ` -> `/dev/nvmeXnY` (ej. `/dev/nvme0n1p2` -> `/dev/nvme0n1`)
+/// - macOS: `/dev/diskNsM` -> `/dev/diskN` (ej. `/dev/disk2s1` -> `/dev/disk2`)
+///
+/// Si el path no matchea ninguno de estos patrones de partición (ej. ya es un
+/// disco completo, o es una ruta de Windows tipo `\\.\PhysicalDriveN`), se
+/// devuelve tal cual sin modificar.
+fn normalize_to_whole_disk(path: &str) -> String {
+    // Caso NVMe: /dev/nvme<N>n<M>p<P> -> /dev/nvme<N>n<M>
+    if let Some(rest) = path.strip_prefix("/dev/nvme") {
+        // rest debe tener forma "<N>n<M>p<P>"; buscamos la 'p' que precede al
+        // sufijo numérico de partición.
+        if let Some(p_idx) = rest.rfind('p') {
+            let (before_p, after_p) = rest.split_at(p_idx);
+            let partition_suffix = &after_p[1..]; // sin la 'p'
+            if !before_p.is_empty()
+                && before_p.contains('n')
+                && !partition_suffix.is_empty()
+                && partition_suffix.chars().all(|c| c.is_ascii_digit())
+            {
+                return format!("/dev/nvme{}", before_p);
+            }
+        }
+        return path.to_string();
+    }
+
+    // Caso macOS: /dev/disk<N>s<M> -> /dev/disk<N>
+    if let Some(rest) = path.strip_prefix("/dev/disk") {
+        if let Some(s_idx) = rest.find('s') {
+            let (before_s, after_s) = rest.split_at(s_idx);
+            let partition_suffix = &after_s[1..]; // sin la 's'
+            if !before_s.is_empty()
+                && before_s.chars().all(|c| c.is_ascii_digit())
+                && !partition_suffix.is_empty()
+                && partition_suffix.chars().all(|c| c.is_ascii_digit())
+            {
+                return format!("/dev/disk{}", before_s);
+            }
+        }
+        return path.to_string();
+    }
+
+    // Caso genérico Linux (sd*, vd*, hd*, xvd*, etc.): /dev/<letras><digitos> -> /dev/<letras>
+    if let Some(rest) = path.strip_prefix("/dev/") {
+        let letters_end = rest.find(|c: char| c.is_ascii_digit());
+        if let Some(idx) = letters_end {
+            let (letters, digits) = rest.split_at(idx);
+            if !letters.is_empty()
+                && letters.chars().all(|c| c.is_ascii_alphabetic())
+                && !digits.is_empty()
+                && digits.chars().all(|c| c.is_ascii_digit())
+            {
+                return format!("/dev/{}", letters);
+            }
+        }
+    }
+
+    path.to_string()
+}
+
+pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path::Path) -> Option<String> {
+    let src_str = source_path.to_string_lossy();
+    if !crate::util::is_physical_device(source_path) {
+        return None;
+    }
+
+    let normalized_src = normalize_to_whole_disk(&src_str);
+
+    // Buscar el punto de montaje del dispositivo origen entre los discos detectados.
+    // Primero se intenta con el path tal cual (caso disco completo o
+    // \\.\PhysicalDriveN de Windows), y si no matchea se reintenta con el
+    // identificador de disco completo normalizado (caso partición, ej.
+    // /dev/sdb1 -> /dev/sdb, /dev/nvme0n1p2 -> /dev/nvme0n1, /dev/disk2s1 -> /dev/disk2).
+    let drives = drives::list_drives();
+    let mount = drives
+        .iter()
+        .find(|d| d.path == src_str)
+        .or_else(|| drives.iter().find(|d| d.path == normalized_src))
+        .and_then(|d| d.letter.clone())?;
+
+    if mount.trim().is_empty() {
+        return None;
+    }
+
+    let mount_path = PathBuf::from(&mount);
+
+    // Resolver el directorio de salida a una ruta absoluta lo mejor posible
+    // sin requerir que exista todavía.
+    let candidate = if output_dir.exists() {
+        output_dir.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(output_dir),
+            Err(_) => output_dir.to_path_buf(),
+        }
+    };
+
+    let candidate_str = candidate.to_string_lossy().replace('\\', "/");
+    let mount_str = mount_path.to_string_lossy().replace('\\', "/");
+    let mount_prefix = mount_str.trim_end_matches('/');
+
+    let mut same = candidate_str == mount_str
+        || candidate_str.starts_with(&format!("{}/", mount_prefix))
+        || candidate_str == mount_prefix;
+
+    // Comprobación adicional en Unix vía device id (best-effort, si es posible).
+    #[cfg(unix)]
+    if !same {
+        use std::os::unix::fs::MetadataExt;
+
+        fn dev_id_of(mut path: std::path::PathBuf) -> Option<u64> {
+            loop {
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    return Some(meta.dev());
+                }
+                if !path.pop() {
+                    return None;
+                }
+            }
+        }
+
+        if let (Some(out_dev), Some(mount_dev)) =
+            (dev_id_of(candidate.clone()), dev_id_of(mount_path.clone()))
+        {
+            same = out_dev == mount_dev;
+        }
+    }
+
+    if same {
+        Some(format!(
+            "  ⚠️  El directorio de salida parece estar en el mismo dispositivo que estás escaneando ({}).\n     Recuperar archivos ahí puede sobrescribir los sectores borrados que intentas rescatar.",
+            mount
+        ))
+    } else {
+        None
+    }
 }
 
 /// Menú inteligente para seleccionar la fuente de escaneo.
@@ -417,7 +569,7 @@ fn select_image_file() -> Result<Option<PathBuf>> {
         .map(|p| {
             let name = p.file_name().unwrap_or_default().to_string_lossy();
             let size = p.metadata().map(|m| m.len()).unwrap_or(0);
-            format!("  📄 {} ({})", name, format_file_size(size))
+            format!("  📄 {} ({})", name, crate::util::format_size(size))
         })
         .collect();
     display_items.push("  ✏️  Escribir ruta manualmente".to_string());
@@ -494,24 +646,6 @@ fn select_manual_path() -> Result<Option<PathBuf>> {
     }
 
     Ok(Some(source_path))
-}
-
-/// Formatea bytes a una cadena legible para archivos.
-fn format_file_size(bytes: u64) -> String {
-    const GB: f64 = 1_073_741_824.0;
-    const MB: f64 = 1_048_576.0;
-    const KB: f64 = 1_024.0;
-
-    let b = bytes as f64;
-    if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else if b >= KB {
-        format!("{:.1} KB", b / KB)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 /// Pregunta si el usuario quiere recuperar los archivos encontrados
@@ -624,7 +758,7 @@ pub fn show_about() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  Licencia: MIT                                 ".bright_green(),
+        "  Licencia: GPL-3.0                             ".bright_green(),
         "║".bright_cyan()
     );
     println!(

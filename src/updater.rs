@@ -7,6 +7,7 @@ use colored::Colorize;
 use dialoguer::Confirm;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::banner;
 
@@ -15,6 +16,8 @@ const GITHUB_API_URL: &str =
 const CONNECT_TIMEOUT_SECS: u64 = 5;
 const READ_TIMEOUT_SECS: u64 = 30;
 const MIN_BINARY_SIZE: u64 = 500_000; // 500KB mínimo para un binario válido
+const MAX_BINARY_SIZE: u64 = 100_000_000; // 100MB máximo, evita OOM con un asset gigante
+const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
 
 // ─── Tipos para deserializar la API de GitHub ───────────────────────────────
 
@@ -120,7 +123,10 @@ fn try_check_for_updates() -> Result<(), Box<dyn std::error::Error>> {
     let asset = find_platform_asset(&release.assets)
         .ok_or("No se encontró un binario compatible para esta plataforma")?;
 
-    download_and_replace(&agent, &asset.browser_download_url, asset.size)?;
+    let checksums_asset = find_checksums_asset(&release.assets)
+        .ok_or("No se encontró el archivo de checksums (SHA256SUMS.txt) en el release")?;
+
+    download_and_replace(&agent, asset, checksums_asset)?;
 
     show_update_complete(&release.tag_name);
     process::exit(0);
@@ -148,26 +154,84 @@ fn find_platform_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
     }
 }
 
+/// Busca el asset de checksums (SHA256SUMS.txt) publicado junto a los binarios del release.
+fn find_checksums_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
+    assets.iter().find(|a| a.name == CHECKSUMS_ASSET_NAME)
+}
+
+/// Solo se confía en URLs de descarga que apunten a github.com, para evitar
+/// que un release/API comprometido redirija la descarga a un host arbitrario.
+fn is_github_url(url: &str) -> bool {
+    url.starts_with("https://github.com/")
+}
+
 fn download_and_replace(
     agent: &ureq::Agent,
-    url: &str,
-    expected_size: u64,
+    asset: &GitHubAsset,
+    checksums_asset: &GitHubAsset,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_github_url(&asset.browser_download_url) || !is_github_url(&checksums_asset.browser_download_url) {
+        return Err(
+            "La URL de descarga no apunta a github.com, se aborta la actualización por seguridad"
+                .into(),
+        );
+    }
+
     println!();
+    println!(
+        "{}",
+        "  📥 Descargando checksums...".bright_cyan()
+    );
+
+    // Descargar SHA256SUMS.txt y ubicar la línea correspondiente a este asset
+    let checksums_text = agent
+        .get(&checksums_asset.browser_download_url)
+        .set("User-Agent", "RecupeGhost-Updater")
+        .call()?
+        .into_string()?;
+
+    let expected_hash = checksums_text
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.split_whitespace();
+            let hash = parts.next()?;
+            let name = parts.next()?.trim_start_matches('*');
+            if name == asset.name {
+                Some(hash.to_lowercase())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "No se encontró el checksum de '{}' en {}",
+                asset.name, CHECKSUMS_ASSET_NAME
+            )
+        })?;
+
     println!(
         "{}",
         "  📥 Descargando actualización...".bright_cyan()
     );
 
     let response = agent
-        .get(url)
+        .get(&asset.browser_download_url)
         .set("User-Agent", "RecupeGhost-Updater")
         .call()?;
 
     let total_size = response
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(expected_size);
+        .unwrap_or(asset.size);
+
+    // Límite duro para evitar OOM con un asset gigante o Content-Length falso
+    if total_size > MAX_BINARY_SIZE {
+        return Err(format!(
+            "El binario reportado ({} bytes) excede el límite permitido de {} bytes",
+            total_size, MAX_BINARY_SIZE
+        )
+        .into());
+    }
 
     // Barra de progreso
     let pb = ProgressBar::new(total_size);
@@ -175,7 +239,7 @@ fn download_and_replace(
         ProgressStyle::with_template(
             "  {spinner:.cyan} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})",
         )
-        .unwrap()
+        .expect("template de progreso estático y válido, no debería fallar")
         .progress_chars("█▓░"),
     );
 
@@ -187,6 +251,13 @@ fn download_and_replace(
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                if (data.len() as u64) + (n as u64) > MAX_BINARY_SIZE {
+                    return Err(format!(
+                        "La descarga excedió el límite permitido de {} bytes, abortando",
+                        MAX_BINARY_SIZE
+                    )
+                    .into());
+                }
                 data.extend_from_slice(&buf[..n]);
                 pb.set_position(data.len() as u64);
             }
@@ -202,6 +273,18 @@ fn download_and_replace(
         return Err(format!(
             "El archivo descargado es muy pequeño ({} bytes), posiblemente corrupto",
             data.len()
+        )
+        .into());
+    }
+
+    // Validar checksum SHA256 contra SHA256SUMS.txt antes de reemplazar el binario
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if actual_hash != expected_hash {
+        return Err(format!(
+            "El checksum SHA256 no coincide (esperado {}, obtenido {}); se aborta la actualización",
+            expected_hash, actual_hash
         )
         .into());
     }

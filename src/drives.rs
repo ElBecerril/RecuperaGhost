@@ -62,11 +62,11 @@ pub fn is_admin() -> bool {
 #[cfg(not(target_os = "windows"))]
 pub fn is_admin() -> bool {
     // En Linux/macOS, verificar si somos root
-    unsafe { libc_geteuid() == 0 }
+    current_uid() == 0
 }
 
 #[cfg(not(target_os = "windows"))]
-fn libc_geteuid() -> u32 {
+fn current_uid() -> u32 {
     // Usar command como fallback sin dependencia de libc
     Command::new("id")
         .arg("-u")
@@ -75,24 +75,6 @@ fn libc_geteuid() -> u32 {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1000)
-}
-
-/// Formatea bytes a una cadena legible (ej: `14.5 GB`).
-fn format_size(bytes: u64) -> String {
-    const GB: f64 = 1_073_741_824.0;
-    const MB: f64 = 1_048_576.0;
-    const TB: f64 = 1_099_511_627_776.0;
-
-    let b = bytes as f64;
-    if b >= TB {
-        format!("{:.1} TB", b / TB)
-    } else if b >= GB {
-        format!("{:.1} GB", b / GB)
-    } else if b >= MB {
-        format!("{:.1} MB", b / MB)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -195,9 +177,9 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
             .map(|(_, letter)| letter.clone());
 
         let display_name = if let Some(ref l) = letter {
-            format!("{} - {} ({})", l, model, format_size(size_bytes))
+            format!("{} - {} ({})", l, model, crate::util::format_size(size_bytes))
         } else {
-            format!("{} - {} ({})", device_id, model, format_size(size_bytes))
+            format!("{} - {} ({})", device_id, model, crate::util::format_size(size_bytes))
         };
 
         drives.push(DriveInfo {
@@ -308,15 +290,31 @@ fn list_drives_wmic() -> Option<Vec<DriveInfo>> {
             continue;
         }
         // CSV: Node,DeviceID,MediaType,Model,Size
-        let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 5 {
-            continue;
-        }
+        // Model puede contener comas, así que los campos fijos del inicio
+        // (Node, DeviceID, MediaType) se parsean por delante, y Size (fijo,
+        // numérico) se extrae por detrás, dejando lo que sobra como Model.
+        let mut front = line.splitn(4, ',');
+        let _node = match front.next() {
+            Some(v) => v,
+            None => continue,
+        };
+        let device_id = match front.next() {
+            Some(v) => v.trim().to_string(),
+            None => continue,
+        };
+        let media_type = match front.next() {
+            Some(v) => v.trim().to_lowercase(),
+            None => continue,
+        };
+        let rest = match front.next() {
+            Some(v) => v,
+            None => continue,
+        };
 
-        let device_id = fields[1].trim().to_string();
-        let media_type = fields[2].trim().to_lowercase();
-        let model = fields[3].trim().to_string();
-        let size_bytes: u64 = fields[4].trim().parse().unwrap_or(0);
+        let mut back = rest.rsplitn(2, ',');
+        let size_str = back.next().unwrap_or("").trim();
+        let model = back.next().unwrap_or("").trim().to_string();
+        let size_bytes: u64 = size_str.parse().unwrap_or(0);
         let is_removable = media_type.contains("removable") || media_type.contains("external");
 
         let display_name = format!(
@@ -327,7 +325,7 @@ fn list_drives_wmic() -> Option<Vec<DriveInfo>> {
             } else {
                 &model
             },
-            format_size(size_bytes)
+            crate::util::format_size(size_bytes)
         );
 
         drives.push(DriveInfo {
@@ -355,13 +353,50 @@ struct LsblkOutput {
 #[derive(Deserialize)]
 struct LsblkDevice {
     name: String,
+    #[serde(default, deserialize_with = "de_size_flex")]
     size: Option<String>,
     #[serde(rename = "type")]
     dev_type: Option<String>,
+    #[serde(default, deserialize_with = "de_bool_flex")]
     rm: Option<bool>,
     model: Option<String>,
     mountpoint: Option<String>,
     children: Option<Vec<LsblkDevice>>,
+}
+
+/// `lsblk --json` emite `size` como string en util-linux viejo y como
+/// número JSON desde util-linux >= 2.37. Aceptamos ambos formatos.
+#[cfg(target_os = "linux")]
+fn de_size_flex<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value.map(|v| match v {
+        serde_json::Value::String(s) => s,
+        serde_json::Value::Number(n) => n.to_string(),
+        other => other.to_string(),
+    }))
+}
+
+/// `rm` es bool JSON en util-linux nuevo y string `"0"`/`"1"` en versiones
+/// viejas. Aceptamos ambos formatos.
+#[cfg(target_os = "linux")]
+fn de_bool_flex<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value.and_then(|v| match v {
+        serde_json::Value::Bool(b) => Some(b),
+        serde_json::Value::String(s) => match s.as_str() {
+            "1" => Some(true),
+            "0" => Some(false),
+            other => other.parse::<bool>().ok(),
+        },
+        serde_json::Value::Number(n) => n.as_i64().map(|i| i != 0),
+        _ => None,
+    }))
 }
 
 #[cfg(target_os = "linux")]
@@ -377,7 +412,10 @@ fn list_drives_linux() -> Vec<DriveInfo> {
     let json = String::from_utf8_lossy(&output.stdout);
     let parsed: LsblkOutput = match serde_json::from_str(&json) {
         Ok(p) => p,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            eprintln!("RecupeGhost: no se pudo parsear la salida de lsblk: {}", e);
+            return Vec::new();
+        }
     };
 
     let mut drives = Vec::new();
@@ -413,9 +451,9 @@ fn list_drives_linux() -> Vec<DriveInfo> {
             .cloned();
 
         let display_name = if let Some(ref m) = mount {
-            format!("{} - {} ({}) [{}]", path, model, format_size(size_bytes), m)
+            format!("{} - {} ({}) [{}]", path, model, crate::util::format_size(size_bytes), m)
         } else {
-            format!("{} - {} ({})", path, model, format_size(size_bytes))
+            format!("{} - {} ({})", path, model, crate::util::format_size(size_bytes))
         };
 
         drives.push(DriveInfo {
@@ -447,22 +485,27 @@ fn list_drives_macos() -> Vec<DriveInfo> {
     let plist = String::from_utf8_lossy(&output.stdout);
     let mut drives = Vec::new();
 
-    // Extraer nombres de disco del plist (ej: disk0, disk1, disk2)
+    // El plist de "diskutil list -plist" no trae rutas "/dev/diskN" sueltas:
+    // los identificadores (ej: "disk0", "disk1") están como <string> dentro
+    // del array que sigue a la <key>WholeDisks</key>. Extraemos ese bloque
+    // y anteponemos "/dev/" a cada identificador.
     let disk_names: Vec<String> = plist
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("<string>/dev/") && trimmed.ends_with("</string>") {
-                let name = trimmed
-                    .trim_start_matches("<string>")
-                    .trim_end_matches("</string>")
-                    .to_string();
-                Some(name)
-            } else {
-                None
-            }
+        .find("<key>WholeDisks</key>")
+        .and_then(|key_pos| {
+            let after_key = &plist[key_pos..];
+            let array_start = after_key.find("<array>")? + "<array>".len();
+            let array_end = after_key.find("</array>")?;
+            Some(&after_key[array_start..array_end])
         })
-        .collect();
+        .map(|array_block| {
+            array_block
+                .split("<string>")
+                .skip(1)
+                .filter_map(|chunk| chunk.split("</string>").next())
+                .map(|name| format!("/dev/{}", name.trim()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     for disk_path in disk_names {
         // Obtener info de cada disco
@@ -516,7 +559,7 @@ fn get_macos_disk_info(disk_path: &str) -> Option<DriveInfo> {
         "{} - {} ({})",
         disk_path,
         model,
-        format_size(size_bytes)
+        crate::util::format_size(size_bytes)
     );
 
     Some(DriveInfo {
