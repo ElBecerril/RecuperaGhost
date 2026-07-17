@@ -64,5 +64,9 @@ pub fn show_banner() {
         "{}",
         "  🔍 Recupera fotos, videos, audios y más...".bright_white()
     );
+    println!(
+        "{}",
+        "  📺 ¿Primera vez? Tutorial paso a paso en YouTube: @el_becerril".bright_black()
+    );
     println!();
 }

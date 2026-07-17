@@ -63,8 +63,34 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
             .bright_cyan()
     );
     println!();
+    println!(
+        "{}",
+        "  En todos los menús: usá las flechas ↑↓ para moverte y ENTER para elegir."
+            .bright_black()
+    );
+    println!();
 
     // 1. Seleccionar origen con menú inteligente
+    println!(
+        "{}",
+        "  ¿De dónde querés recuperar archivos?".bright_yellow()
+    );
+    println!(
+        "{}",
+        "  · Memoria USB / disco externo: para una memoria, tarjeta SD o disco que conectaste aparte."
+            .bright_black()
+    );
+    println!(
+        "{}",
+        "  · Disco interno: para el disco de tu PC (fotos borradas del disco principal)."
+            .bright_black()
+    );
+    println!(
+        "{}",
+        "  · Archivo de imagen: para un archivo .img/.dd/.raw que ya tenés (uso avanzado)."
+            .bright_black()
+    );
+    println!();
     let source_path = match select_source()? {
         Some(path) => path,
         None => return Ok(None),
@@ -175,7 +201,8 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
         .default(default_output)
         .interact_text()?;
 
-    let output_dir = PathBuf::from(output.trim());
+    // Resolver a ruta absoluta ahora (en vez de dejarla relativa): ver `to_absolute_output`.
+    let output_dir = crate::util::to_absolute_output(PathBuf::from(output.trim()));
 
     println!();
 
@@ -352,7 +379,7 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
     // recuperación en curso.
     if mounts.is_empty() {
         return Some(format!(
-            "  ⚠️  No se pudo confirmar que el directorio de salida esté en un disco distinto al que estás escaneando ({}).\n     Por seguridad, verifica manualmente que no estés recuperando hacia el mismo dispositivo.",
+            "  ⚠️  No pudimos confirmar que la carpeta de salida esté en un disco distinto al que estás escaneando ({}).\n     Por las dudas, fijate que la carpeta de salida NO esté en ese mismo disco/USB — si no, podrías perder para siempre justo lo que estás tratando de recuperar.",
             src_str
         ));
     }
@@ -398,7 +425,7 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
 
         if same {
             return Some(format!(
-                "  ⚠️  El directorio de salida parece estar en el mismo dispositivo que estás escaneando ({}).\n     Recuperar archivos ahí puede sobrescribir los sectores borrados que intentas rescatar.",
+                "  ⚠️  La carpeta de salida está en el mismo disco que estás escaneando ({}).\n     Si guardás ahí, podrías perder para siempre justo los archivos que estás tratando de recuperar. Elegí otra carpeta, idealmente en otro disco.",
                 mount
             ));
         }
@@ -412,6 +439,7 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
 fn select_source() -> Result<Option<PathBuf>> {
     let options = vec![
         "💾 Memoria USB / disco externo",
+        "💽 Disco interno / ver todos los discos del sistema",
         "📁 Archivo de imagen (.img, .dd, .raw)",
         "🔧 Escribir ruta manualmente",
     ];
@@ -424,8 +452,9 @@ fn select_source() -> Result<Option<PathBuf>> {
 
     match selection {
         0 => select_removable_drive(),
-        1 => select_image_file(),
-        2 => select_manual_path(),
+        1 => select_all_drives(),
+        2 => select_image_file(),
+        3 => select_manual_path(),
         _ => Ok(None),
     }
 }
@@ -495,7 +524,9 @@ fn select_removable_drive() -> Result<Option<PathBuf>> {
     show_drive_list(&removable)
 }
 
-/// Muestra todos los discos del sistema (fallback cuando no hay removibles).
+/// Muestra todos los discos del sistema (incluye discos internos), tanto por
+/// selección directa desde `select_source` como de fallback cuando no se
+/// detectan dispositivos removibles.
 fn select_all_drives() -> Result<Option<PathBuf>> {
     let all_drives = drives::list_drives();
 
@@ -516,23 +547,50 @@ fn select_all_drives() -> Result<Option<PathBuf>> {
     println!();
     println!(
         "{}",
-        "  ⚠️  Se muestran TODOS los discos. Ten cuidado de no escanear"
+        "  ⚠️  Se muestran TODOS los discos, incluido el de tu sistema (Windows/tu PC)."
             .bright_yellow()
     );
     println!(
         "{}",
-        "     el disco del sistema operativo.".bright_yellow()
+        "     Podés recuperar del disco de tu PC sin problema — lo importante es GUARDAR"
+            .bright_yellow()
+    );
+    println!(
+        "{}",
+        "     los archivos recuperados en OTRO disco o USB, nunca en el mismo que escaneás."
+            .bright_yellow()
     );
     println!();
 
     show_drive_list(&all_drives)
 }
 
+/// Heurística best-effort para marcar en la lista cuál disco es probablemente el del sistema
+/// operativo (Windows: letra C:; Linux/macOS: montado en la raíz "/"). Se marca NO para
+/// prohibir escanearlo (recuperar del disco de la PC es un caso de uso legítimo y común), sino
+/// para recordarle a quien no tiene conocimiento técnico que la carpeta de salida debe ir en
+/// OTRO disco — escribir la recuperación sobre el mismo disco que se escanea es lo peligroso,
+/// no leerlo (ver `same_device_warning`).
+fn is_likely_system_disk(d: &drives::DriveInfo) -> bool {
+    d.all_mounts
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case("C:") || m == "/")
+}
+
 /// Muestra una lista de discos para que el usuario seleccione uno.
 fn show_drive_list(drive_list: &[drives::DriveInfo]) -> Result<Option<PathBuf>> {
     let mut display_items: Vec<String> = drive_list
         .iter()
-        .map(|d| format!("  {}", d.display_name))
+        .map(|d| {
+            if is_likely_system_disk(d) {
+                format!(
+                    "  {}  💻 (disco de tu PC — guardá lo recuperado en OTRO disco/USB)",
+                    d.display_name
+                )
+            } else {
+                format!("  {}", d.display_name)
+            }
+        })
         .collect();
     display_items.push("  ↩️  Volver".to_string());
 
@@ -591,21 +649,21 @@ fn select_image_file() -> Result<Option<PathBuf>> {
         );
         println!();
 
-        let source: String = Input::new()
-            .with_prompt("  📁 Escribe la ruta del archivo de imagen")
-            .interact_text()?;
+        let no_auto_options = vec![
+            "✏️  Escribir ruta manualmente",
+            "↩️  Volver",
+        ];
+        let choice = Select::new()
+            .with_prompt("  ¿Qué deseas hacer?")
+            .items(&no_auto_options)
+            .default(0)
+            .interact()?;
 
-        let path = PathBuf::from(source.trim());
-        if !path.exists() {
-            println!(
-                "{}",
-                "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
-                    .bright_red()
-            );
+        if choice == 1 {
             return Ok(None);
         }
 
-        return Ok(Some(path));
+        return prompt_path_or_cancel("  📁 Ruta del archivo de imagen", false);
     }
 
     println!();
@@ -638,25 +696,48 @@ fn select_image_file() -> Result<Option<PathBuf>> {
 
     if selection == image_files.len() {
         // Escribir ruta manualmente
-        let source: String = Input::new()
-            .with_prompt("  📁 Ruta del archivo de imagen")
-            .interact_text()?;
-
-        let path = PathBuf::from(source.trim());
-        if !path.exists() {
-            println!(
-                "{}",
-                "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
-                    .bright_red()
-            );
-            return Ok(None);
-        }
-
-        return Ok(Some(path));
+        return prompt_path_or_cancel("  📁 Ruta del archivo de imagen", false);
     }
 
     // Volver
     Ok(None)
+}
+
+/// Pide una ruta por teclado; dejar el campo vacío y presionar Enter cancela
+/// (devuelve `None` en vez de tratar la cadena vacía como una ruta inválida).
+/// `allow_raw_device`: si es true, no valida `exists()` para rutas de
+/// dispositivo crudo (`\\.\...`, `/dev/...`), que no son archivos regulares.
+fn prompt_path_or_cancel(prompt: &str, allow_raw_device: bool) -> Result<Option<PathBuf>> {
+    println!(
+        "{}",
+        "  (dejá el campo vacío y presioná Enter para volver)".bright_black()
+    );
+
+    let source: String = Input::new()
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()?;
+
+    let trimmed = source.trim();
+    if trimmed.is_empty() {
+        println!("  ↩️  Cancelado.");
+        return Ok(None);
+    }
+
+    let path = PathBuf::from(trimmed);
+    let is_raw_device = allow_raw_device
+        && (trimmed.starts_with("\\\\.\\") || trimmed.starts_with("/dev/"));
+
+    if !is_raw_device && !path.exists() {
+        println!(
+            "{}",
+            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
+                .bright_red()
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(path))
 }
 
 /// Permite escribir una ruta manualmente (comportamiento original).
@@ -672,26 +753,7 @@ fn select_manual_path() -> Result<Option<PathBuf>> {
     );
     println!();
 
-    let source: String = Input::new()
-        .with_prompt("  📁 Ruta de origen")
-        .interact_text()?;
-
-    let source_path = PathBuf::from(source.trim());
-
-    // Verificar que existe (solo si no es un dispositivo raw)
-    if !source_path.to_string_lossy().starts_with("\\\\.\\")
-        && !source_path.to_string_lossy().starts_with("/dev/")
-        && !source_path.exists()
-    {
-        println!(
-            "{}",
-            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
-                .bright_red()
-        );
-        return Ok(None);
-    }
-
-    Ok(Some(source_path))
+    prompt_path_or_cancel("  📁 Ruta de origen", true)
 }
 
 /// Pregunta si el usuario quiere recuperar los archivos encontrados
@@ -732,37 +794,19 @@ pub fn show_about() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  RecupeGhost es una herramienta portable de    ".white(),
+        "  RecupeGhost busca fotos, videos y audios      ".white(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  recuperación de archivos multimedia borrados.  ".white(),
+        "  borrados que ya no ves en tu PC o USB,        ".white(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "                                                ".white(),
-        "║".bright_cyan()
-    );
-    println!(
-        "{}{}{}",
-        "  ║".bright_cyan(),
-        "  Utiliza la técnica de 'file carving' para     ".white(),
-        "║".bright_cyan()
-    );
-    println!(
-        "{}{}{}",
-        "  ║".bright_cyan(),
-        "  buscar firmas (magic bytes) de archivos       ".white(),
-        "║".bright_cyan()
-    );
-    println!(
-        "{}{}{}",
-        "  ║".bright_cyan(),
-        "  directamente en el disco o imagen raw.        ".white(),
+        "  leyendo el disco directamente.                ".white(),
         "║".bright_cyan()
     );
     println!(
@@ -774,19 +818,73 @@ pub fn show_about() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  Soporta: JPG, PNG, GIF, BMP, WebP, TIFF,     ".bright_yellow(),
+        "  Cómo se usa (3 pasos):                        ".bright_yellow(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  MP4, AVI, MKV, MOV, MP3, WAV, FLAC, OGG,     ".bright_yellow(),
+        "  1. Elegí el disco/USB a revisar               ".white(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  AAC, M4A, AMR, WMA, OPUS y más.               ".bright_yellow(),
+        "  2. Elegí qué tipo de archivo buscar           ".white(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  3. Confirmá, esperá, y recuperalos            ".white(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "                                                ".white(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  Ojo: los archivos recuperados NO              ".bright_yellow(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  conservan su nombre original                  ".bright_yellow(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  (se llaman recovered_0001.ext, etc.)          ".bright_yellow(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "                                                ".white(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  Soporta: JPG, PNG, GIF, BMP, WebP, TIFF,     ".bright_green(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  MP4, AVI, MKV, MOV, MP3, WAV, FLAC, OGG,     ".bright_green(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "  AAC, M4A, AMR, WMA, OPUS, PDF y más.         ".bright_green(),
         "║".bright_cyan()
     );
     println!(
@@ -926,5 +1024,48 @@ fn open_url(url: &str) {
     #[cfg(target_os = "linux")]
     {
         let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive_with_mounts(mounts: &[&str]) -> drives::DriveInfo {
+        drives::DriveInfo {
+            path: "irrelevante".to_string(),
+            display_name: "irrelevante".to_string(),
+            letter: mounts.first().map(|m| m.to_string()),
+            all_mounts: mounts.iter().map(|m| m.to_string()).collect(),
+            size_bytes: 0,
+            is_removable: false,
+        }
+    }
+
+    #[test]
+    fn test_is_likely_system_disk_windows_c() {
+        assert!(is_likely_system_disk(&drive_with_mounts(&["C:"])));
+        // Case-insensitive: WMI a veces devuelve la letra en minuscula.
+        assert!(is_likely_system_disk(&drive_with_mounts(&["c:"])));
+    }
+
+    #[test]
+    fn test_is_likely_system_disk_unix_root() {
+        assert!(is_likely_system_disk(&drive_with_mounts(&["/"])));
+    }
+
+    #[test]
+    fn test_is_likely_system_disk_false_for_data_drives() {
+        assert!(!is_likely_system_disk(&drive_with_mounts(&["D:"])));
+        assert!(!is_likely_system_disk(&drive_with_mounts(&["/home"])));
+        assert!(!is_likely_system_disk(&drive_with_mounts(&["/media/usb"])));
+        assert!(!is_likely_system_disk(&drive_with_mounts(&[])));
+    }
+
+    #[test]
+    fn test_is_likely_system_disk_checks_all_mounts_not_just_first() {
+        // Un disco con /home como primer mount y / como segundo sigue siendo el disco de
+        // sistema (bug #1/#2 de la sesion anterior: antes solo se guardaba el primer mount).
+        assert!(is_likely_system_disk(&drive_with_mounts(&["/home", "/"])));
     }
 }

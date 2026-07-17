@@ -27,3 +27,19 @@ pub fn is_physical_device(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
     s.starts_with("\\\\.\\") || s.starts_with("/dev/")
 }
+
+/// Resuelve una carpeta de salida a ruta absoluta (relativa al directorio de trabajo actual)
+/// sin requerir que exista todavía. Alguien sin conocimiento técnico no sabe "relativo a qué"
+/// es una carpeta como `RecupeGhost_20260217_143022`; con la ruta completa mostrada en el
+/// resumen y al terminar puede encontrarla a simple vista en el explorador de archivos. Se usa
+/// en el flujo interactivo y en el batch para que ambos muestren lo mismo. Si ya es absoluta se
+/// devuelve tal cual; si no se puede determinar el directorio actual, se devuelve sin cambios.
+pub fn to_absolute_output(dir: std::path::PathBuf) -> std::path::PathBuf {
+    if dir.is_absolute() {
+        dir
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&dir))
+            .unwrap_or(dir)
+    }
+}

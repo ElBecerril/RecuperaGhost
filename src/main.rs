@@ -91,6 +91,9 @@ impl CliArgs {
                 chrono::Local::now().format("%Y%m%d_%H%M%S")
             )),
         };
+        // Misma resolución a ruta absoluta que el flujo interactivo, para que el resumen y el
+        // mensaje final de ubicación muestren la ruta completa también en modo batch.
+        let output_dir = util::to_absolute_output(output_dir);
 
         ScanConfig {
             source_path,
@@ -144,6 +147,19 @@ fn enable_windows_ansi() {
 fn main() -> Result<()> {
     #[cfg(windows)]
     enable_windows_ansi();
+
+    // Handler de Ctrl+C (una sola vez, multiplataforma vía `ctrlc`). Si hay un escaneo en
+    // curso, lo cancela de forma cooperativa (para conservando lo encontrado); si no, cierra el
+    // programa con el código estándar 130 (Ctrl+C), que es lo que el usuario espera cuando está
+    // en un menú. El closure corre en un thread propio del crate `ctrlc`, no en el contexto
+    // async de la señal, así que `process::exit` acá es seguro.
+    let _ = ctrlc::set_handler(|| {
+        if scanner::is_scan_in_progress() {
+            scanner::request_cancel();
+        } else {
+            process::exit(130);
+        }
+    });
 
     // CliArgs::parse() debe correr ANTES que cualquier llamada de red o prompt
     // interactivo: así --help/--version responden de inmediato sin tocar la red.
@@ -221,6 +237,9 @@ fn main() -> Result<()> {
                 "{}",
                 format!("  ❌ Error: {}", e).bright_red()
             );
+            if let Some(hint) = friendly_error_hint(&e) {
+                eprintln!("{}", hint.bright_yellow());
+            }
             let mut source = e.source();
             while let Some(cause) = source {
                 eprintln!(
@@ -277,6 +296,9 @@ fn main() -> Result<()> {
                                 "{}",
                                 format!("  ❌ Error durante el escaneo: {}", e).bright_red()
                             );
+                            if let Some(hint) = friendly_error_hint(&e) {
+                                eprintln!("{}", hint.bright_yellow());
+                            }
                             // Mostrar causa raíz si existe
                             let mut source = e.source();
                             while let Some(cause) = source {
@@ -308,6 +330,33 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Busca un `std::io::Error` en la cadena de causas del error y devuelve una traducción
+/// amigable en español para los casos más comunes con los que alguien sin conocimiento técnico
+/// puede toparse (permisos, dispositivo desconectado). El mensaje técnico original se sigue
+/// mostrando abajo como "Causa:" para quien lo necesite; esto es un resumen en criollo antes.
+fn friendly_error_hint(e: &anyhow::Error) -> Option<&'static str> {
+    for cause in e.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::PermissionDenied => Some(
+                    "  🔒 No tenés permisos suficientes para acceder a ese disco o archivo. \
+Si es un disco físico, ejecutá el programa como Administrador (Windows) o con sudo (Linux/macOS).",
+                ),
+                std::io::ErrorKind::NotFound => Some(
+                    "  🔍 No se encontró la ruta indicada. Verificá que el disco/USB siga conectado \
+y que la ruta esté bien escrita.",
+                ),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted => Some(
+                    "  ⏱️  El dispositivo tardó demasiado en responder. Puede estar desconectado \
+o dañado — probá reconectarlo.",
+                ),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// Espera a que el usuario presione ENTER antes de cerrar.
@@ -359,16 +408,29 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     println!();
 
     if result.found_files.is_empty() {
-        println!(
-            "{}",
-            "  😔 No se encontraron archivos multimedia."
-                .bright_yellow()
-        );
-        println!(
-            "{}",
-            "     Intenta con otra imagen de disco o categorías diferentes."
-                .bright_black()
-        );
+        if result.cancelled {
+            println!(
+                "{}",
+                "  ⏹️  Cancelaste antes de que se encontrara ningún archivo."
+                    .bright_yellow()
+            );
+            println!(
+                "{}",
+                "     Podés volver a escanear cuando quieras."
+                    .bright_black()
+            );
+        } else {
+            println!(
+                "{}",
+                "  😔 No se encontraron archivos multimedia."
+                    .bright_yellow()
+            );
+            println!(
+                "{}",
+                "     Intenta con otra imagen de disco o categorías diferentes."
+                    .bright_black()
+            );
+        }
         println!();
         return Ok(());
     }
@@ -378,9 +440,14 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         "{}",
         "  ═══ Archivos encontrados ═══".bright_cyan()
     );
+    println!(
+        "{}",
+        "  (se guardan con este nombre; no conservan el nombre ni la carpeta original)"
+            .bright_black()
+    );
     for (i, found) in result.found_files.iter().enumerate() {
         if i < 20 {
-            println!("  {}", found);
+            println!("  {}", found.friendly_summary());
         } else if i == 20 {
             println!(
                 "  ... y {} archivos más",

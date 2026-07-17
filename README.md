@@ -60,8 +60,10 @@ El binario queda en `target/release/recupe_ghost.exe` (Windows) o `target/releas
 Presenta un menu inteligente donde puedes:
 1. **Seleccionar origen con deteccion automatica:**
    - Memorias USB / discos externos (auto-detectados)
+   - Disco interno / ver todos los discos del sistema (incluye el disco de la PC)
    - Archivos de imagen (.img, .dd, .raw) encontrados en el directorio actual
    - Ruta manual para usuarios avanzados
+   - En cualquier prompt de ruta escrita a mano, dejar el campo vacio y presionar Enter cancela y vuelve al menu anterior
 2. Elegir que tipos de archivo buscar (fotos, videos, audio, documentos)
 3. Escanear con barra de progreso en tiempo real
 4. Recuperar los archivos encontrados a una carpeta organizada
@@ -117,6 +119,7 @@ RecupeGhost escanea byte por byte buscando **firmas de archivo** (magic bytes) e
 - **Imagenes de disco (SSD/NVMe):** auto-detecta CPU cores y divide el archivo en segmentos paralelos (hasta 8 hilos), acelerando el escaneo 2-6x
 - Overlap entre segmentos garantiza que ninguna firma se pierda en fronteras
 - Barra de progreso y tiempo estimado en tiempo real
+- **Cancelable con Ctrl+C:** cortar un escaneo largo conserva todo lo encontrado hasta ese momento (podes recuperarlo igual). La cancelacion es cooperativa: no interrumpe una lectura ya colgada en el kernel (ej. un dispositivo que se desconecto), solo evita empezar el siguiente bloque
 
 **Compatibilidad con discos fisicos (Windows):**
 - Detecta automaticamente memorias USB y discos externos
@@ -156,7 +159,7 @@ src/
 cargo test
 ```
 
-28 tests automatizados:
+33 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -176,6 +179,8 @@ cargo test
 - No-englobing de archivos adyacentes en el mismo buffer
 - Rechazo de falsos positivos MP3/AAC via frame-chaining
 - Parseo de versiones y busqueda de assets (updater)
+- Deteccion del disco de sistema (Windows C: / raiz Unix) para avisos de UI
+- Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
 
 ## Contribuir
 

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,36 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::signatures::{FileCategory, FileSignature};
 use crate::util::format_size;
+
+// ─── Cancelación cooperativa del escaneo (Ctrl+C) ───
+//
+// `SCAN_IN_PROGRESS` lo setea `scan_source_impl` mientras hay un escaneo corriendo, para que el
+// handler de Ctrl+C (instalado una vez en `main`) distinga "cancelar el escaneo en curso" de
+// "cerrar el programa" (comportamiento normal de Ctrl+C cuando el usuario está en un menú).
+//
+// `SCAN_CANCEL_REQUESTED` lo setea el handler; el loop de lectura de `scan_segment` lo chequea
+// una vez por bloque (1 MB) y, si está seteado, corta conservando todo lo encontrado hasta ese
+// punto — exactamente el mismo comportamiento "parar y conservar lo parcial" que ya se usa para
+// sectores dañados. Es cancelación COOPERATIVA: no interrumpe un `read()` ya bloqueado en el
+// kernel (ej. un dispositivo que se cayó), solo evita empezar el siguiente bloque.
+static SCAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static SCAN_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// True si hay un escaneo corriendo ahora mismo. Lo usa el handler de Ctrl+C para decidir entre
+/// cancelar el escaneo o dejar que el programa termine normalmente.
+pub fn is_scan_in_progress() -> bool {
+    SCAN_IN_PROGRESS.load(Ordering::SeqCst)
+}
+
+/// Pide cancelar el escaneo en curso (lo llama el handler de Ctrl+C). El escaneo se detiene en
+/// el próximo bloque y devuelve lo encontrado hasta el momento con `ScanResult::cancelled`.
+pub fn request_cancel() {
+    SCAN_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn is_cancel_requested() -> bool {
+    SCAN_CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
 
 /// Archivo encontrado durante el escaneo
 #[derive(Debug, Clone)]
@@ -39,6 +69,29 @@ impl std::fmt::Display for FoundFile {
     }
 }
 
+impl FoundFile {
+    /// Nombre de archivo con el que se va a guardar al recuperarlo (ver
+    /// `recovery::recover_files`, que usa este mismo formato para nombrar el archivo real en
+    /// disco). Centralizado acá para que la lista de "archivos encontrados" que ve el usuario
+    /// (antes de recuperar) muestre el mismo nombre que después va a encontrar en la carpeta
+    /// de salida, en vez de un offset hexadecimal sin usar `unwrap()`/expect() que no le sirve
+    /// de nada a alguien sin conocimiento técnico.
+    pub fn recovered_filename(&self) -> String {
+        format!("recovered_{:04}.{}", self.index, self.signature.extension)
+    }
+
+    /// Línea de resumen pensada para el usuario final (sin offsets ni jerga técnica): muestra
+    /// el nombre con el que va a quedar guardado y el tamaño.
+    pub fn friendly_summary(&self) -> String {
+        format!(
+            "{} {} — {}",
+            self.signature.category,
+            self.recovered_filename(),
+            format_size(self.size)
+        )
+    }
+}
+
 /// Resultado completo del escaneo
 pub struct ScanResult {
     pub found_files: Vec<FoundFile>,
@@ -52,6 +105,9 @@ pub struct ScanResult {
     /// incompleto — pero `found_files` igual contiene todo lo que se logró encontrar en las
     /// partes del origen que sí se pudieron leer, en vez de haberse descartado por completo.
     pub had_errors: bool,
+    /// true si el usuario canceló el escaneo con Ctrl+C antes de terminar. Igual que con
+    /// `had_errors`, `found_files` conserva todo lo hallado hasta el momento de cancelar.
+    pub cancelled: bool,
 }
 
 impl ScanResult {
@@ -65,6 +121,11 @@ impl ScanResult {
             self.documents_count,
             format_size(self.bytes_scanned),
         );
+        if self.cancelled {
+            s.push_str(
+                "\n   ⏹️  Cancelaste el escaneo antes de terminar — abajo está solo lo que se\n       alcanzó a encontrar hasta ese punto. Podés recuperarlo igual.",
+            );
+        }
         if self.had_errors {
             s.push_str(
                 "\n   ⚠️  El escaneo tuvo errores de I/O leyendo el origen (sectores dañados u\n       otro fallo de lectura) — el resultado es parcial: puede faltar contenido de\n       las zonas que no se pudieron leer.",
@@ -277,10 +338,17 @@ struct SegmentResult {
 /// Cada hilo abre su propio File handle y escanea secuencialmente dentro del segmento.
 /// Solo retiene resultados con offset en [claim_start, claim_end).
 ///
-/// Limitación conocida (M7, no resuelta aquí): `file.read()` más abajo no tiene timeout ni
-/// forma de cancelarse. Si el dispositivo de origen deja de responder (ej. un USB que se cae
-/// a media lectura), este read puede bloquear indefinidamente y el hilo nunca retorna.
-/// Implementar cancelación está fuera de alcance de este cambio.
+/// `cancel`: flag de cancelación cooperativa (Ctrl+C). Se chequea una vez por bloque; si está
+/// seteado, el escaneo del segmento corta conservando lo encontrado hasta ese punto. Se recibe
+/// por parámetro (en producción es `&SCAN_CANCEL_REQUESTED`, el flag global que setea el handler
+/// de Ctrl+C) en vez de leer el global directamente, para que los tests puedan pasar su propio
+/// flag sin interferir con el estado global compartido entre tests que corren en paralelo.
+///
+/// Limitación conocida (M7, no resuelta aquí): la cancelación es COOPERATIVA — no interrumpe un
+/// `file.read()` ya bloqueado en el kernel. Si el dispositivo de origen deja de responder (ej.
+/// un USB que se cae a media lectura), ese read puede bloquear indefinidamente y el chequeo de
+/// `cancel` no llega a ejecutarse hasta el siguiente bloque. Cancelar un escaneo que progresa
+/// (el caso común) sí funciona; interrumpir un dispositivo colgado requeriría timeouts de I/O.
 ///
 /// (B1) A propósito esta función NUNCA devuelve `Err`: un solo sector dañado (I/O error) en
 /// cualquier punto del origen es el escenario CENTRAL de uso de esta herramienta (discos
@@ -297,6 +365,7 @@ fn scan_segment(
     max_header_len: usize,
     progress_bytes: &AtomicU64,
     inline_pb: Option<&ProgressBar>,
+    cancel: &AtomicBool,
 ) -> SegmentResult {
     let mut file = match File::open(source_path) {
         Ok(f) => f,
@@ -337,6 +406,13 @@ fn scan_segment(
 
     loop {
         if position >= segment.end {
+            break;
+        }
+
+        // Cancelación cooperativa: si el usuario apretó Ctrl+C, cortar acá conservando todo lo
+        // encontrado hasta este bloque (mismo patrón "parar y conservar" que los errores de
+        // I/O de más abajo). Se chequea una vez por bloque de 1 MB → respuesta en ~decenas de ms.
+        if cancel.load(Ordering::SeqCst) {
             break;
         }
 
@@ -473,6 +549,20 @@ fn scan_source_impl(
     file_size: u64,
     num_threads: usize,
 ) -> Result<ScanResult> {
+    // Marcar el escaneo como "en progreso" para que el handler de Ctrl+C cancele en vez de
+    // cerrar el programa, y limpiar cualquier cancelación pendiente de un escaneo anterior (en
+    // modo interactivo se puede escanear, cancelar, volver al menú y reescanear). El guard con
+    // `Drop` garantiza que `SCAN_IN_PROGRESS` se limpie al salir de la función pase lo que pase.
+    struct ScanGuard;
+    impl Drop for ScanGuard {
+        fn drop(&mut self) {
+            SCAN_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    SCAN_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
+    let _scan_guard = ScanGuard;
+
     println!(
         "  🔎 Escaneando: {}",
         source_path.display()
@@ -534,6 +624,11 @@ fn scan_source_impl(
     if num_threads > 1 {
         println!("  🧵 Usando {} hilos de escaneo", num_threads);
     }
+    println!(
+        "{}",
+        "  ⏹️  Podés cancelar en cualquier momento con Ctrl+C (se guarda lo encontrado hasta ahí)."
+            .bright_black()
+    );
     println!();
 
     let pb = ProgressBar::new(file_size);
@@ -558,7 +653,7 @@ fn scan_source_impl(
         let progress = AtomicU64::new(0);
         // (B1) scan_segment ya no propaga errores de I/O con `?` — un sector dañado en
         // cualquier punto del origen ya no descarta todo lo encontrado antes de llegar a él.
-        let result = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb));
+        let result = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb), &SCAN_CANCEL_REQUESTED);
         if result.had_errors {
             eprintln!("  ⚠️  El escaneo tuvo errores de I/O leyendo el origen; el resultado es parcial.");
         }
@@ -596,7 +691,9 @@ fn scan_source_impl(
                 let sigs = sigs_arc.clone();
                 let prog = progress.clone();
                 std::thread::spawn(move || {
-                    scan_segment(&path, &segment, &sigs, file_size, max_header_len, &prog, None)
+                    // `&SCAN_CANCEL_REQUESTED` es una referencia 'static (es un static global),
+                    // así que se puede mover a cada worker sin clonar ni envolver en Arc.
+                    scan_segment(&path, &segment, &sigs, file_size, max_header_len, &prog, None, &SCAN_CANCEL_REQUESTED)
                 })
             })
             .collect();
@@ -648,11 +745,21 @@ fn scan_source_impl(
         (all_files, scanned, multi_had_errors)
     };
 
+    // Capturar si el escaneo fue cancelado por el usuario (Ctrl+C). `found_files` ya contiene
+    // solo lo hallado antes de cortar.
+    let cancelled = is_cancel_requested();
+
     // A2: segundo pase de footer, en un solo hilo, para archivos cuyo footer no apareció
-    // dentro del buffer/chunk original — ver `refine_footers`.
+    // dentro del buffer/chunk original — ver `refine_footers`. Solo itera sobre los archivos ya
+    // encontrados (seeks puntuales), no re-lee el origen entero, así que es rápido aun tras
+    // cancelar.
     refine_footers(source_path, &mut found_files);
 
-    pb.finish_with_message("✅ Escaneo completado");
+    if cancelled {
+        pb.finish_with_message("⏹️  Escaneo cancelado");
+    } else {
+        pb.finish_with_message("✅ Escaneo completado");
+    }
     println!();
 
     let photos_count = found_files
@@ -680,6 +787,7 @@ fn scan_source_impl(
         audios_count,
         documents_count,
         had_errors,
+        cancelled,
     })
 }
 
@@ -1994,5 +2102,62 @@ mod tests {
         );
 
         println!("\nValidador BMP acepta headers coherentes y rechaza campos incoherentes.");
+    }
+
+    #[test]
+    fn test_scan_cancellation_stops_before_reading() {
+        // Un flag de cancelación ya seteado al arrancar debe hacer que scan_segment corte en la
+        // primera iteración del loop (el chequeo está ANTES del read), sin encontrar nada. Con
+        // el flag en false, el mismo escaneo sí encuentra el JPEG. Usa AtomicBool locales, no el
+        // global SCAN_CANCEL_REQUESTED, para no interferir con otros tests que corren en paralelo.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0u8; 4096];
+        let pos = 512usize;
+        data[pos..pos + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        for i in 3..2048 {
+            data[pos + i] = ((i * 7) % 256) as u8;
+        }
+        data[pos + 2048..pos + 2050].copy_from_slice(&[0xFF, 0xD9]);
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let max_header_len = max_signature_reach(&sigs);
+        let segment = Segment {
+            start: 0,
+            end: 4096,
+            claim_start: 0,
+            claim_end: 4096,
+        };
+
+        // Cancelado de entrada → no lee, no encuentra nada.
+        let progress = AtomicU64::new(0);
+        let cancel_on = AtomicBool::new(true);
+        let cancelled = scan_segment(
+            file.path(), &segment, &sigs, 4096, max_header_len, &progress, None, &cancel_on,
+        );
+        assert!(
+            cancelled.found_files.is_empty(),
+            "con cancelación activa scan_segment no debería encontrar archivos, encontró {}",
+            cancelled.found_files.len()
+        );
+        assert_eq!(
+            progress.load(Ordering::SeqCst),
+            0,
+            "con cancelación activa no debería haber leído ningún byte"
+        );
+
+        // Sin cancelar → sí encuentra el JPEG.
+        let progress2 = AtomicU64::new(0);
+        let cancel_off = AtomicBool::new(false);
+        let normal = scan_segment(
+            file.path(), &segment, &sigs, 4096, max_header_len, &progress2, None, &cancel_off,
+        );
+        assert!(
+            normal.found_files.iter().any(|f| f.signature.extension == "jpg"),
+            "sin cancelar, scan_segment debería encontrar el JPEG"
+        );
+
+        println!("\nCancelación cooperativa corta el escaneo antes de leer y conserva el flujo normal.");
     }
 }

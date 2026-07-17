@@ -59,10 +59,7 @@ pub fn recover_files(
             crate::signatures::FileCategory::Document => &documents_dir,
         };
 
-        let filename = format!(
-            "recovered_{:04}.{}",
-            found.index, found.signature.extension
-        );
+        let filename = found.recovered_filename();
         let dest_path = dest_dir.join(&filename);
 
         match extract_file(&mut source, found, &dest_path) {
