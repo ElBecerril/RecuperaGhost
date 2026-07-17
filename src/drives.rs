@@ -9,8 +9,14 @@ pub struct DriveInfo {
     pub path: String,
     /// Nombre legible para mostrar al usuario (ej: `D: - Kingston DataTraveler (14.5 GB)`)
     pub display_name: String,
-    /// Letra de unidad (solo Windows, ej: `D:`)
+    /// Letra de unidad o punto de montaje principal, usado para mostrar
+    /// (solo Windows, ej: `D:`; o el primer mountpoint detectado en Linux).
     pub letter: Option<String>,
+    /// TODOS los puntos de montaje / letras de unidad asociados a este disco
+    /// físico (no solo el primero). Necesario para que `same_device_warning`
+    /// pueda detectar coincidencias contra cualquier partición montada del
+    /// disco, no solo la primera que aparezca en el listado.
+    pub all_mounts: Vec<String>,
     /// Tamaño en bytes
     pub size_bytes: u64,
     /// Si es un dispositivo removible (USB, disco externo)
@@ -159,6 +165,13 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
         let media_type = disk.media_type.unwrap_or_default().to_lowercase();
+        // D3 (bonus, no crítico): WMI reporta discos duros/SSD externos por USB
+        // como "Fixed hard disk media", no como "removable"/"external", así que
+        // este heurístico no los detecta. Para cubrirlo haría falta consultar
+        // también la interfaz (ej. Win32_DiskDrive.InterfaceType == "USB" via
+        // MSFT_PhysicalDisk.BusType, o Win32_DiskDriveToDiskPartition +
+        // Win32_USBHub) y sumarla como señal OR adicional aquí. Se deja
+        // documentado sin tocar la query WMI actual.
         let is_removable = media_type.contains("removable") || media_type.contains("external");
 
         // Buscar letra de unidad asociada a este disco
@@ -171,10 +184,15 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
             .chars()
             .rev()
             .collect::<String>();
-        let letter = letter_map
+        // Todas las letras de unidad asociadas a este disco físico (bug #2:
+        // antes solo se guardaba la primera con `.find()`, ignorando el resto
+        // de las letras del mismo disco cuando tiene varias particiones montadas).
+        let all_mounts: Vec<String> = letter_map
             .iter()
-            .find(|(disk_ref, _)| *disk_ref == drive_num)
-            .map(|(_, letter)| letter.clone());
+            .filter(|(disk_ref, _)| *disk_ref == drive_num)
+            .map(|(_, letter)| letter.clone())
+            .collect();
+        let letter = all_mounts.first().cloned();
 
         let display_name = if let Some(ref l) = letter {
             format!("{} - {} ({})", l, model, crate::util::format_size(size_bytes))
@@ -186,6 +204,7 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
             path: device_id,
             display_name,
             letter,
+            all_mounts,
             size_bytes,
             is_removable,
         });
@@ -332,6 +351,7 @@ fn list_drives_wmic() -> Option<Vec<DriveInfo>> {
             path: device_id,
             display_name,
             letter: None,
+            all_mounts: Vec::new(),
             size_bytes,
             is_removable,
         });
@@ -439,16 +459,23 @@ fn list_drives_linux() -> Vec<DriveInfo> {
             .unwrap_or(0);
         let is_removable = dev.rm.unwrap_or(false);
 
-        // Buscar punto de montaje en las particiones hijas
-        let mount = dev
+        // Buscar TODOS los puntos de montaje en las particiones hijas (bug #1:
+        // antes se usaba `.find_map()` que corta en el primer mountpoint no
+        // vacío, ignorando el resto de las particiones montadas del mismo
+        // disco físico, ej. /boot en sda1 y /home en sda2).
+        let all_mounts: Vec<String> = dev
             .children
             .as_ref()
-            .and_then(|children| {
+            .map(|children| {
                 children
                     .iter()
-                    .find_map(|c| c.mountpoint.as_ref().filter(|m| !m.is_empty()))
+                    .filter_map(|c| c.mountpoint.as_ref())
+                    .filter(|m| !m.is_empty())
+                    .cloned()
+                    .collect()
             })
-            .cloned();
+            .unwrap_or_default();
+        let mount = all_mounts.first().cloned();
 
         let display_name = if let Some(ref m) = mount {
             format!("{} - {} ({}) [{}]", path, model, crate::util::format_size(size_bytes), m)
@@ -460,6 +487,7 @@ fn list_drives_linux() -> Vec<DriveInfo> {
             path,
             display_name,
             letter: mount,
+            all_mounts,
             size_bytes,
             is_removable,
         });
@@ -495,6 +523,11 @@ fn list_drives_macos() -> Vec<DriveInfo> {
             let after_key = &plist[key_pos..];
             let array_start = after_key.find("<array>")? + "<array>".len();
             let array_end = after_key.find("</array>")?;
+            // D4: si el tag de cierre aparece antes que el de apertura (plist
+            // mal formado o inesperado), evitar el panic de slicing inválido.
+            if array_end < array_start {
+                return None;
+            }
             Some(&after_key[array_start..array_end])
         })
         .map(|array_block| {
@@ -566,6 +599,7 @@ fn get_macos_disk_info(disk_path: &str) -> Option<DriveInfo> {
         path: disk_path.to_string(),
         display_name,
         letter: None,
+        all_mounts: Vec::new(),
         size_bytes,
         is_removable,
     })

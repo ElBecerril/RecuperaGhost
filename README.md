@@ -19,13 +19,19 @@
 
 Herramienta CLI de recuperacion de archivos multimedia borrados, escrita en Rust. Utiliza **file carving** para buscar firmas (magic bytes) directamente en discos o imagenes raw, sin depender del sistema de archivos.
 
-## Formatos soportados (21)
+## Formatos soportados (25)
 
 | Categoria | Formatos |
 |-----------|----------|
-| Fotos (6) | JPEG, PNG, GIF, BMP, WebP, TIFF |
+| Fotos (9) | JPEG, PNG, GIF, BMP, WebP, TIFF (little-endian y big-endian), HEIC/HEIF, CR2 (Canon RAW) |
 | Videos (6) | MP4/M4V, AVI, MKV, FLV, MOV, 3GP |
 | Audio (9) | MP3, WAV, FLAC, OGG Vorbis, AAC, M4A, WMA, AMR, OPUS |
+| Documentos (1) | PDF |
+
+> **Nikon NEF:** no tiene un marcador propio a offset fijo (es TIFF-based sin firma
+> distintiva salvo parseando tags IFD como `Make`), asi que un NEF se recupera bajo la firma
+> generica "TIFF" — el contenedor es valido y los datos se preservan, solo queda con
+> extension `.tiff` en vez de `.nef`.
 
 ## Instalacion
 
@@ -56,7 +62,7 @@ Presenta un menu inteligente donde puedes:
    - Memorias USB / discos externos (auto-detectados)
    - Archivos de imagen (.img, .dd, .raw) encontrados en el directorio actual
    - Ruta manual para usuarios avanzados
-2. Elegir que tipos de archivo buscar (fotos, videos, audio)
+2. Elegir que tipos de archivo buscar (fotos, videos, audio, documentos)
 3. Escanear con barra de progreso en tiempo real
 4. Recuperar los archivos encontrados a una carpeta organizada
 
@@ -71,6 +77,9 @@ Presenta un menu inteligente donde puedes:
 
 # Solo videos y audio
 ./recupe_ghost /dev/sdb1 --videos --audio
+
+# Solo documentos (PDF)
+./recupe_ghost disco.img --documentos
 
 # Ayuda
 ./recupe_ghost --help
@@ -88,9 +97,10 @@ Los archivos se organizan automaticamente:
 
 ```
 RecupeGhost_20260216_143022/
-  fotos/    -> recovered_0001.jpg, recovered_0002.png, ...
-  videos/   -> recovered_0003.mp4, recovered_0004.avi, ...
-  audios/   -> recovered_0005.mp3, recovered_0006.wav, ...
+  fotos/       -> recovered_0001.jpg, recovered_0002.png, ...
+  videos/      -> recovered_0003.mp4, recovered_0004.avi, ...
+  audios/      -> recovered_0005.mp3, recovered_0006.wav, ...
+  documentos/  -> recovered_0006.pdf, ...
 ```
 
 ## Como funciona
@@ -133,7 +143,7 @@ src/
   main.rs              -> Punto de entrada, CLI con clap, modo interactivo/batch
   banner.rs            -> Banner ASCII y branding
   drives.rs            -> Deteccion de discos por plataforma (Windows/Linux/macOS)
-  signatures/mod.rs    -> 21 firmas de archivo (magic bytes, extra_check, footer)
+  signatures/mod.rs    -> 25 firmas de archivo (magic bytes, extra_check, footer)
   scanner/mod.rs       -> Motor de escaneo multi-hilo por file carving + IOCTL + 9 tests
   recovery/mod.rs      -> Extraccion de archivos a carpetas organizadas
   ui/mod.rs            -> Menus interactivos con seleccion inteligente de origen
@@ -146,10 +156,17 @@ src/
 cargo test
 ```
 
-17 tests automatizados:
+28 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
+- Deteccion de TIFF big-endian (Motorola byte order)
+- Desambiguacion HEIC/HEIF vs MP4 (misma caja ftyp, distinto major_brand, incluye brands hevm/hevs)
+- Desambiguacion CR2 vs TIFF generico (mismo header, distinto marcador)
+- Desambiguacion 3GP/M4A vs MP4 (misma caja ftyp)
+- Validador BMP (BITMAPFILEHEADER coherente vs datos aleatorios)
+- Deteccion de PDF (header %PDF- y footer %%EOF)
+- Recuperacion truncada vs completa (RecoveryResult distingue ambos casos)
 - Deteccion de footer JPEG (incluye fotos con thumbnail EXIF embebido)
 - Flujo completo de recuperacion
 - Calculo de segmentos para escaneo paralelo

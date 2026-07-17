@@ -130,15 +130,16 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     println!();
 
     let type_options = vec![
-        "📷 Fotos (JPG, PNG, GIF, BMP, WebP, TIFF)",
+        "📷 Fotos (JPG, PNG, GIF, BMP, WebP, TIFF, HEIC, CR2)",
         "🎬 Videos (MP4, AVI, MKV, MOV, FLV, 3GP)",
         "🎵 Audio (MP3, WAV, FLAC, OGG, AAC, M4A, AMR, WMA, OPUS)",
+        "📄 Documentos (PDF)",
     ];
 
     let selected_types = MultiSelect::new()
         .with_prompt("  🎯 Tipos de archivo")
         .items(&type_options)
-        .defaults(&[true, true, true])
+        .defaults(&[true, true, true, true])
         .interact()?;
 
     if selected_types.is_empty() {
@@ -156,6 +157,7 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
             0 => categories.push(FileCategory::Photo),
             1 => categories.push(FileCategory::Video),
             2 => categories.push(FileCategory::Audio),
+            3 => categories.push(FileCategory::Document),
             _ => {}
         }
     }
@@ -225,30 +227,15 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
 /// Patrones reconocidos:
 /// - Linux: `/dev/sdXN` -> `/dev/sdX` (ej. `/dev/sdb1` -> `/dev/sdb`)
 /// - Linux: `/dev/nvmeXnYpZ` -> `/dev/nvmeXnY` (ej. `/dev/nvme0n1p2` -> `/dev/nvme0n1`)
+/// - Linux: `/dev/mmcblkNpM` -> `/dev/mmcblkN` (ej. `/dev/mmcblk0p1` -> `/dev/mmcblk0`, tarjetas SD/eMMC)
+/// - Linux: cualquier `/dev/<prefijo><N>p<M>` donde el nombre termina en
+///   dígitos y la 'p' está precedida por otro dígito (ej. `/dev/nbd0p1`)
 /// - macOS: `/dev/diskNsM` -> `/dev/diskN` (ej. `/dev/disk2s1` -> `/dev/disk2`)
 ///
 /// Si el path no matchea ninguno de estos patrones de partición (ej. ya es un
 /// disco completo, o es una ruta de Windows tipo `\\.\PhysicalDriveN`), se
 /// devuelve tal cual sin modificar.
 fn normalize_to_whole_disk(path: &str) -> String {
-    // Caso NVMe: /dev/nvme<N>n<M>p<P> -> /dev/nvme<N>n<M>
-    if let Some(rest) = path.strip_prefix("/dev/nvme") {
-        // rest debe tener forma "<N>n<M>p<P>"; buscamos la 'p' que precede al
-        // sufijo numérico de partición.
-        if let Some(p_idx) = rest.rfind('p') {
-            let (before_p, after_p) = rest.split_at(p_idx);
-            let partition_suffix = &after_p[1..]; // sin la 'p'
-            if !before_p.is_empty()
-                && before_p.contains('n')
-                && !partition_suffix.is_empty()
-                && partition_suffix.chars().all(|c| c.is_ascii_digit())
-            {
-                return format!("/dev/nvme{}", before_p);
-            }
-        }
-        return path.to_string();
-    }
-
     // Caso macOS: /dev/disk<N>s<M> -> /dev/disk<N>
     if let Some(rest) = path.strip_prefix("/dev/disk") {
         if let Some(s_idx) = rest.find('s') {
@@ -265,8 +252,33 @@ fn normalize_to_whole_disk(path: &str) -> String {
         return path.to_string();
     }
 
-    // Caso genérico Linux (sd*, vd*, hd*, xvd*, etc.): /dev/<letras><digitos> -> /dev/<letras>
     if let Some(rest) = path.strip_prefix("/dev/") {
+        // Caso genérico "con número de controlador" (bug #3: antes solo se
+        // reconocía "nvme" hardcodeado, dejando afuera mmcblk/nbd/loop/etc.):
+        // si el nombre termina en dígitos y justo antes de esos dígitos hay
+        // una 'p' precedida a su vez por otro dígito, el sufijo "pN" es el
+        // separador estándar de partición (ej. nvme0n1p2, mmcblk0p1, nbd0p1)
+        // y se corta ahí, quedándonos con el disco completo.
+        let digits_start = rest.rfind(|c: char| !c.is_ascii_digit()).map(|i| i + 1);
+        if let Some(digits_start) = digits_start {
+            if digits_start < rest.len() {
+                // rest[..digits_start] termina en 'p', y el char anterior a
+                // esa 'p' es un dígito (ej. "nvme0n1" + "p" + "2").
+                if let Some(before_p) = rest[..digits_start].strip_suffix('p') {
+                    if before_p
+                        .chars()
+                        .last()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
+                        return format!("/dev/{}", before_p);
+                    }
+                }
+            }
+        }
+
+        // Caso simple sd*, vd*, hd*, xvd*, etc. (letras + dígitos, sin 'p'):
+        // /dev/<letras><digitos> -> /dev/<letras>
         let letters_end = rest.find(|c: char| c.is_ascii_digit());
         if let Some(idx) = letters_end {
             let (letters, digits) = rest.split_at(idx);
@@ -291,23 +303,33 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
 
     let normalized_src = normalize_to_whole_disk(&src_str);
 
-    // Buscar el punto de montaje del dispositivo origen entre los discos detectados.
-    // Primero se intenta con el path tal cual (caso disco completo o
-    // \\.\PhysicalDriveN de Windows), y si no matchea se reintenta con el
-    // identificador de disco completo normalizado (caso partición, ej.
-    // /dev/sdb1 -> /dev/sdb, /dev/nvme0n1p2 -> /dev/nvme0n1, /dev/disk2s1 -> /dev/disk2).
+    // Buscar el disco origen entre los discos detectados. Primero se intenta
+    // con el path tal cual (caso disco completo o \\.\PhysicalDriveN de
+    // Windows), y si no matchea se reintenta con el identificador de disco
+    // completo normalizado (caso partición, ej. /dev/sdb1 -> /dev/sdb,
+    // /dev/nvme0n1p2 -> /dev/nvme0n1, /dev/mmcblk0p1 -> /dev/mmcblk0,
+    // /dev/disk2s1 -> /dev/disk2).
+    //
+    // Bug #5: la comparación de rutas de Windows (`\\.\PhysicalDrive1` vs
+    // `\\.\physicaldrive1`) debe ser case-insensitive.
     let drives = drives::list_drives();
-    let mount = drives
+    let matched_drive = drives
         .iter()
-        .find(|d| d.path == src_str)
-        .or_else(|| drives.iter().find(|d| d.path == normalized_src))
-        .and_then(|d| d.letter.clone())?;
+        .find(|d| d.path.eq_ignore_ascii_case(&src_str))
+        .or_else(|| drives.iter().find(|d| d.path.eq_ignore_ascii_case(&normalized_src)));
 
-    if mount.trim().is_empty() {
-        return None;
-    }
-
-    let mount_path = PathBuf::from(&mount);
+    // Bug #1/#2: usar TODOS los mountpoints/letras del disco origen, no solo
+    // el primero (`all_mounts`), para no perder de vista particiones
+    // adicionales montadas del mismo disco físico.
+    let mounts: Vec<String> = matched_drive
+        .map(|d| {
+            d.all_mounts
+                .iter()
+                .filter(|m| !m.trim().is_empty())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Resolver el directorio de salida a una ruta absoluta lo mejor posible
     // sin requerir que exista todavía.
@@ -319,46 +341,70 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
             Err(_) => output_dir.to_path_buf(),
         }
     };
-
     let candidate_str = candidate.to_string_lossy().replace('\\', "/");
-    let mount_str = mount_path.to_string_lossy().replace('\\', "/");
-    let mount_prefix = mount_str.trim_end_matches('/');
 
-    let mut same = candidate_str == mount_str
-        || candidate_str.starts_with(&format!("{}/", mount_prefix))
-        || candidate_str == mount_prefix;
+    // Bug #4: si no pudimos determinar ningún mountpoint/letra del disco de
+    // origen (ya sea porque el disco no aparece en `list_drives()` o porque
+    // no tiene ninguna partición montada detectada), no hay forma segura de
+    // probar que el destino está en un disco distinto. En vez de saltear la
+    // advertencia (`?` anterior devolvía `None` de inmediato), preferimos un
+    // falso positivo ocasional a un falso negativo que corrompa la
+    // recuperación en curso.
+    if mounts.is_empty() {
+        return Some(format!(
+            "  ⚠️  No se pudo confirmar que el directorio de salida esté en un disco distinto al que estás escaneando ({}).\n     Por seguridad, verifica manualmente que no estés recuperando hacia el mismo dispositivo.",
+            src_str
+        ));
+    }
 
-    // Comprobación adicional en Unix vía device id (best-effort, si es posible).
-    #[cfg(unix)]
-    if !same {
-        use std::os::unix::fs::MetadataExt;
+    for mount in &mounts {
+        let mount_path = PathBuf::from(mount);
+        let mount_str = mount_path.to_string_lossy().replace('\\', "/");
+        let mount_prefix = mount_str.trim_end_matches('/');
 
-        fn dev_id_of(mut path: std::path::PathBuf) -> Option<u64> {
-            loop {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    return Some(meta.dev());
+        // Bug #6: cuando `mount == "/"`, `mount_prefix` queda vacío tras el
+        // `trim_end_matches('/')`, y `starts_with("{}/", mount_prefix)`
+        // degenera en `starts_with("/")`, que matchea CUALQUIER ruta
+        // absoluta (falso positivo con discos montados en otro punto). Solo
+        // aplicamos el chequeo de prefijo cuando `mount_prefix` no es vacío;
+        // el caso `mount == "/"` sigue cubierto por la igualdad exacta y por
+        // la comprobación de device id de más abajo.
+        let mut same = candidate_str == mount_str
+            || candidate_str == mount_prefix
+            || (!mount_prefix.is_empty() && candidate_str.starts_with(&format!("{}/", mount_prefix)));
+
+        // Comprobación adicional en Unix vía device id (best-effort, si es posible).
+        #[cfg(unix)]
+        if !same {
+            use std::os::unix::fs::MetadataExt;
+
+            fn dev_id_of(mut path: std::path::PathBuf) -> Option<u64> {
+                loop {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        return Some(meta.dev());
+                    }
+                    if !path.pop() {
+                        return None;
+                    }
                 }
-                if !path.pop() {
-                    return None;
-                }
+            }
+
+            if let (Some(out_dev), Some(mount_dev)) =
+                (dev_id_of(candidate.clone()), dev_id_of(mount_path.clone()))
+            {
+                same = out_dev == mount_dev;
             }
         }
 
-        if let (Some(out_dev), Some(mount_dev)) =
-            (dev_id_of(candidate.clone()), dev_id_of(mount_path.clone()))
-        {
-            same = out_dev == mount_dev;
+        if same {
+            return Some(format!(
+                "  ⚠️  El directorio de salida parece estar en el mismo dispositivo que estás escaneando ({}).\n     Recuperar archivos ahí puede sobrescribir los sectores borrados que intentas rescatar.",
+                mount
+            ));
         }
     }
 
-    if same {
-        Some(format!(
-            "  ⚠️  El directorio de salida parece estar en el mismo dispositivo que estás escaneando ({}).\n     Recuperar archivos ahí puede sobrescribir los sectores borrados que intentas rescatar.",
-            mount
-        ))
-    } else {
-        None
-    }
+    None
 }
 
 /// Menú inteligente para seleccionar la fuente de escaneo.

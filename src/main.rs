@@ -19,7 +19,7 @@ use ui::{MainMenuChoice, ScanConfig};
 
 /// RecupeGhost - El Detective de Archivos Perdidos
 ///
-/// Recupera fotos, videos y audios borrados desde discos o imágenes raw.
+/// Recupera fotos, videos, audios y documentos borrados desde discos o imágenes raw.
 /// Sin argumentos entra en modo interactivo.
 #[derive(Parser)]
 #[command(name = "RecupeGhost", version = banner::VERSION)]
@@ -39,6 +39,10 @@ struct CliArgs {
     #[arg(long)]
     audio: bool,
 
+    /// Buscar documentos (PDF)
+    #[arg(long)]
+    documentos: bool,
+
     /// Directorio de salida para archivos recuperados
     #[arg(short = 'o', long = "output")]
     output: Option<String>,
@@ -55,9 +59,14 @@ impl CliArgs {
     fn into_scan_config(self, source: String) -> ScanConfig {
         let source_path = PathBuf::from(source);
 
-        let categories = if !self.fotos && !self.videos && !self.audio {
+        let categories = if !self.fotos && !self.videos && !self.audio && !self.documentos {
             // Ningún flag = buscar todo
-            vec![FileCategory::Photo, FileCategory::Video, FileCategory::Audio]
+            vec![
+                FileCategory::Photo,
+                FileCategory::Video,
+                FileCategory::Audio,
+                FileCategory::Document,
+            ]
         } else {
             let mut cats = Vec::new();
             if self.fotos {
@@ -68,6 +77,9 @@ impl CliArgs {
             }
             if self.audio {
                 cats.push(FileCategory::Audio);
+            }
+            if self.documentos {
+                cats.push(FileCategory::Document);
             }
             cats
         };
@@ -89,16 +101,17 @@ impl CliArgs {
 
     /// Valida que no se pasen flags sin source.
     fn validate(&self) {
-        let has_flags = self.fotos || self.videos || self.audio || self.output.is_some();
+        let has_flags =
+            self.fotos || self.videos || self.audio || self.documentos || self.output.is_some();
         if self.source.is_none() && has_flags {
             eprintln!(
                 "{}",
-                "  ❌ Error: debes especificar una ruta de origen cuando usas --fotos, --videos, --audio u -o."
+                "  ❌ Error: debes especificar una ruta de origen cuando usas --fotos, --videos, --audio, --documentos u -o."
                     .bright_red()
             );
             eprintln!(
                 "{}",
-                "     Uso: recupe_ghost <SOURCE> [--fotos] [--videos] [--audio] [-o <OUTPUT>]"
+                "     Uso: recupe_ghost <SOURCE> [--fotos] [--videos] [--audio] [--documentos] [-o <OUTPUT>]"
                     .bright_yellow()
             );
             process::exit(1);
@@ -228,6 +241,29 @@ fn main() -> Result<()> {
             wait_for_keypress();
         }
     } else {
+        // Sin source y sin TTY de ENTRADA (script/cron que olvidó pasar argumentos,
+        // wrapper que invoca mal el binario, etc.): no entrar al menú interactivo, que
+        // se quedaría colgado esperando input de dialoguer que nunca va a llegar.
+        // Ojo: se chequea stdin específicamente (lo que dialoguer realmente lee), no
+        // `is_tty` (que es de stdout, usado arriba para decisiones cosméticas como
+        // saltar el update-check). Si se usara `is_tty` acá, un uso legítimo como
+        // `recupe_ghost | tee log.txt` (stdin sigue siendo un TTY real; solo stdout
+        // está redirigido) abortaría en vez de mostrar el menú interactivo.
+        let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        if !stdin_is_tty {
+            eprintln!(
+                "{}",
+                "  ❌ Error: no se especificó un origen y no hay una terminal interactiva disponible (ejecución sin TTY)."
+                    .bright_red()
+            );
+            eprintln!(
+                "{}",
+                "     Especifica un origen: recupe_ghost <SOURCE> [--fotos] [--videos] [--audio] [--documentos] [-o <OUTPUT>]"
+                    .bright_yellow()
+            );
+            process::exit(1);
+        }
+
         // ── Modo interactivo (comportamiento original) ──
         banner::show_banner();
 

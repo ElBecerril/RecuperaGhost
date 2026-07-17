@@ -46,41 +46,65 @@ pub struct ScanResult {
     pub photos_count: usize,
     pub videos_count: usize,
     pub audios_count: usize,
+    pub documents_count: usize,
+    /// (B1) true si el escaneo encontró errores de I/O leyendo el origen (sectores dañados,
+    /// dispositivo que se cayó a media lectura, etc.) y por lo tanto el resultado puede estar
+    /// incompleto — pero `found_files` igual contiene todo lo que se logró encontrar en las
+    /// partes del origen que sí se pudieron leer, en vez de haberse descartado por completo.
+    pub had_errors: bool,
 }
 
 impl ScanResult {
     pub fn summary(&self) -> String {
-        format!(
-            "📊 Resumen: {} archivos encontrados\n   📷 Fotos: {}  |  🎬 Videos: {}  |  🎵 Audios: {}\n   💾 Bytes escaneados: {}",
+        let mut s = format!(
+            "📊 Resumen: {} archivos encontrados\n   📷 Fotos: {}  |  🎬 Videos: {}  |  🎵 Audios: {}  |  📄 Documentos: {}\n   💾 Bytes escaneados: {}",
             self.found_files.len(),
             self.photos_count,
             self.videos_count,
             self.audios_count,
+            self.documents_count,
             format_size(self.bytes_scanned),
-        )
+        );
+        if self.had_errors {
+            s.push_str(
+                "\n   ⚠️  El escaneo tuvo errores de I/O leyendo el origen (sectores dañados u\n       otro fallo de lectura) — el resultado es parcial: puede faltar contenido de\n       las zonas que no se pudieron leer.",
+            );
+        }
+        s
     }
 }
 
 /// Obtiene el tamaño de la fuente (archivo o disco físico).
 /// En discos físicos de Windows, `seek(End)` no funciona; se usa `IOCTL_DISK_GET_LENGTH_INFO`.
 fn get_source_size(file: &mut File, source_path: &Path) -> Result<u64> {
-    // Intentar seek(End) primero (funciona en archivos normales y en Linux/macOS).
-    // Nota: en discos físicos de Windows esto puede devolver 0 en vez de fallar, por eso el
-    // caso Ok(0) no se trata como error aquí mismo — solo se sabrá que el origen está
-    // realmente vacío si además no aplica (o falla) el fallback de Windows de abajo.
-    let seek_result = file.seek(SeekFrom::End(0)).ok();
-    if let Some(size) = seek_result {
-        if size > 0 {
-            return Ok(size);
-        }
-    }
-
-    // Fallback para discos físicos en Windows
+    // Discos físicos crudos de Windows (\\.\PhysicalDriveN): NO confiar en seek(End) como
+    // definitivo. El propio caso de uso de este fallback es que seek puede "tener éxito" y
+    // devolver un tamaño > 0 pero incorrecto, derivado de metadata de partición en vez del
+    // tamaño real del medio — por eso antes NO alcanzaba con solo probar el IOCTL cuando
+    // seek daba 0; hay que preferir SIEMPRE el IOCTL en este caso y usar seek solo si el
+    // IOCTL falla.
     #[cfg(target_os = "windows")]
     {
         let src = source_path.to_string_lossy();
         if src.starts_with("\\\\.\\") {
-            return get_disk_size_windows(file);
+            if let Ok(size) = get_disk_size_windows(file) {
+                return Ok(size);
+            }
+            // IOCTL falló: fallback a seek(End) como último recurso.
+            if let Some(size) = file.seek(SeekFrom::End(0)).ok().filter(|&s| s > 0) {
+                return Ok(size);
+            }
+            anyhow::bail!(
+                "No se pudo determinar el tamaño del disco físico (IOCTL_DISK_GET_LENGTH_INFO y seek fallaron)"
+            );
+        }
+    }
+
+    // Camino normal: archivos regulares, o no-Windows (seek(End) es confiable ahí).
+    let seek_result = file.seek(SeekFrom::End(0)).ok();
+    if let Some(size) = seek_result {
+        if size > 0 {
+            return Ok(size);
         }
     }
 
@@ -240,6 +264,15 @@ fn max_signature_reach(signatures: &[FileSignature]) -> usize {
         .unwrap_or(16)
 }
 
+/// Resultado de escanear un segmento: los archivos hallados, y si hubo algún error de I/O
+/// leyendo el origen (disco con sectores dañados, etc.) que impidió leer una parte del
+/// segmento — en cuyo caso `found_files` igual contiene todo lo que se logró encontrar ANTES
+/// (y, si se pudo saltar el bloque dañado, DESPUÉS) del error.
+struct SegmentResult {
+    found_files: Vec<FoundFile>,
+    had_errors: bool,
+}
+
 /// Escanea un segmento del archivo buscando firmas multimedia.
 /// Cada hilo abre su propio File handle y escanea secuencialmente dentro del segmento.
 /// Solo retiene resultados con offset en [claim_start, claim_end).
@@ -248,6 +281,14 @@ fn max_signature_reach(signatures: &[FileSignature]) -> usize {
 /// forma de cancelarse. Si el dispositivo de origen deja de responder (ej. un USB que se cae
 /// a media lectura), este read puede bloquear indefinidamente y el hilo nunca retorna.
 /// Implementar cancelación está fuera de alcance de este cambio.
+///
+/// (B1) A propósito esta función NUNCA devuelve `Err`: un solo sector dañado (I/O error) en
+/// cualquier punto del origen es el escenario CENTRAL de uso de esta herramienta (discos
+/// fallando), y antes un solo error acá se propagaba con `?` hacia el caller, descartando en
+/// el camino de 1 hilo TODO lo encontrado hasta ese punto, y en el camino multi-hilo el
+/// resultado de los OTROS hilos que sí terminaron bien. Ahora los errores de lectura del
+/// origen se tratan como "saltar y seguir" en vez de "abortar todo", y se reportan vía
+/// `SegmentResult::had_errors` en vez de con `Result::Err`.
 fn scan_segment(
     source_path: &Path,
     segment: &Segment,
@@ -256,15 +297,40 @@ fn scan_segment(
     max_header_len: usize,
     progress_bytes: &AtomicU64,
     inline_pb: Option<&ProgressBar>,
-) -> Result<Vec<FoundFile>> {
-    let mut file = File::open(source_path)?;
-    file.seek(SeekFrom::Start(segment.start))?;
+) -> SegmentResult {
+    let mut file = match File::open(source_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!(
+                "  ⚠️  No se pudo abrir {} para escanear [0x{:X}, 0x{:X}): {} — este segmento se omite",
+                source_path.display(),
+                segment.start,
+                segment.end,
+                e
+            );
+            return SegmentResult {
+                found_files: Vec::new(),
+                had_errors: true,
+            };
+        }
+    };
+    if let Err(e) = file.seek(SeekFrom::Start(segment.start)) {
+        eprintln!(
+            "  ⚠️  No se pudo posicionar en 0x{:X}: {} — este segmento se omite",
+            segment.start, e
+        );
+        return SegmentResult {
+            found_files: Vec::new(),
+            had_errors: true,
+        };
+    }
 
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut overlap: Vec<u8> = Vec::new();
     let mut found_files: Vec<FoundFile> = Vec::new();
     let mut position = segment.start;
     let mut file_index: usize = 0;
+    let mut had_errors = false;
     // Claves (offset absoluto, extensión) ya registradas en este segmento, para deduplicar
     // hits repetidos por overlap en O(1) en vez de un scan O(n) de found_files (ver C2).
     let mut seen: HashSet<(u64, &'static str)> = HashSet::new();
@@ -279,7 +345,43 @@ fn scan_segment(
             segment.end - position,
         ) as usize;
 
-        let bytes_read = file.read(&mut buffer[..max_to_read])?;
+        let bytes_read = match file.read(&mut buffer[..max_to_read]) {
+            Ok(n) => n,
+            Err(e) => {
+                // (B1) No propagar: un sector dañado no debe tirar lo ya encontrado. Se
+                // intenta saltar este bloque (avanzar `position` y reposicionar el file
+                // handle después de él) y seguir escaneando el resto del segmento. El
+                // `overlap` de antes del error ya no es válido (hay un hueco sin leer), así
+                // que se descarta para no combinar bytes no contiguos.
+                eprintln!(
+                    "  ⚠️  Error de I/O leyendo en offset 0x{:X}: {} — saltando este bloque y continuando",
+                    position, e
+                );
+                had_errors = true;
+                overlap.clear();
+                let next_position = position + max_to_read as u64;
+                progress_bytes.fetch_add(max_to_read as u64, Ordering::Relaxed);
+                if let Some(pb) = inline_pb {
+                    pb.set_position(progress_bytes.load(Ordering::Relaxed));
+                }
+                if next_position >= segment.end {
+                    break;
+                }
+                match file.seek(SeekFrom::Start(next_position)) {
+                    Ok(_) => {
+                        position = next_position;
+                        continue;
+                    }
+                    Err(seek_err) => {
+                        eprintln!(
+                            "  ⚠️  No se pudo reposicionar tras error de I/O: {} — abandonando el resto de este segmento",
+                            seek_err
+                        );
+                        break;
+                    }
+                }
+            }
+        };
         if bytes_read == 0 {
             break;
         }
@@ -327,7 +429,10 @@ fn scan_segment(
     // Filtrar: solo retener archivos en la zona exclusiva de este segmento
     found_files.retain(|f| f.offset >= segment.claim_start && f.offset < segment.claim_end);
 
-    Ok(found_files)
+    SegmentResult {
+        found_files,
+        had_errors,
+    }
 }
 
 /// Escanea un archivo/dispositivo buscando firmas de archivos multimedia
@@ -442,7 +547,7 @@ fn scan_source_impl(
 
     let max_header_len = max_signature_reach(signatures);
 
-    let (mut found_files, bytes_scanned_actual) = if num_threads <= 1 {
+    let (mut found_files, bytes_scanned_actual, had_errors) = if num_threads <= 1 {
         // ── Fast path: 1 hilo, sin overhead de threads ──
         let segment = Segment {
             start: 0,
@@ -451,11 +556,16 @@ fn scan_source_impl(
             claim_end: file_size,
         };
         let progress = AtomicU64::new(0);
-        let files = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb))?;
+        // (B1) scan_segment ya no propaga errores de I/O con `?` — un sector dañado en
+        // cualquier punto del origen ya no descarta todo lo encontrado antes de llegar a él.
+        let result = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb));
+        if result.had_errors {
+            eprintln!("  ⚠️  El escaneo tuvo errores de I/O leyendo el origen; el resultado es parcial.");
+        }
         // B3: reportar lo realmente leído, no file_size fijo — un EOF prematuro (bytes_read
         // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo.
         let scanned = progress.load(Ordering::Relaxed);
-        (files, scanned)
+        (result.found_files, scanned, result.had_errors)
     } else {
         // ── Multi-hilo ──
         let segments = calculate_segments(file_size, num_threads, max_header_len as u64);
@@ -491,24 +601,31 @@ fn scan_source_impl(
             })
             .collect();
 
-        // Recolectar resultados, manejar errores
+        // Recolectar resultados de todos los hilos. (B1) A propósito NO se aborta ni se
+        // descarta nada si un hilo tuvo errores de I/O o incluso panicó: los demás hilos que
+        // sí terminaron bien conservan sus resultados. Antes, un solo `Err` de cualquier hilo
+        // hacía `return Err(e)` acá y tiraba a la basura `all_files` completo, incluyendo lo
+        // que habían encontrado los OTROS hilos exitosos — exactamente el escenario central
+        // de uso de la herramienta (un sector malo en algún punto del disco).
         let mut all_files: Vec<FoundFile> = Vec::new();
-        let mut worker_error: Option<anyhow::Error> = None;
+        let mut multi_had_errors = false;
         for handle in handles {
             match handle.join() {
-                Ok(Ok(files)) => all_files.extend(files),
-                Ok(Err(e)) => {
-                    if worker_error.is_none() {
-                        worker_error = Some(e);
-                    }
+                Ok(result) => {
+                    all_files.extend(result.found_files);
+                    multi_had_errors |= result.had_errors;
                 }
                 Err(_) => {
-                    if worker_error.is_none() {
-                        worker_error =
-                            Some(anyhow::anyhow!("Un hilo de escaneo falló inesperadamente"));
-                    }
+                    // El hilo panicó: perdemos SUS resultados (no hay forma de recuperarlos
+                    // de un panic), pero los demás hilos ya recolectados en `all_files` se
+                    // conservan igual.
+                    eprintln!("  ⚠️  Un hilo de escaneo falló inesperadamente (panic); se conservan los resultados de los demás hilos.");
+                    multi_had_errors = true;
                 }
             }
+        }
+        if multi_had_errors {
+            eprintln!("  ⚠️  El escaneo tuvo errores en uno o más hilos; el resultado es parcial.");
         }
 
         // B3: capturar lo realmente acumulado ANTES de forzar el atomic a file_size (eso
@@ -519,10 +636,6 @@ fn scan_source_impl(
         progress.store(file_size, Ordering::Relaxed);
         let _ = monitor_handle.join();
 
-        if let Some(e) = worker_error {
-            return Err(e);
-        }
-
         // Sort por offset, dedup defensivo, re-indexar
         all_files.sort_by_key(|f| f.offset);
         all_files.dedup_by(|a, b| {
@@ -532,7 +645,7 @@ fn scan_source_impl(
             f.index = i + 1;
         }
 
-        (all_files, scanned)
+        (all_files, scanned, multi_had_errors)
     };
 
     // A2: segundo pase de footer, en un solo hilo, para archivos cuyo footer no apareció
@@ -554,6 +667,10 @@ fn scan_source_impl(
         .iter()
         .filter(|f| f.signature.category == FileCategory::Audio)
         .count();
+    let documents_count = found_files
+        .iter()
+        .filter(|f| f.signature.category == FileCategory::Document)
+        .count();
 
     Ok(ScanResult {
         found_files,
@@ -561,6 +678,8 @@ fn scan_source_impl(
         photos_count,
         videos_count,
         audios_count,
+        documents_count,
+        had_errors,
     })
 }
 
@@ -651,7 +770,28 @@ fn check_signatures_in_buffer(
                     // A1 fix v2 — combina la búsqueda "última ocurrencia" que resuelve
                     // thumbnails con la acotación que evita englobar el siguiente archivo).
                     let search_start = check_pos + sig.header.len();
-                    if let Some(pos) = find_footer_nested(buf, sig.header, footer, search_start) {
+                    // Acotar cuánto buscar: un footer más allá de max_size bytes del header no
+                    // serviría de nada (se descartaría de todas formas a favor de max_possible
+                    // más abajo), así que no vale la pena que find_footer_nested siga leyendo
+                    // más allá — esto evita el blowup O(buffer_size^2) descrito en B/M2.
+                    let search_limit =
+                        std::cmp::min(buf.len(), i.saturating_add(max_possible as usize));
+                    if let Some(pos) =
+                        find_footer_nested(buf, sig.header, footer, search_start, search_limit)
+                    {
+                        // Invariante requerido para que el cálculo de abajo no underflowee:
+                        // toda firma con footer debe tener header.len() >= footer.len(). Hoy
+                        // se cumple para todas las firmas en signatures/mod.rs, pero nada lo
+                        // fuerza en tiempo de compilación — si una firma nueva lo rompe, este
+                        // assert lo va a detectar en debug/test builds en vez de producir
+                        // silenciosamente un tamaño de archivo absurdo en release (ver B4).
+                        debug_assert!(
+                            sig.header.len() >= footer.len(),
+                            "Firma '{}': footer.len() ({}) > header.len() ({}) rompe el cálculo de found_size",
+                            sig.name,
+                            footer.len(),
+                            sig.header.len()
+                        );
                         let found_size = (pos - i) as u64 + footer.len() as u64;
                         if found_size <= max_possible {
                             (found_size, true)
@@ -699,10 +839,32 @@ fn check_signatures_in_buffer(
 /// - Dos archivos del mismo formato en el mismo buffer: si no hay anidamiento real, el primer
 ///   footer encontrado SÍ baja la profundidad a 0 de inmediato, así que no se sigue buscando
 ///   más allá y no se engloba el siguiente archivo.
-fn find_footer_nested(buf: &[u8], header: &[u8], footer: &[u8], start: usize) -> Option<usize> {
+fn find_footer_nested(
+    buf: &[u8],
+    header: &[u8],
+    footer: &[u8],
+    start: usize,
+    search_limit: usize,
+) -> Option<usize> {
     // depth arranca en 1 (el header ya encontrado por el caller); `start` también sirve como
     // `skip_before` para `scan_nesting` porque no queremos contar nada antes de él.
-    scan_nesting(buf, header, footer, 1, start).1
+    //
+    // Optimización de rendimiento (B/M2): la versión anterior siempre escaneaba `buf` completo
+    // desde el índice 0, sin importar dónde cayó el header. En datos de alta entropía donde un
+    // footer corto (ej. GIF, 2 bytes) aparece por azar cada ~64KB, eso hacía O(buffer_size^2)
+    // por chunk. El fix tiene dos partes:
+    // - Empezar en `scan_from` (≈ `start`, con un pequeño margen hacia atrás) en vez de 0: no
+    //   hace falta escanear antes de `start` porque `scan_nesting` ya ignora (via
+    //   `skip_before`) cualquier match que TERMINE antes de `start`; el margen (el mayor entre
+    //   header.len() y footer.len(), menos 1) solo cubre el caso borde de un match que
+    //   "straddlea" la frontera (empieza antes de `start` pero termina después).
+    // - Acotar el final de la búsqueda a `search_limit` (calculado por el caller a partir de
+    //   `max_size` de la firma): un footer más allá de `max_size` bytes del header no serviría
+    //   de nada igual (`check_signatures_in_buffer` lo descartaría a favor de `max_possible`),
+    //   así que no vale la pena seguir buscando más allá.
+    let margin = std::cmp::max(header.len(), footer.len()).saturating_sub(1);
+    let scan_from = start.saturating_sub(margin);
+    scan_nesting(buf, header, footer, 1, start, scan_from, search_limit).1
 }
 
 /// Motor compartido de conteo de anidamiento usado por `find_footer_nested` (pasada en buffer,
@@ -712,18 +874,27 @@ fn find_footer_nested(buf: &[u8], header: &[u8], footer: &[u8], start: usize) ->
 /// — usado por `find_footer_sequential` para no re-contar, en cada chunk, bytes de overlap que
 /// ya fueron contados en la iteración anterior. Retorna la profundidad resultante y, si llegó a
 /// 0, la posición (índice en `buf`) del footer que cerró el archivo.
+///
+/// `scan_from`/`scan_to` acotan el rango de `buf` efectivamente recorrido (ver B/M2 en
+/// `find_footer_nested`): `find_footer_sequential` sigue pasando el chunk completo (0..len,
+/// ya acotado a `chunk_size` por el caller, no hay blowup ahí), mientras que
+/// `find_footer_nested` acota a la vecindad del header recién encontrado para evitar el costo
+/// O(buffer_size) por cada header en un buffer de 1 MB.
 fn scan_nesting(
     buf: &[u8],
     header: &[u8],
     footer: &[u8],
     mut depth: i32,
     skip_before: usize,
+    scan_from: usize,
+    scan_to: usize,
 ) -> (i32, Option<usize>) {
     if footer.is_empty() {
         return (depth, None);
     }
-    let mut i = 0usize;
-    while i < buf.len() {
+    let scan_to = std::cmp::min(scan_to, buf.len());
+    let mut i = scan_from;
+    while i < scan_to {
         if i + footer.len() <= buf.len() && &buf[i..i + footer.len()] == footer {
             if i + footer.len() > skip_before {
                 depth -= 1;
@@ -827,8 +998,9 @@ fn find_footer_sequential(
         let mut combined = overlap.clone();
         combined.extend_from_slice(&buf);
 
+        let combined_len = combined.len();
         let (new_depth, footer_pos) =
-            scan_nesting(&combined, header, footer, depth, skip_before);
+            scan_nesting(&combined, header, footer, depth, skip_before, 0, combined_len);
         depth = new_depth;
         if let Some(rel_pos) = footer_pos {
             let abs_pos = combined_start + rel_pos as u64;
@@ -1316,6 +1488,11 @@ mod tests {
                 "audios_count difiere con {} hilos",
                 num_threads
             );
+            assert_eq!(
+                result_1.documents_count, result_n.documents_count,
+                "documents_count difiere con {} hilos",
+                num_threads
+            );
         }
     }
 
@@ -1501,5 +1678,321 @@ mod tests {
         // frágil ante variaciones del PRNG determinístico usado arriba).
         assert!(mp3_pct < 5.0, "MP3 sync validator deja pasar demasiados falsos positivos: {:.4}%", mp3_pct);
         assert!(aac_pct < 5.0, "AAC ADTS validator deja pasar demasiados falsos positivos: {:.4}%", aac_pct);
+    }
+
+    #[test]
+    fn test_tiff_big_endian_detection() {
+        // Archivo propio (no create_test_image) porque TIFF no tiene footer ni
+        // size_from_header: se carvea hasta max_size o fin de fuente, así que se aisla en un
+        // buffer chico para no interferir con los offsets de otras firmas.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0u8; 4096];
+        let pos = 512usize;
+        // Motorola byte order: "MM" + 0x002A
+        data[pos..pos + 4].copy_from_slice(&[0x4D, 0x4D, 0x00, 0x2A]);
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let tiff_be = result
+            .found_files
+            .iter()
+            .find(|f| f.offset == pos as u64)
+            .expect("TIFF big-endian no encontrado");
+        assert_eq!(tiff_be.signature.extension, "tiff");
+        assert_eq!(tiff_be.signature.name, "TIFF (big-endian)");
+
+        println!("\nTIFF big-endian (MM*) detectado correctamente en offset 0x{:X}.", pos);
+    }
+
+    #[test]
+    fn test_heic_mp4_disambiguation() {
+        // HEIC y MP4/M4V comparten la misma caja contenedora ftyp (ISOBMFF); solo el
+        // major_brand (4 bytes tras "ftyp") los distingue. Verifica que un archivo HEIC no se
+        // detecte tambien como MP4, y viceversa.
+        let mut data = vec![0u8; 4096];
+
+        // HEIC: box size (4) + "ftyp" + "heic" (major_brand)
+        let heic_pos = 256usize;
+        data[heic_pos + 4..heic_pos + 8].copy_from_slice(b"ftyp");
+        data[heic_pos + 8..heic_pos + 12].copy_from_slice(b"heic");
+
+        // MP4: box size (4) + "ftyp" + "isom" (major_brand, no HEIC)
+        let mp4_pos = 1024usize;
+        data[mp4_pos + 4..mp4_pos + 8].copy_from_slice(b"ftyp");
+        data[mp4_pos + 8..mp4_pos + 12].copy_from_slice(b"isom");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo, FileCategory::Video]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let at_heic: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == heic_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_heic, vec!["heic"], "Offset HEIC tiene: {:?}", at_heic);
+
+        let at_mp4: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == mp4_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_mp4, vec!["mp4"], "Offset MP4 tiene: {:?}", at_mp4);
+
+        println!("\nDesambiguacion HEIC/MP4 (ftyp) correcta.");
+    }
+
+    #[test]
+    fn test_cr2_tiff_disambiguation() {
+        // CR2 (Canon RAW) es TIFF little-endian con un marcador propio "CR\x02\x00" en offset
+        // 8. Verifica que un CR2 no se detecte tambien como TIFF generico, y viceversa.
+        let mut data = vec![0u8; 4096];
+
+        // CR2: "II*\0" + puntero IFD0 (4 bytes, cualquier valor) + "CR\x02\x00"
+        let cr2_pos = 256usize;
+        data[cr2_pos..cr2_pos + 4].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00]);
+        data[cr2_pos + 8..cr2_pos + 12].copy_from_slice(b"CR\x02\x00");
+
+        // TIFF generico: "II*\0" + puntero IFD0 + datos que NO son el marcador CR2
+        let tiff_pos = 1024usize;
+        data[tiff_pos..tiff_pos + 4].copy_from_slice(&[0x49, 0x49, 0x2A, 0x00]);
+        data[tiff_pos + 8..tiff_pos + 12].copy_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let at_cr2: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == cr2_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_cr2, vec!["cr2"], "Offset CR2 tiene: {:?}", at_cr2);
+
+        let at_tiff: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == tiff_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_tiff, vec!["tiff"], "Offset TIFF tiene: {:?}", at_tiff);
+
+        println!("\nDesambiguacion CR2/TIFF correcta.");
+    }
+
+    #[test]
+    fn test_pdf_header_footer_detection() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut data = vec![0u8; 4096];
+        let pos = 512usize;
+        data[pos..pos + 5].copy_from_slice(b"%PDF-");
+        for i in 5..800 {
+            data[pos + i] = ((i * 19) % 256) as u8;
+        }
+        data[pos + 800..pos + 805].copy_from_slice(b"%%EOF");
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Document]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let pdf = result
+            .found_files
+            .iter()
+            .find(|f| f.offset == pos as u64)
+            .expect("PDF no encontrado");
+        assert_eq!(pdf.signature.extension, "pdf");
+        assert_eq!(pdf.size, 805, "Tamano PDF deberia ser 805, es {}", pdf.size);
+
+        println!("\nPDF detectado correctamente con header %PDF- y footer %%EOF.");
+    }
+
+    #[test]
+    fn test_3gp_m4a_not_duplicated_as_mp4() {
+        // 3GP y M4A comparten la misma caja ftyp que "MP4/M4V" (mismo header, mismo offset).
+        // Antes del fix, un .3gp o .m4a real se detectaba DOS veces: una vez bajo su propia
+        // firma y otra, redundante, bajo "MP4/M4V". Verifica que ya no pase.
+        let mut data = vec![0u8; 4096];
+
+        // 3GP: box size (4) + "ftyp" + "3gp4" (major_brand, digito de version variable)
+        let gp3_pos = 256usize;
+        data[gp3_pos + 4..gp3_pos + 8].copy_from_slice(b"ftyp");
+        data[gp3_pos + 8..gp3_pos + 12].copy_from_slice(b"3gp4");
+
+        // M4A: box size (4) + "ftyp" + "M4A " (major_brand exacto, con espacio final)
+        let m4a_pos = 1024usize;
+        data[m4a_pos + 4..m4a_pos + 8].copy_from_slice(b"ftyp");
+        data[m4a_pos + 8..m4a_pos + 12].copy_from_slice(b"M4A ");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Video, FileCategory::Audio]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let at_3gp: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == gp3_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_3gp, vec!["3gp"], "Offset 3GP tiene: {:?}", at_3gp);
+
+        let at_m4a: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == m4a_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_m4a, vec!["m4a"], "Offset M4A tiene: {:?}", at_m4a);
+
+        println!("\n3GP y M4A ya no se duplican bajo MP4/M4V.");
+    }
+
+    #[test]
+    fn test_heic_hevm_hevs_brands_detected_as_heic_not_mp4() {
+        // hevm/hevs son los brands HEIC/HEIF reales para secuencias HEVC multiview/escalables
+        // (ISO/IEC 23008-12). La sesion anterior habia tipeado "hejc"/"hejs" por error, lo que
+        // hacia que estos brands cayeran (incorrectamente) en la deteccion generica MP4/M4V en
+        // vez de HEIC.
+        let mut data = vec![0u8; 4096];
+
+        let hevm_pos = 256usize;
+        data[hevm_pos + 4..hevm_pos + 8].copy_from_slice(b"ftyp");
+        data[hevm_pos + 8..hevm_pos + 12].copy_from_slice(b"hevm");
+
+        let hevs_pos = 1024usize;
+        data[hevs_pos + 4..hevs_pos + 8].copy_from_slice(b"ftyp");
+        data[hevs_pos + 8..hevs_pos + 12].copy_from_slice(b"hevs");
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo, FileCategory::Video]);
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let at_hevm: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == hevm_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_hevm, vec!["heic"], "Offset hevm tiene: {:?}", at_hevm);
+
+        let at_hevs: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == hevs_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_hevs, vec!["heic"], "Offset hevs tiene: {:?}", at_hevs);
+
+        println!("\nBrands hevm/hevs detectados correctamente como HEIC, no MP4.");
+    }
+
+    #[test]
+    fn test_bmp_header_validator() {
+        // BMP tenia header de solo 2 bytes ("BM") sin validador, y ademas usa
+        // size_from_header: en un falso positivo, leia 4 bytes de basura como tamano total del
+        // archivo sin ninguna validacion. Verifica que un BITMAPFILEHEADER coherente SI se
+        // detecte, y que "BM" con campos incoherentes (tipico de datos aleatorios) NO se
+        // detecte.
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let bmp_sig = sigs.iter().find(|s| s.name == "BMP").unwrap();
+        let (validator_fn, _needed) = bmp_sig.validator.expect("BMP deberia tener validator");
+
+        // Caso valido: bfSize = 100, reservado1/2 = 0, bfOffBits = 54 (valor tipico BMP: 14
+        // bytes de BITMAPFILEHEADER + 40 bytes de BITMAPINFOHEADER estandar).
+        let mut valid = vec![0u8; 100];
+        valid[0] = 0x42;
+        valid[1] = 0x4D;
+        valid[2..6].copy_from_slice(&100u32.to_le_bytes());
+        valid[6..10].copy_from_slice(&[0, 0, 0, 0]);
+        valid[10..14].copy_from_slice(&54u32.to_le_bytes());
+        assert!(validator_fn(&valid), "BMP valido deberia pasar el validador");
+
+        // Caso invalido: bfOffBits mayor que bfSize (estructuralmente imposible en un BMP real).
+        let mut bad_offset = vec![0u8; 100];
+        bad_offset[0] = 0x42;
+        bad_offset[1] = 0x4D;
+        bad_offset[2..6].copy_from_slice(&100u32.to_le_bytes());
+        bad_offset[10..14].copy_from_slice(&500u32.to_le_bytes());
+        assert!(!validator_fn(&bad_offset), "bfOffBits > bfSize deberia rechazarse");
+
+        // Caso invalido: bfSize absurdamente grande (mayor al max_size de la firma).
+        let mut bad_size = vec![0u8; 100];
+        bad_size[0] = 0x42;
+        bad_size[1] = 0x4D;
+        bad_size[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+        bad_size[10..14].copy_from_slice(&54u32.to_le_bytes());
+        assert!(!validator_fn(&bad_size), "bfSize absurdo deberia rechazarse");
+
+        // Fin a fin: un BMP valido embebido en un buffer se detecta via scan_source, y datos
+        // aleatorios con "BM" al inicio pero campos incoherentes no. bfSize se declara en
+        // 1000 (no 200): el scanner descarta cualquier archivo detectado de menos de 512
+        // bytes por heuristica anti-falsos-positivos (preexistente, ver "size > 512" en
+        // check_signatures_in_buffer) — un bfSize menor a ese umbral haria que el test fallara
+        // por esa heuristica no relacionada, no por el validador BMP en si.
+        let mut data = vec![0u8; 4096];
+        let bmp_pos = 512usize;
+        data[bmp_pos] = 0x42;
+        data[bmp_pos + 1] = 0x4D;
+        data[bmp_pos + 2..bmp_pos + 6].copy_from_slice(&1000u32.to_le_bytes());
+        data[bmp_pos + 10..bmp_pos + 14].copy_from_slice(&54u32.to_le_bytes());
+
+        // xorshift64 simple, determinístico, solo para este test (mismo patron que
+        // test_mp3_aac_frame_chaining_rejects_most_random_data).
+        let mut state: u64 = 0xD1B54A32D192ED03;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let random_bmp_pos = 2048usize;
+        for i in 0..64 {
+            data[random_bmp_pos + i] = (next() & 0xFF) as u8;
+        }
+        data[random_bmp_pos] = 0x42;
+        data[random_bmp_pos + 1] = 0x4D;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let result = scan_source(file.path(), &sigs).unwrap();
+
+        let at_valid_bmp: Vec<&str> = result
+            .found_files
+            .iter()
+            .filter(|f| f.offset == bmp_pos as u64)
+            .map(|f| f.signature.extension)
+            .collect();
+        assert_eq!(at_valid_bmp, vec!["bmp"], "Offset BMP valido tiene: {:?}", at_valid_bmp);
+
+        let at_random_bmp = result
+            .found_files
+            .iter()
+            .any(|f| f.offset == random_bmp_pos as u64 && f.signature.extension == "bmp");
+        assert!(
+            !at_random_bmp,
+            "'BM' con campos aleatorios/incoherentes no deberia detectarse como BMP"
+        );
+
+        println!("\nValidador BMP acepta headers coherentes y rechaza campos incoherentes.");
     }
 }

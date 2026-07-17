@@ -6,6 +6,7 @@ pub enum FileCategory {
     Photo,
     Video,
     Audio,
+    Document,
 }
 
 impl fmt::Display for FileCategory {
@@ -14,6 +15,7 @@ impl fmt::Display for FileCategory {
             FileCategory::Photo => write!(f, "📷 Foto"),
             FileCategory::Video => write!(f, "🎬 Video"),
             FileCategory::Audio => write!(f, "🎵 Audio"),
+            FileCategory::Document => write!(f, "📄 Documento"),
         }
     }
 }
@@ -149,6 +151,104 @@ fn validate_aac_adts(bytes: &[u8]) -> bool {
     bytes[frame_length] == 0xFF && (bytes[frame_length + 1] & 0xF0) == 0xF0
 }
 
+/// HEIC/HEIF y MP4 comparten la misma caja contenedora `ftyp` (ISOBMFF): la única forma de
+/// distinguirlos es leer el `major_brand` de 4 bytes que sigue inmediatamente a "ftyp".
+const HEIC_BRANDS: [&[u8; 4]; 10] = [
+    b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1",
+];
+
+/// `bytes` empieza en "ftyp" (offset del header MP4/HEIC), no en el inicio de la caja.
+fn is_heic_brand(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let brand: &[u8; 4] = bytes[4..8].try_into().unwrap();
+    HEIC_BRANDS.contains(&brand)
+}
+
+/// Valida que la caja `ftyp` sea HEIC/HEIF (major_brand conocido), no MP4 genérico.
+fn validate_heic_ftyp(bytes: &[u8]) -> bool {
+    is_heic_brand(bytes)
+}
+
+/// 3GP y M4A también son cajas `ftyp` (ISOBMFF) válidas y comparten el mismo header/offset
+/// que "MP4/M4V" — sin esta exclusión, cualquier .3gp o .m4a real se carvea DOS veces (una
+/// bajo su firma propia y otra, redundante, bajo "MP4/M4V"). `bytes` empieza en "ftyp", igual
+/// que `is_heic_brand`.
+/// El major_brand de 3GP siempre empieza con los 3 bytes "3gp" (el 4to byte es un dígito de
+/// versión variable, ej. "3gp4", "3gp5", "3gp6"). El de M4A real es "M4A " (con espacio
+/// final), pero acá se compara solo el prefijo de 3 bytes "M4A" — a propósito, para que esta
+/// exclusión sea simétrica con lo que la propia firma "M4A" matchea (su `header` también
+/// compara solo esos mismos 3 bytes del brand, sin el 4to byte/espacio; ver esa firma más
+/// abajo). Si se comparara el brand completo de 4 bytes acá, un candidato con basura en el 4to
+/// byte (ej. datos corruptos, no un M4A real) matchearía la firma "M4A" pero no esta
+/// exclusión, y volvería a duplicarse bajo "MP4/M4V".
+fn is_3gp_or_m4a_brand(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let brand = &bytes[4..8];
+    &brand[0..3] == b"3gp" || &brand[0..3] == b"M4A"
+}
+
+/// Valida que la caja `ftyp` NO sea HEIC/HEIF ni 3GP/M4A, para que "MP4/M4V" no duplique la
+/// detección de fotos HEIC ni de videos/audios 3GP/M4A (mismo header `ftyp`, mismo offset).
+fn validate_mp4_generic_ftyp(bytes: &[u8]) -> bool {
+    !is_heic_brand(bytes) && !is_3gp_or_m4a_brand(bytes)
+}
+
+/// Valida un header BMP (`BITMAPFILEHEADER`) tras el magic "BM" de 2 bytes, para descartar los
+/// falsos positivos masivos que produce ese header corto en datos de alta entropía (mismo
+/// problema que `validate_mp3_sync`/`validate_aac_adts`, agravado acá porque `size_from_header`
+/// lee 4 bytes de basura como tamaño total del archivo si no se valida nada). `bytes` empieza
+/// en "BM" (offset 0 del header). Estructura real (little-endian):
+/// - offset 0-1: "BM"
+/// - offset 2-5 (u32): tamaño total del archivo (`bfSize`)
+/// - offset 6-9: reservado1 + reservado2 (no se usan acá)
+/// - offset 10-13 (u32): offset a los datos de píxeles (`bfOffBits`)
+/// Se verifica que `bfSize` sea mayor al tamaño mínimo de header (14 bytes) y no exceda
+/// `max_bmp_size` (el `max_size` de la firma), y que `bfOffBits` sea mayor a 14 y no mayor que
+/// `bfSize`. Ambos campos son estructuralmente coherentes en cualquier BMP real, así que este
+/// chequeo filtra la enorme mayoría de coincidencias casuales de "BM" en datos aleatorios sin
+/// arriesgar rechazar BMPs válidos.
+fn validate_bmp_header(bytes: &[u8], max_bmp_size: usize) -> bool {
+    if bytes.len() < 14 {
+        return false;
+    }
+    let file_size = u32::from_le_bytes(bytes[2..6].try_into().unwrap()) as usize;
+    let pixel_offset = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+
+    if file_size <= 14 || file_size > max_bmp_size {
+        return false;
+    }
+    if pixel_offset <= 14 || pixel_offset > file_size {
+        return false;
+    }
+    true
+}
+
+/// Adaptador para `FileSignature::validator` (firma `fn(&[u8]) -> bool`): fija `max_bmp_size`
+/// al `max_size` de la firma "BMP" (50 MB), ver `validate_bmp_header`.
+fn validate_bmp_default_max(bytes: &[u8]) -> bool {
+    validate_bmp_header(bytes, 50 * 1024 * 1024)
+}
+
+/// Canon CR2 es TIFF little-endian ("II*\0") con un marcador propio "CR\x02\x00" en offset 8
+/// (justo despues del puntero a IFD0 del header TIFF estandar).
+/// `bytes` empieza en el header TIFF ("II*\0"), no en un offset separado.
+fn is_cr2_marker(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 {
+        return false;
+    }
+    &bytes[8..12] == b"CR\x02\x00"
+}
+
+/// Valida que un header "II*\0" sea TIFF genuino y no un CR2 (ver "CR2 (Canon RAW)" abajo),
+/// para no duplicar la deteccion del mismo header bajo dos firmas distintas.
+fn validate_tiff_le_not_cr2(bytes: &[u8]) -> bool {
+    !is_cr2_marker(bytes)
+}
+
 /// Retorna todas las firmas conocidas
 pub fn all_signatures() -> Vec<FileSignature> {
     vec![
@@ -198,7 +298,9 @@ pub fn all_signatures() -> Vec<FileSignature> {
             extra_check: None,
             footer: None,
             max_size: 50 * 1024 * 1024,
-            validator: None,
+            // Header de solo 2 bytes ("BM") sin esto genera falsos positivos masivos en datos
+            // de alta entropía, agravado por size_from_header abajo (ver validate_bmp_header).
+            validator: Some((validate_bmp_default_max, 14)),
             // BITMAPFILEHEADER: tamaño total del archivo en offset 2, 4 bytes little-endian.
             size_from_header: Some((2, 4)),
         },
@@ -215,6 +317,20 @@ pub fn all_signatures() -> Vec<FileSignature> {
             size_from_header: None,
         },
         FileSignature {
+            name: "CR2 (Canon RAW)",
+            extension: "cr2",
+            category: FileCategory::Photo,
+            // Mismo header TIFF little-endian que "TIFF" abajo; se desambigua por el
+            // marcador "CR\x02\x00" en offset 8.
+            header: &[0x49, 0x49, 0x2A, 0x00],
+            header_offset: 0,
+            extra_check: Some((b"CR\x02\x00", 8)),
+            footer: None,
+            max_size: 100 * 1024 * 1024,
+            validator: None,
+            size_from_header: None,
+        },
+        FileSignature {
             name: "TIFF",
             extension: "tiff",
             category: FileCategory::Photo,
@@ -223,7 +339,37 @@ pub fn all_signatures() -> Vec<FileSignature> {
             extra_check: None,
             footer: None,
             max_size: 100 * 1024 * 1024,
+            // NEF (Nikon RAW) tambien es TIFF-based sin un marcador propio a offset fijo
+            // (requeriria parsear tags IFD, ej. Make = "NIKON CORPORATION", fuera del alcance
+            // de file carving por magic bytes); se recupera bajo esta firma generica como
+            // .tiff, contenedor valido que preserva los datos aunque no distinga el fabricante.
+            validator: Some((validate_tiff_le_not_cr2, 12)),
+            size_from_header: None,
+        },
+        FileSignature {
+            name: "TIFF (big-endian)",
+            extension: "tiff",
+            category: FileCategory::Photo,
+            // Motorola byte order: "MM" + 0x002A (big-endian, vs "II" + 0x2A00 little-endian).
+            header: &[0x4D, 0x4D, 0x00, 0x2A],
+            header_offset: 0,
+            extra_check: None,
+            footer: None,
+            max_size: 100 * 1024 * 1024,
             validator: None,
+            size_from_header: None,
+        },
+        FileSignature {
+            name: "HEIC/HEIF",
+            extension: "heic",
+            category: FileCategory::Photo,
+            // Misma caja ftyp (ISOBMFF) que MP4; se desambigua por major_brand via validator.
+            header: &[0x66, 0x74, 0x79, 0x70],
+            header_offset: 4,
+            extra_check: None,
+            footer: None,
+            max_size: 50 * 1024 * 1024,
+            validator: Some((validate_heic_ftyp, 8)),
             size_from_header: None,
         },
 
@@ -238,7 +384,10 @@ pub fn all_signatures() -> Vec<FileSignature> {
             extra_check: None,
             footer: None,
             max_size: 2 * 1024 * 1024 * 1024, // 2 GB
-            validator: None,
+            // Excluye brands HEIC/HEIF (ver "HEIC/HEIF" arriba) y 3GP/M4A (ver esas firmas
+            // abajo) para no duplicar la deteccion de la misma caja ftyp bajo dos firmas
+            // distintas.
+            validator: Some((validate_mp4_generic_ftyp, 8)),
             size_from_header: None,
         },
         FileSignature {
@@ -420,6 +569,20 @@ pub fn all_signatures() -> Vec<FileSignature> {
             extra_check: Some((&[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 28)),
             footer: None,
             max_size: 50 * 1024 * 1024,
+            validator: None,
+            size_from_header: None,
+        },
+
+        // ═══════════════════════ DOCUMENTOS ═══════════════════════
+        FileSignature {
+            name: "PDF",
+            extension: "pdf",
+            category: FileCategory::Document,
+            header: &[0x25, 0x50, 0x44, 0x46, 0x2D], // "%PDF-"
+            header_offset: 0,
+            extra_check: None,
+            footer: Some(&[0x25, 0x25, 0x45, 0x4F, 0x46]), // "%%EOF"
+            max_size: 200 * 1024 * 1024,
             validator: None,
             size_from_header: None,
         },

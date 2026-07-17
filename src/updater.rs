@@ -18,6 +18,8 @@ const READ_TIMEOUT_SECS: u64 = 30;
 const MIN_BINARY_SIZE: u64 = 500_000; // 500KB mínimo para un binario válido
 const MAX_BINARY_SIZE: u64 = 100_000_000; // 100MB máximo, evita OOM con un asset gigante
 const CHECKSUMS_ASSET_NAME: &str = "SHA256SUMS.txt";
+const GITHUB_OWNER: &str = "ElBecerril";
+const GITHUB_REPO: &str = "RecuperaGhost";
 
 // ─── Tipos para deserializar la API de GitHub ───────────────────────────────
 
@@ -44,6 +46,24 @@ struct Version {
     patch: u32,
 }
 
+/// Parsea un componente numérico de versión. Si el parseo directo falla (por ejemplo
+/// por un sufijo de pre-release/build-metadata tipo "3-rc1" o "3+build"), intenta
+/// extraer solo el prefijo numérico inicial. Esto no es semver completo (no le da
+/// precedencia correcta a pre-release vs release), pero evita que un tag como
+/// "v1.2.3-rc1" haga fallar el parseo por completo y deje el updater sordo a nuevas
+/// versiones publicadas con ese formato de tag.
+fn parse_version_component(part: &str) -> Option<u32> {
+    if let Ok(n) = part.parse::<u32>() {
+        return Some(n);
+    }
+    let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 fn parse_version(s: &str) -> Option<Version> {
     let s = s.strip_prefix('v').unwrap_or(s);
     let parts: Vec<&str> = s.split('.').collect();
@@ -51,9 +71,9 @@ fn parse_version(s: &str) -> Option<Version> {
         return None;
     }
     Some(Version {
-        major: parts[0].parse().ok()?,
-        minor: parts[1].parse().ok()?,
-        patch: parts[2].parse().ok()?,
+        major: parse_version_component(parts[0])?,
+        minor: parse_version_component(parts[1])?,
+        patch: parse_version_component(parts[2])?,
     })
 }
 
@@ -86,9 +106,16 @@ pub fn check_for_updates() {
 // ─── Lógica interna ─────────────────────────────────────────────────────────
 
 fn try_check_for_updates() -> Result<(), Box<dyn std::error::Error>> {
+    // Límite explícito de redirects: los assets de GitHub se sirven habitualmente
+    // vía redirect a objects.githubusercontent.com / release-assets.githubusercontent.com,
+    // así que no podemos prohibir redirects, pero sí acotarlos a un número razonable
+    // (5, que además es el default de ureq) para reducir la superficie de una cadena
+    // de redirects abusiva. Ver comentario en `is_github_url` sobre la limitación de
+    // no poder validar el host final post-redirect con esta versión de ureq.
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
+        .redirects(5)
         .build();
 
     let response = agent
@@ -159,10 +186,25 @@ fn find_checksums_asset(assets: &[GitHubAsset]) -> Option<&GitHubAsset> {
     assets.iter().find(|a| a.name == CHECKSUMS_ASSET_NAME)
 }
 
-/// Solo se confía en URLs de descarga que apunten a github.com, para evitar
-/// que un release/API comprometido redirija la descarga a un host arbitrario.
+/// Solo se confía en URLs de descarga que apunten específicamente al path de
+/// releases de ESTE repo (owner/repo hardcodeados, igual que en GITHUB_API_URL),
+/// no a "github.com" en general — eso evitaría un host arbitrario, pero seguiría
+/// aceptando cualquier otro repo/usuario de GitHub, que no es lo que queremos confiar.
+///
+/// LIMITACIÓN CONOCIDA: esta validación se aplica a la URL recibida en el JSON de
+/// la API, ANTES de que `ureq` siga redirects. GitHub habitualmente redirige la
+/// descarga de assets a `objects.githubusercontent.com` / `release-assets.githubusercontent.com`,
+/// y esta función no valida ese destino final — ureq no expone fácilmente la cadena
+/// de redirects para inspeccionarla. El límite de redirects del agente (ver
+/// `AgentBuilder` en `try_check_for_updates`) mitiga parcialmente el riesgo, pero
+/// la garantía real es "la descarga arrancó en este repo de GitHub", no
+/// "el host final servido es de confianza".
 fn is_github_url(url: &str) -> bool {
-    url.starts_with("https://github.com/")
+    let prefix = format!(
+        "https://github.com/{}/{}/releases/download/",
+        GITHUB_OWNER, GITHUB_REPO
+    );
+    url.starts_with(&prefix)
 }
 
 fn download_and_replace(
@@ -333,7 +375,54 @@ fn download_and_replace(
                 "{}",
                 "  🔄 Intentando restaurar el binario anterior...".bright_yellow()
             );
-            let _ = fs::rename(&old_path, &exe_path);
+            if let Err(rollback_err) = fs::rename(&old_path, &exe_path) {
+                eprintln!(
+                    "{}",
+                    "  ══════════════════════════════════════════════════".bright_red()
+                );
+                eprintln!(
+                    "{}",
+                    "  ❌ ERROR CRÍTICO: no se pudo restaurar el binario original."
+                        .bright_red()
+                        .bold()
+                );
+                eprintln!(
+                    "{}",
+                    format!("     Motivo de la restauración fallida: {}", rollback_err)
+                        .bright_red()
+                );
+                eprintln!(
+                    "{}",
+                    format!(
+                        "     El ejecutable anterior quedó en: {}",
+                        old_path.display()
+                    )
+                    .bright_yellow()
+                );
+                eprintln!(
+                    "{}",
+                    format!(
+                        "     Renómbralo manualmente de vuelta a: {}",
+                        exe_path.display()
+                    )
+                    .bright_yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "     para poder seguir usando el programa.".bright_yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "  ══════════════════════════════════════════════════".bright_red()
+                );
+                return Err(format!(
+                    "Fallo al escribir el nuevo binario ({}) y también falló la restauración del binario anterior ({}); ejecutable anterior en {}",
+                    e,
+                    rollback_err,
+                    old_path.display()
+                )
+                .into());
+            }
             return Err(e.into());
         }
     }
@@ -485,6 +574,48 @@ mod tests {
     fn test_parse_version_invalid() {
         assert_eq!(parse_version("abc"), None);
         assert_eq!(parse_version("1.2"), None);
+    }
+
+    #[test]
+    fn test_parse_version_with_suffix() {
+        assert_eq!(
+            parse_version("v1.2.3-rc1"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        assert_eq!(
+            parse_version("1.2.3+build"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3
+            })
+        );
+        // Sin ningún dígito al principio de la última parte, debe seguir fallando
+        assert_eq!(parse_version("1.2.rc1"), None);
+    }
+
+    #[test]
+    fn test_is_github_url_rejects_wrong_repo() {
+        // Repo/owner correcto: se acepta
+        assert!(is_github_url(
+            "https://github.com/ElBecerril/RecuperaGhost/releases/download/v1.0.0/recupe_ghost.exe"
+        ));
+        // Mismo host github.com, pero otro repo/owner: se rechaza
+        assert!(!is_github_url(
+            "https://github.com/otro-usuario/otro-repo/releases/download/v1.0.0/malware.exe"
+        ));
+        // github.com pero sin el path de releases/download: se rechaza
+        assert!(!is_github_url(
+            "https://github.com/ElBecerril/RecuperaGhost"
+        ));
+        // Host completamente distinto: se rechaza
+        assert!(!is_github_url(
+            "https://evil.com/ElBecerril/RecuperaGhost/releases/download/v1.0.0/x.exe"
+        ));
     }
 
     #[test]
