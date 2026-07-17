@@ -1,2 +1,0 @@
-- AL INICIO DE SESION: lee toda la documentacion, reportes, readme, roadmaps, y contexto en json, excluyendo node_modules y venv
-- AL FINAL DE SESION: documenta, has el reporte, actualiza el readme y actualiza el contexto en json
