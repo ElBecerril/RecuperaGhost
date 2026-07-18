@@ -68,6 +68,11 @@ Presenta un menu inteligente donde puedes:
 3. Escanear con barra de progreso en tiempo real
 4. Recuperar los archivos encontrados a una carpeta organizada
 
+Los resultados se **ordenan y marcan por integridad** para que sepas cuales son confiables:
+`✅ integro` (se encontro el final real del archivo), `⚠️ posiblemente danado` (quedo truncado,
+probable falso positivo o archivo incompleto), y sin marca (`no se pudo verificar`, formatos sin
+un final detectable). **No se oculta nada**: podes recuperar todos igual.
+
 Tambien podes **clonar un disco que esta fallando a un archivo de imagen** antes de escanear
 (ver abajo).
 
@@ -180,7 +185,7 @@ src/
 cargo test
 ```
 
-42 tests automatizados:
+47 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -206,6 +211,7 @@ cargo test
 - same_device_warning no advierte cuando el origen es un archivo de imagen (no un disco fisico)
 - Clonado de disco a imagen: copia byte a byte exacta (ida y vuelta, multi-bloque)
 - Clonado cancelable: corta y conserva la copia parcial
+- Clasificacion de integridad de resultados (integro / posiblemente danado / no verificable) y orden de presentacion
 
 ## Contribuir
 

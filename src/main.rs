@@ -408,7 +408,14 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     println!();
 
     // Ejecutar escaneo
-    let result = scanner::scan_source(&config.source_path, &sigs)?;
+    let mut result = scanner::scan_source(&config.source_path, &sigs)?;
+
+    // Ordenar por integridad: primero los íntegros, después los no verificables, al final los
+    // dudosos (posiblemente dañados). No se oculta ninguno; el orden solo prioriza lo confiable.
+    // `sort_by_key` es estable, así que dentro de cada grupo se conserva el orden de aparición.
+    result
+        .found_files
+        .sort_by_key(|f| f.integrity().display_rank());
 
     // Mostrar resumen
     println!("{}", result.summary().bright_green());
@@ -445,6 +452,11 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         "  (se guardan con este nombre; no conservan el nombre ni la carpeta original)"
             .bright_black()
     );
+    println!(
+        "{}",
+        "  ✅ íntegro   ⚠️  posiblemente dañado   (sin marca) = no se pudo verificar"
+            .bright_black()
+    );
     for (i, found) in result.found_files.iter().enumerate() {
         if i < 20 {
             println!("  {}", found.friendly_summary());
@@ -454,6 +466,24 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         }
     }
     println!();
+
+    // Contar los dudosos para avisar sin ocultarlos.
+    let suspect_count = result
+        .found_files
+        .iter()
+        .filter(|f| f.integrity() == scanner::Integrity::Suspect)
+        .count();
+    if suspect_count > 0 {
+        println!(
+            "{}",
+            format!(
+                "  ⚠️  {} archivo(s) podrían estar dañados o incompletos (quedaron sin su final).\n     Igual podés recuperarlos: a veces se abren bien o se reparan aparte.",
+                suspect_count
+            )
+            .bright_yellow()
+        );
+        println!();
+    }
 
     // En modo batch: recuperar directamente. En interactivo: preguntar.
     let should_recover = if batch { true } else { ui::ask_recover()? };

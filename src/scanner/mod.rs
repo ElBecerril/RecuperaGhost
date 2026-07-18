@@ -80,15 +80,71 @@ impl FoundFile {
         format!("recovered_{:04}.{}", self.index, self.signature.extension)
     }
 
+    /// Estado de integridad best-effort del archivo carveado (ver `Integrity`). Se apoya en la
+    /// señal que el escaneo ya calculó (`footer_found`) más las capacidades de la firma; NO hace
+    /// I/O extra. La idea es avisarle al usuario cuáles resultados son confiables y cuáles pueden
+    /// estar dañados/incompletos, SIN ocultar ninguno (puede recuperarlos todos igual).
+    pub fn integrity(&self) -> Integrity {
+        // Un formato tiene "final detectable" si define un footer o si codifica su tamaño en el
+        // header (ej. BMP). En esos casos `footer_found` nos dice si dimos con el final real.
+        let end_detectable =
+            self.signature.footer.is_some() || self.signature.size_from_header.is_some();
+        if end_detectable {
+            if self.footer_found {
+                Integrity::Intact
+            } else {
+                // El formato TIENE un final detectable pero no lo encontramos: el archivo quedó
+                // truncado a max_size. Probable falso positivo o archivo incompleto/dañado.
+                Integrity::Suspect
+            }
+        } else {
+            // Sin footer ni tamaño en header: no hay forma barata de verificar el final. No lo
+            // afirmamos ni lo negamos.
+            Integrity::Unverifiable
+        }
+    }
+
     /// Línea de resumen pensada para el usuario final (sin offsets ni jerga técnica): muestra
-    /// el nombre con el que va a quedar guardado y el tamaño.
+    /// una marca de integridad, el nombre con el que va a quedar guardado y el tamaño.
     pub fn friendly_summary(&self) -> String {
+        let (mark, suffix) = match self.integrity() {
+            Integrity::Intact => ("✅ ", ""),
+            Integrity::Suspect => ("⚠️  ", "  (posiblemente dañado)"),
+            Integrity::Unverifiable => ("   ", ""),
+        };
         format!(
-            "{} {} — {}",
+            "{}{} {} — {}{}",
+            mark,
             self.signature.category,
             self.recovered_filename(),
-            format_size(self.size)
+            format_size(self.size),
+            suffix
         )
+    }
+}
+
+/// Estado de integridad best-effort de un archivo recuperado por carving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integrity {
+    /// Se encontró el final real del archivo (footer o tamaño del header): estructuralmente
+    /// completo, alta confianza.
+    Intact,
+    /// El formato tiene un final detectable pero no se encontró: quedó truncado a `max_size`
+    /// (probable falso positivo, o archivo real incompleto/dañado).
+    Suspect,
+    /// El formato no tiene una forma barata de verificar el final; no lo podemos afirmar ni negar.
+    Unverifiable,
+}
+
+impl Integrity {
+    /// Orden de presentación: primero los íntegros, después los no verificables, al final los
+    /// dudosos (para que el usuario vea arriba lo más confiable y abajo lo que puede estar mal).
+    pub fn display_rank(self) -> u8 {
+        match self {
+            Integrity::Intact => 0,
+            Integrity::Unverifiable => 1,
+            Integrity::Suspect => 2,
+        }
     }
 }
 
@@ -1139,8 +1195,70 @@ fn find_footer_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signatures::{signatures_for_categories, FileCategory};
+    use crate::signatures::{all_signatures, signatures_for_categories, FileCategory};
     use std::io::Write;
+
+    fn found_with(sig: crate::signatures::FileSignature, footer_found: bool) -> FoundFile {
+        FoundFile {
+            signature: sig,
+            offset: 0,
+            size: 1000,
+            index: 1,
+            footer_found,
+        }
+    }
+
+    #[test]
+    fn test_integrity_footer_format_found_is_intact() {
+        // JPEG tiene footer (FFD9). Si se encontró el footer, es íntegro.
+        let jpeg = all_signatures()
+            .into_iter()
+            .find(|s| s.extension == "jpg")
+            .expect("firma jpg");
+        assert!(jpeg.footer.is_some());
+        assert_eq!(found_with(jpeg, true).integrity(), Integrity::Intact);
+    }
+
+    #[test]
+    fn test_integrity_footer_format_not_found_is_suspect() {
+        // JPEG con footer NO encontrado (truncado a max_size) → posiblemente dañado.
+        let jpeg = all_signatures()
+            .into_iter()
+            .find(|s| s.extension == "jpg")
+            .expect("firma jpg");
+        assert_eq!(found_with(jpeg, false).integrity(), Integrity::Suspect);
+    }
+
+    #[test]
+    fn test_integrity_size_from_header_format_is_intact() {
+        // BMP determina su tamaño por el header (size_from_header), sin footer; footer_found=true
+        // cuando ese tamaño se leyó bien → íntegro.
+        let bmp = all_signatures()
+            .into_iter()
+            .find(|s| s.extension == "bmp")
+            .expect("firma bmp");
+        assert!(bmp.footer.is_none() && bmp.size_from_header.is_some());
+        assert_eq!(found_with(bmp, true).integrity(), Integrity::Intact);
+    }
+
+    #[test]
+    fn test_integrity_no_end_marker_format_is_unverifiable() {
+        // Un formato sin footer ni tamaño en header no se puede verificar → no verificable.
+        let no_end = all_signatures()
+            .into_iter()
+            .find(|s| s.footer.is_none() && s.size_from_header.is_none())
+            .expect("alguna firma sin footer ni size_from_header");
+        assert_eq!(
+            found_with(no_end, false).integrity(),
+            Integrity::Unverifiable
+        );
+    }
+
+    #[test]
+    fn test_integrity_display_rank_orders_intact_first_suspect_last() {
+        assert!(Integrity::Intact.display_rank() < Integrity::Unverifiable.display_rank());
+        assert!(Integrity::Unverifiable.display_rank() < Integrity::Suspect.display_rank());
+    }
 
     /// Crea un archivo temporal con firmas multimedia embebidas para testing
     fn create_test_image() -> (tempfile::NamedTempFile, Vec<(&'static str, u64)>) {
