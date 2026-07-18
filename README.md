@@ -159,7 +159,7 @@ src/
 cargo test
 ```
 
-33 tests automatizados:
+40 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -181,6 +181,8 @@ cargo test
 - Parseo de versiones y busqueda de assets (updater)
 - Deteccion del disco de sistema (Windows C: / raiz Unix) para avisos de UI
 - Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
+- Normalizacion de particion a disco completo (sd/nvme/mmcblk/nbd/loop/macOS), sin mal-normalizar discos que terminan en digito
+- same_device_warning no advierte cuando el origen es un archivo de imagen (no un disco fisico)
 
 ## Contribuir
 

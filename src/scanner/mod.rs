@@ -357,6 +357,7 @@ struct SegmentResult {
 /// resultado de los OTROS hilos que sí terminaron bien. Ahora los errores de lectura del
 /// origen se tratan como "saltar y seguir" en vez de "abortar todo", y se reportan vía
 /// `SegmentResult::had_errors` en vez de con `Result::Err`.
+#[allow(clippy::too_many_arguments)]
 fn scan_segment(
     source_path: &Path,
     segment: &Segment,
@@ -416,10 +417,7 @@ fn scan_segment(
             break;
         }
 
-        let max_to_read = std::cmp::min(
-            BUFFER_SIZE as u64,
-            segment.end - position,
-        ) as usize;
+        let max_to_read = std::cmp::min(BUFFER_SIZE as u64, segment.end - position) as usize;
 
         let bytes_read = match file.read(&mut buffer[..max_to_read]) {
             Ok(n) => n,
@@ -512,10 +510,7 @@ fn scan_segment(
 }
 
 /// Escanea un archivo/dispositivo buscando firmas de archivos multimedia
-pub fn scan_source(
-    source_path: &Path,
-    signatures: &[FileSignature],
-) -> Result<ScanResult> {
+pub fn scan_source(source_path: &Path, signatures: &[FileSignature]) -> Result<ScanResult> {
     let mut file = File::open(source_path)
         .with_context(|| format!("No se pudo abrir: {}", source_path.display()))?;
     let file_size = get_source_size(&mut file, source_path)
@@ -563,14 +558,8 @@ fn scan_source_impl(
     SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
     let _scan_guard = ScanGuard;
 
-    println!(
-        "  🔎 Escaneando: {}",
-        source_path.display()
-    );
-    println!(
-        "  📏 Tamaño: {}",
-        format_size(file_size)
-    );
+    println!("  🔎 Escaneando: {}", source_path.display());
+    println!("  📏 Tamaño: {}", format_size(file_size));
 
     // Estimar tiempo con velocidad ajustada por hilos
     let is_device = crate::util::is_physical_device(source_path);
@@ -585,39 +574,27 @@ fn scan_source_impl(
     if estimated_secs > 30 {
         let mins = estimated_secs / 60;
         let secs = estimated_secs % 60;
-        println!(
-            "  ⏱️  Tiempo estimado: ~{} min {} seg",
-            mins, secs
-        );
+        println!("  ⏱️  Tiempo estimado: ~{} min {} seg", mins, secs);
         println!();
         println!(
             "{}",
-            "  ☕ Estos escaneos son bastante tardados, así que te"
-                .bright_yellow()
+            "  ☕ Estos escaneos son bastante tardados, así que te".bright_yellow()
         );
         println!(
             "{}",
-            "     recomendamos ir por un café o echarte un sueñito"
-                .bright_yellow()
+            "     recomendamos ir por un café o echarte un sueñito".bright_yellow()
         );
         println!(
             "{}",
-            "     en lo que nosotros chambeamos. 👻💤"
-                .bright_yellow()
+            "     en lo que nosotros chambeamos. 👻💤".bright_yellow()
         );
     } else if estimated_secs > 5 {
         let mins = estimated_secs / 60;
         let secs = estimated_secs % 60;
         if mins > 0 {
-            println!(
-                "  ⏱️  Tiempo estimado: ~{} min {} seg",
-                mins, secs
-            );
+            println!("  ⏱️  Tiempo estimado: ~{} min {} seg", mins, secs);
         } else {
-            println!(
-                "  ⏱️  Tiempo estimado: ~{} seg",
-                secs
-            );
+            println!("  ⏱️  Tiempo estimado: ~{} seg", secs);
         }
     }
 
@@ -634,7 +611,7 @@ fn scan_source_impl(
     let pb = ProgressBar::new(file_size);
     pb.set_style(
         ProgressStyle::with_template(
-            "  👻 [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)"
+            "  👻 [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
         )
         .unwrap()
         .progress_chars("█▓▒░  "),
@@ -653,9 +630,20 @@ fn scan_source_impl(
         let progress = AtomicU64::new(0);
         // (B1) scan_segment ya no propaga errores de I/O con `?` — un sector dañado en
         // cualquier punto del origen ya no descarta todo lo encontrado antes de llegar a él.
-        let result = scan_segment(source_path, &segment, signatures, file_size, max_header_len, &progress, Some(&pb), &SCAN_CANCEL_REQUESTED);
+        let result = scan_segment(
+            source_path,
+            &segment,
+            signatures,
+            file_size,
+            max_header_len,
+            &progress,
+            Some(&pb),
+            &SCAN_CANCEL_REQUESTED,
+        );
         if result.had_errors {
-            eprintln!("  ⚠️  El escaneo tuvo errores de I/O leyendo el origen; el resultado es parcial.");
+            eprintln!(
+                "  ⚠️  El escaneo tuvo errores de I/O leyendo el origen; el resultado es parcial."
+            );
         }
         // B3: reportar lo realmente leído, no file_size fijo — un EOF prematuro (bytes_read
         // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo.
@@ -669,15 +657,13 @@ fn scan_source_impl(
         // Hilo dedicado de progreso: lee el atomic cada 100ms y actualiza ProgressBar
         let progress_monitor = progress.clone();
         let pb_monitor = pb.clone();
-        let monitor_handle = std::thread::spawn(move || {
-            loop {
-                let pos = progress_monitor.load(Ordering::Relaxed);
-                pb_monitor.set_position(std::cmp::min(pos, file_size));
-                if pos >= file_size {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        let monitor_handle = std::thread::spawn(move || loop {
+            let pos = progress_monitor.load(Ordering::Relaxed);
+            pb_monitor.set_position(std::cmp::min(pos, file_size));
+            if pos >= file_size {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         });
 
         // Spawn N hilos workers
@@ -693,7 +679,16 @@ fn scan_source_impl(
                 std::thread::spawn(move || {
                     // `&SCAN_CANCEL_REQUESTED` es una referencia 'static (es un static global),
                     // así que se puede mover a cada worker sin clonar ni envolver en Arc.
-                    scan_segment(&path, &segment, &sigs, file_size, max_header_len, &prog, None, &SCAN_CANCEL_REQUESTED)
+                    scan_segment(
+                        &path,
+                        &segment,
+                        &sigs,
+                        file_size,
+                        max_header_len,
+                        &prog,
+                        None,
+                        &SCAN_CANCEL_REQUESTED,
+                    )
                 })
             })
             .collect();
@@ -817,9 +812,7 @@ fn check_signatures_in_buffer(
                 if let Some((extra_bytes, extra_offset)) = &sig.extra_check {
                     let extra_pos = i + extra_offset;
                     let extra_end = extra_pos + extra_bytes.len();
-                    if extra_end > buf.len()
-                        || &buf[extra_pos..extra_end] != *extra_bytes
-                    {
+                    if extra_end > buf.len() || &buf[extra_pos..extra_end] != *extra_bytes {
                         continue;
                     }
                 }
@@ -853,8 +846,7 @@ fn check_signatures_in_buffer(
                 );
 
                 // Determinar tamaño: campo de tamaño en el header (BMP), footer, o max_size.
-                let (size, footer_found) = if let Some((sf_offset, sf_len)) = sig.size_from_header
-                {
+                let (size, footer_found) = if let Some((sf_offset, sf_len)) = sig.size_from_header {
                     let sf_start = i + sf_offset;
                     let sf_end = sf_start + sf_len;
                     if sf_end <= buf.len() {
@@ -1013,7 +1005,9 @@ fn scan_nesting(
             i += footer.len();
             continue;
         }
-        if !header.is_empty() && i + header.len() <= buf.len() && &buf[i..i + header.len()] == header
+        if !header.is_empty()
+            && i + header.len() <= buf.len()
+            && &buf[i..i + header.len()] == header
         {
             if i + header.len() > skip_before {
                 depth += 1;
@@ -1045,9 +1039,8 @@ fn refine_footers(source_path: &Path, found_files: &mut [FoundFile]) {
             continue;
         };
 
-        let header_end = f.offset
-            + f.signature.header_offset as u64
-            + f.signature.header.len() as u64;
+        let header_end =
+            f.offset + f.signature.header_offset as u64 + f.signature.header.len() as u64;
         let search_end = f.offset + f.signature.max_size as u64;
 
         if let Some(new_size) = find_footer_sequential(
@@ -1107,8 +1100,15 @@ fn find_footer_sequential(
         combined.extend_from_slice(&buf);
 
         let combined_len = combined.len();
-        let (new_depth, footer_pos) =
-            scan_nesting(&combined, header, footer, depth, skip_before, 0, combined_len);
+        let (new_depth, footer_pos) = scan_nesting(
+            &combined,
+            header,
+            footer,
+            depth,
+            skip_before,
+            0,
+            combined_len,
+        );
         depth = new_depth;
         if let Some(rel_pos) = footer_pos {
             let abs_pos = combined_start + rel_pos as u64;
@@ -1217,8 +1217,7 @@ mod tests {
         data[pos + 5] = 0x02;
         data[pos + 26] = 1;
         data[pos + 27] = 19;
-        data[pos + 28..pos + 36]
-            .copy_from_slice(&[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]);
+        data[pos + 28..pos + 36].copy_from_slice(&[0x4F, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64]);
         for i in 36..800 {
             data[pos + i] = ((i * 31) % 256) as u8;
         }
@@ -1250,7 +1249,11 @@ mod tests {
     #[test]
     fn test_scan_detects_all_signatures() {
         let (file, expected) = create_test_image();
-        let all_categories = vec![FileCategory::Photo, FileCategory::Video, FileCategory::Audio];
+        let all_categories = vec![
+            FileCategory::Photo,
+            FileCategory::Video,
+            FileCategory::Audio,
+        ];
         let sigs = signatures_for_categories(&all_categories);
 
         let result = scan_source(file.path(), &sigs).unwrap();
@@ -1269,20 +1272,23 @@ mod tests {
                 .found_files
                 .iter()
                 .any(|f| f.signature.extension == *ext && f.offset == *offset);
-            assert!(
-                found,
-                "No se encontro {} en offset 0x{:X}",
-                ext, offset
-            );
+            assert!(found, "No se encontro {} en offset 0x{:X}", ext, offset);
         }
 
-        println!("\nTodas las {} firmas detectadas correctamente.", expected.len());
+        println!(
+            "\nTodas las {} firmas detectadas correctamente.",
+            expected.len()
+        );
     }
 
     #[test]
     fn test_riff_disambiguation() {
         let (file, _) = create_test_image();
-        let all_categories = vec![FileCategory::Photo, FileCategory::Video, FileCategory::Audio];
+        let all_categories = vec![
+            FileCategory::Photo,
+            FileCategory::Video,
+            FileCategory::Audio,
+        ];
         let sigs = signatures_for_categories(&all_categories);
 
         let result = scan_source(file.path(), &sigs).unwrap();
@@ -1365,31 +1371,40 @@ mod tests {
             .expect("JPEG no encontrado");
 
         // El footer FFD9 esta a 2050 bytes del inicio del JPEG
-        assert_eq!(jpeg.size, 2050, "Tamano JPEG deberia ser 2050, es {}", jpeg.size);
-        println!("\nFooter JPEG detectado correctamente: {} bytes.", jpeg.size);
+        assert_eq!(
+            jpeg.size, 2050,
+            "Tamano JPEG deberia ser 2050, es {}",
+            jpeg.size
+        );
+        println!(
+            "\nFooter JPEG detectado correctamente: {} bytes.",
+            jpeg.size
+        );
     }
 
     #[test]
     fn test_recovery() {
         let (file, _) = create_test_image();
-        let all_categories = vec![FileCategory::Photo, FileCategory::Video, FileCategory::Audio];
+        let all_categories = vec![
+            FileCategory::Photo,
+            FileCategory::Video,
+            FileCategory::Audio,
+        ];
         let sigs = signatures_for_categories(&all_categories);
 
         let result = scan_source(file.path(), &sigs).unwrap();
 
         let output_dir = tempfile::tempdir().unwrap();
-        let recovery = crate::recovery::recover_files(
-            file.path(),
-            &result.found_files,
-            output_dir.path(),
-        )
-        .unwrap();
+        let recovery =
+            crate::recovery::recover_files(file.path(), &result.found_files, output_dir.path())
+                .unwrap();
 
-        assert_eq!(recovery.failed, 0, "Hubo {} fallos de recuperacion", recovery.failed);
-        assert!(
-            recovery.recovered > 0,
-            "No se recupero ningun archivo"
+        assert_eq!(
+            recovery.failed, 0,
+            "Hubo {} fallos de recuperacion",
+            recovery.failed
         );
+        assert!(recovery.recovered > 0, "No se recupero ningun archivo");
         assert!(recovery.total_bytes > 0, "0 bytes recuperados");
 
         // Verificar que se crearon las subcarpetas
@@ -1411,9 +1426,9 @@ mod tests {
 
         // Probar con thread counts pares e impares, y tamaños alineados y no-alineados
         let cases: Vec<(u64, &[usize])> = vec![
-            (100 * 1024 * 1024, &[2, 3, 4, 5, 7, 8]),           // 100 MB exacto
-            (100 * 1024 * 1024 + 1, &[2, 3, 5, 7]),             // 100 MB + 1 byte
-            (17 * 1024 * 1024 + 12345, &[2, 3]),                 // ~17 MB no alineado
+            (100 * 1024 * 1024, &[2, 3, 4, 5, 7, 8]), // 100 MB exacto
+            (100 * 1024 * 1024 + 1, &[2, 3, 5, 7]),   // 100 MB + 1 byte
+            (17 * 1024 * 1024 + 12345, &[2, 3]),      // ~17 MB no alineado
         ];
 
         for (file_size, thread_counts) in &cases {
@@ -1428,16 +1443,21 @@ mod tests {
                     file_size, num_threads
                 );
                 assert_eq!(
-                    segments[num_threads - 1].claim_end, *file_size,
+                    segments[num_threads - 1].claim_end,
+                    *file_size,
                     "file_size={}, threads={}: ultimo segmento no llega a file_size",
-                    file_size, num_threads
+                    file_size,
+                    num_threads
                 );
                 for i in 1..num_threads {
                     assert_eq!(
                         segments[i].claim_start,
                         segments[i - 1].claim_end,
                         "file_size={}, threads={}: gap entre segmento {} y {}",
-                        file_size, num_threads, i - 1, i
+                        file_size,
+                        num_threads,
+                        i - 1,
+                        i
                     );
                 }
 
@@ -1447,22 +1467,32 @@ mod tests {
                         assert!(
                             seg.start <= seg.claim_start,
                             "file_size={}, threads={}: segmento {} start {} > claim_start {}",
-                            file_size, num_threads, i, seg.start, seg.claim_start
+                            file_size,
+                            num_threads,
+                            i,
+                            seg.start,
+                            seg.claim_start
                         );
                     }
                     assert!(
                         seg.end >= seg.claim_end,
                         "file_size={}, threads={}: segmento {} end {} < claim_end {}",
-                        file_size, num_threads, i, seg.end, seg.claim_end
+                        file_size,
+                        num_threads,
+                        i,
+                        seg.end,
+                        seg.claim_end
                     );
                 }
 
                 // No hay zonas claim vacías
-                for i in 0..num_threads {
+                for (i, seg) in segments.iter().take(num_threads).enumerate() {
                     assert!(
-                        segments[i].claim_start < segments[i].claim_end,
+                        seg.claim_start < seg.claim_end,
                         "file_size={}, threads={}: zona claim vacia en segmento {}",
-                        file_size, num_threads, i
+                        file_size,
+                        num_threads,
+                        i
                     );
                 }
             }
@@ -1504,13 +1534,18 @@ mod tests {
         let count = select_thread_count(&PathBuf::from("large.img"), 1_000_000_000);
 
         if cpu_cores > 1 {
-            assert!(count > 1, "Esperaba >1 hilo para 1GB en maquina multi-core, obtuve {}", count);
+            assert!(
+                count > 1,
+                "Esperaba >1 hilo para 1GB en maquina multi-core, obtuve {}",
+                count
+            );
         }
         assert!(count <= 8, "Esperaba <=8 hilos, obtuve {}", count);
         assert!(
             count <= cpu_cores,
             "No debe exceder cores disponibles: {} > {}",
-            count, cpu_cores
+            count,
+            cpu_cores
         );
         assert!(count >= 1, "Siempre al menos 1 hilo");
 
@@ -1520,14 +1555,22 @@ mod tests {
 
         // Archivo de 32 MB → max 2 hilos (by_size = 32/16 = 2)
         let count_32 = select_thread_count(&PathBuf::from("medium.img"), 32 * 1024 * 1024);
-        assert!(count_32 <= 2, "32MB no deberia dar mas de 2 hilos, obtuve {}", count_32);
+        assert!(
+            count_32 <= 2,
+            "32MB no deberia dar mas de 2 hilos, obtuve {}",
+            count_32
+        );
     }
 
     #[test]
     fn test_multithreaded_scan_consistency() {
         // Usar la imagen de test con TODAS las categorías (incluye RIFF/OggS disambiguation)
         let (file, expected) = create_test_image();
-        let all_categories = vec![FileCategory::Photo, FileCategory::Video, FileCategory::Audio];
+        let all_categories = vec![
+            FileCategory::Photo,
+            FileCategory::Video,
+            FileCategory::Audio,
+        ];
         let sigs = signatures_for_categories(&all_categories);
 
         // Referencia: resultado single-threaded
@@ -1643,10 +1686,7 @@ mod tests {
             .found_files
             .iter()
             .any(|f| f.offset == boundary as u64);
-        let found_before = result
-            .found_files
-            .iter()
-            .any(|f| f.offset == before as u64);
+        let found_before = result.found_files.iter().any(|f| f.offset == before as u64);
 
         assert!(
             found_at_boundary,
@@ -1680,7 +1720,9 @@ mod tests {
             data[thumb + i] = ((i * 3) % 256) as u8;
         }
         data[thumb + 200..thumb + 202].copy_from_slice(&[0xFF, 0xD9]); // EOI del thumbnail
-        // Resto de datos de la foto real, más largo, con el EOI real mucho más lejos
+                                                                       // Resto de datos de la foto real, más largo, con el EOI real mucho más lejos.
+                                                                       // `i` se usa como índice Y como valor del byte, así que el range-loop es intencional.
+        #[allow(clippy::needless_range_loop)]
         for i in (thumb + 202)..pos + 100_000 {
             data[i] = ((i * 5) % 256) as u8;
         }
@@ -1779,13 +1821,24 @@ mod tests {
         }
         let mp3_pct = mp3_pass as f64 / trials as f64 * 100.0;
         let aac_pct = aac_pass as f64 / trials as f64 * 100.0;
-        println!("mp3 pass rate = {:.4}%  aac pass rate = {:.4}%", mp3_pct, aac_pct);
+        println!(
+            "mp3 pass rate = {:.4}%  aac pass rate = {:.4}%",
+            mp3_pct, aac_pct
+        );
 
         // Antes del frame chaining (solo bits reservados) pasaba ~60-65% de datos aleatorios;
         // con frame chaining debe caer a un porcentaje marginal (umbral generoso para no ser
         // frágil ante variaciones del PRNG determinístico usado arriba).
-        assert!(mp3_pct < 5.0, "MP3 sync validator deja pasar demasiados falsos positivos: {:.4}%", mp3_pct);
-        assert!(aac_pct < 5.0, "AAC ADTS validator deja pasar demasiados falsos positivos: {:.4}%", aac_pct);
+        assert!(
+            mp3_pct < 5.0,
+            "MP3 sync validator deja pasar demasiados falsos positivos: {:.4}%",
+            mp3_pct
+        );
+        assert!(
+            aac_pct < 5.0,
+            "AAC ADTS validator deja pasar demasiados falsos positivos: {:.4}%",
+            aac_pct
+        );
     }
 
     #[test]
@@ -1812,7 +1865,10 @@ mod tests {
         assert_eq!(tiff_be.signature.extension, "tiff");
         assert_eq!(tiff_be.signature.name, "TIFF (big-endian)");
 
-        println!("\nTIFF big-endian (MM*) detectado correctamente en offset 0x{:X}.", pos);
+        println!(
+            "\nTIFF big-endian (MM*) detectado correctamente en offset 0x{:X}.",
+            pos
+        );
     }
 
     #[test]
@@ -2031,7 +2087,10 @@ mod tests {
         valid[2..6].copy_from_slice(&100u32.to_le_bytes());
         valid[6..10].copy_from_slice(&[0, 0, 0, 0]);
         valid[10..14].copy_from_slice(&54u32.to_le_bytes());
-        assert!(validator_fn(&valid), "BMP valido deberia pasar el validador");
+        assert!(
+            validator_fn(&valid),
+            "BMP valido deberia pasar el validador"
+        );
 
         // Caso invalido: bfOffBits mayor que bfSize (estructuralmente imposible en un BMP real).
         let mut bad_offset = vec![0u8; 100];
@@ -2039,7 +2098,10 @@ mod tests {
         bad_offset[1] = 0x4D;
         bad_offset[2..6].copy_from_slice(&100u32.to_le_bytes());
         bad_offset[10..14].copy_from_slice(&500u32.to_le_bytes());
-        assert!(!validator_fn(&bad_offset), "bfOffBits > bfSize deberia rechazarse");
+        assert!(
+            !validator_fn(&bad_offset),
+            "bfOffBits > bfSize deberia rechazarse"
+        );
 
         // Caso invalido: bfSize absurdamente grande (mayor al max_size de la firma).
         let mut bad_size = vec![0u8; 100];
@@ -2047,7 +2109,10 @@ mod tests {
         bad_size[1] = 0x4D;
         bad_size[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
         bad_size[10..14].copy_from_slice(&54u32.to_le_bytes());
-        assert!(!validator_fn(&bad_size), "bfSize absurdo deberia rechazarse");
+        assert!(
+            !validator_fn(&bad_size),
+            "bfSize absurdo deberia rechazarse"
+        );
 
         // Fin a fin: un BMP valido embebido en un buffer se detecta via scan_source, y datos
         // aleatorios con "BM" al inicio pero campos incoherentes no. bfSize se declara en
@@ -2090,7 +2155,12 @@ mod tests {
             .filter(|f| f.offset == bmp_pos as u64)
             .map(|f| f.signature.extension)
             .collect();
-        assert_eq!(at_valid_bmp, vec!["bmp"], "Offset BMP valido tiene: {:?}", at_valid_bmp);
+        assert_eq!(
+            at_valid_bmp,
+            vec!["bmp"],
+            "Offset BMP valido tiene: {:?}",
+            at_valid_bmp
+        );
 
         let at_random_bmp = result
             .found_files
@@ -2134,7 +2204,14 @@ mod tests {
         let progress = AtomicU64::new(0);
         let cancel_on = AtomicBool::new(true);
         let cancelled = scan_segment(
-            file.path(), &segment, &sigs, 4096, max_header_len, &progress, None, &cancel_on,
+            file.path(),
+            &segment,
+            &sigs,
+            4096,
+            max_header_len,
+            &progress,
+            None,
+            &cancel_on,
         );
         assert!(
             cancelled.found_files.is_empty(),
@@ -2151,13 +2228,25 @@ mod tests {
         let progress2 = AtomicU64::new(0);
         let cancel_off = AtomicBool::new(false);
         let normal = scan_segment(
-            file.path(), &segment, &sigs, 4096, max_header_len, &progress2, None, &cancel_off,
+            file.path(),
+            &segment,
+            &sigs,
+            4096,
+            max_header_len,
+            &progress2,
+            None,
+            &cancel_off,
         );
         assert!(
-            normal.found_files.iter().any(|f| f.signature.extension == "jpg"),
+            normal
+                .found_files
+                .iter()
+                .any(|f| f.signature.extension == "jpg"),
             "sin cancelar, scan_segment debería encontrar el JPEG"
         );
 
-        println!("\nCancelación cooperativa corta el escaneo antes de leer y conserva el flujo normal.");
+        println!(
+            "\nCancelación cooperativa corta el escaneo antes de leer y conserva el flujo normal."
+        );
     }
 }

@@ -98,7 +98,7 @@ pub fn cleanup_old_binary() {
 /// Si la hay, ofrece descargarla y reemplazar el binario.
 /// Si falla cualquier cosa, continúa silenciosamente.
 pub fn check_for_updates() {
-    if let Err(_) = try_check_for_updates() {
+    if try_check_for_updates().is_err() {
         // Silencio total: no bloquear el programa por errores de red/parsing
     }
 }
@@ -139,8 +139,7 @@ fn try_check_for_updates() -> Result<(), Box<dyn std::error::Error>> {
     if !ask_update() {
         println!(
             "{}",
-            "  ⏭️  Actualización omitida. Puedes descargarla manualmente desde:"
-                .bright_yellow()
+            "  ⏭️  Actualización omitida. Puedes descargarla manualmente desde:".bright_yellow()
         );
         println!("     {}", release.html_url.bright_cyan());
         println!();
@@ -212,7 +211,9 @@ fn download_and_replace(
     asset: &GitHubAsset,
     checksums_asset: &GitHubAsset,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !is_github_url(&asset.browser_download_url) || !is_github_url(&checksums_asset.browser_download_url) {
+    if !is_github_url(&asset.browser_download_url)
+        || !is_github_url(&checksums_asset.browser_download_url)
+    {
         return Err(
             "La URL de descarga no apunta a github.com, se aborta la actualización por seguridad"
                 .into(),
@@ -220,10 +221,7 @@ fn download_and_replace(
     }
 
     println!();
-    println!(
-        "{}",
-        "  📥 Descargando checksums...".bright_cyan()
-    );
+    println!("{}", "  📥 Descargando checksums...".bright_cyan());
 
     // Descargar SHA256SUMS.txt y ubicar la línea correspondiente a este asset
     let checksums_text = agent
@@ -251,10 +249,7 @@ fn download_and_replace(
             )
         })?;
 
-    println!(
-        "{}",
-        "  📥 Descargando actualización...".bright_cyan()
-    );
+    println!("{}", "  📥 Descargando actualización...".bright_cyan());
 
     let response = agent
         .get(&asset.browser_download_url)
@@ -335,7 +330,10 @@ fn download_and_replace(
     #[cfg(target_os = "windows")]
     {
         if data.len() < 2 || data[0] != b'M' || data[1] != b'Z' {
-            return Err("El archivo descargado no es un ejecutable válido de Windows (falta MZ header)".into());
+            return Err(
+                "El archivo descargado no es un ejecutable válido de Windows (falta MZ header)"
+                    .into(),
+            );
         }
     }
 
@@ -344,16 +342,9 @@ fn download_and_replace(
     let old_path = exe_path.with_extension("exe.old");
 
     // Paso 1: renombrar el binario actual a .old
-    println!(
-        "{}",
-        "  🔄 Reemplazando binario...".bright_cyan()
-    );
-    fs::rename(&exe_path, &old_path).map_err(|e| {
-        format!(
-            "No se pudo renombrar el binario actual: {}",
-            e
-        )
-    })?;
+    println!("{}", "  🔄 Reemplazando binario...".bright_cyan());
+    fs::rename(&exe_path, &old_path)
+        .map_err(|e| format!("No se pudo renombrar el binario actual: {}", e))?;
 
     // Paso 2: escribir el nuevo binario
     match fs::write(&exe_path, &data) {
@@ -436,8 +427,7 @@ fn show_update_available(new_version: &str, url: &str) {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_green()
+        "  ╔══════════════════════════════════════════════╗".bright_green()
     );
     println!(
         "{}{}{}",
@@ -449,17 +439,12 @@ fn show_update_available(new_version: &str, url: &str) {
     );
     println!(
         "{}",
-        "  ╠══════════════════════════════════════════════╣"
-            .bright_green()
+        "  ╠══════════════════════════════════════════════╣".bright_green()
     );
     println!(
         "{}{}{}",
         "  ║".bright_green(),
-        format!(
-            "   Versión actual:  v{:<27}",
-            banner::VERSION
-        )
-        .bright_yellow(),
+        format!("   Versión actual:  v{:<27}", banner::VERSION).bright_yellow(),
         "║".bright_green()
     );
     println!(
@@ -482,8 +467,7 @@ fn show_update_available(new_version: &str, url: &str) {
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_green()
+        "  ╚══════════════════════════════════════════════╝".bright_green()
     );
     println!();
 }
@@ -500,8 +484,7 @@ fn show_update_complete(new_version: &str) {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_green()
+        "  ╔══════════════════════════════════════════════╗".bright_green()
     );
     println!(
         "{}{}{}",
@@ -513,17 +496,12 @@ fn show_update_complete(new_version: &str) {
     );
     println!(
         "{}",
-        "  ╠══════════════════════════════════════════════╣"
-            .bright_green()
+        "  ╠══════════════════════════════════════════════╣".bright_green()
     );
     println!(
         "{}{}{}",
         "  ║".bright_green(),
-        format!(
-            "   RecupeGhost se actualizó a {:<17}",
-            new_version
-        )
-        .bright_green(),
+        format!("   RecupeGhost se actualizó a {:<17}", new_version).bright_green(),
         "║".bright_green()
     );
     println!(
@@ -534,8 +512,7 @@ fn show_update_complete(new_version: &str) {
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_green()
+        "  ╚══════════════════════════════════════════════╝".bright_green()
     );
     println!();
 }

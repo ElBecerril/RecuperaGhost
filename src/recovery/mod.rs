@@ -38,7 +38,7 @@ pub fn recover_files(
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
-            "  👻 Recuperando [{bar:40.green/white}] {pos}/{len} archivos"
+            "  👻 Recuperando [{bar:40.green/white}] {pos}/{len} archivos",
         )
         .unwrap()
         .progress_chars("█▓▒░  "),
@@ -118,8 +118,8 @@ fn extract_file(source: &mut File, found: &FoundFile, dest: &Path) -> Result<u64
         .seek(SeekFrom::Start(aligned_offset))
         .with_context(|| format!("No se pudo posicionar en offset {}", aligned_offset))?;
 
-    let mut dest_file = File::create(dest)
-        .with_context(|| format!("No se pudo crear: {}", dest.display()))?;
+    let mut dest_file =
+        File::create(dest).with_context(|| format!("No se pudo crear: {}", dest.display()))?;
 
     // A partir de acá el archivo de destino ya existe en disco. Si `copy_to_dest` falla
     // (lectura del origen o escritura al destino a mitad de camino), el archivo parcial
@@ -234,7 +234,10 @@ impl RecoveryResult {
         let detail_line = if total_problems > 0 && !self.errors.is_empty() {
             let mut causas = self.errors.join(" | ");
             if total_problems as usize > self.errors.len() {
-                causas.push_str(&format!(" (+{} más)", total_problems as usize - self.errors.len()));
+                causas.push_str(&format!(
+                    " (+{} más)",
+                    total_problems as usize - self.errors.len()
+                ));
             }
             format!("\n     Detalle: {}", causas)
         } else {
@@ -291,7 +294,7 @@ mod tests {
     fn test_truncated_file_not_counted_as_recovered() {
         let mut source_file = tempfile::NamedTempFile::new().unwrap();
         // Solo 100 bytes disponibles en el origen a partir del offset 0.
-        source_file.write_all(&vec![0x42u8; 100]).unwrap();
+        source_file.write_all(&[0x42u8; 100]).unwrap();
         source_file.flush().unwrap();
 
         // Se "encontró" un archivo que supuestamente mide 500 bytes, pero el origen
@@ -304,7 +307,10 @@ mod tests {
         assert_eq!(result.recovered, 0, "no debe contar como recuperado pleno");
         assert_eq!(result.truncated, 1, "debe quedar registrado como truncado");
         assert_eq!(result.failed, 0);
-        assert_eq!(result.total_bytes, 100, "debe reportar los bytes realmente escritos");
+        assert_eq!(
+            result.total_bytes, 100,
+            "debe reportar los bytes realmente escritos"
+        );
         assert_eq!(result.errors.len(), 1);
         assert!(
             result.errors[0].contains("recovered_0001.test"),
@@ -319,7 +325,10 @@ mod tests {
 
         // El archivo parcial sí debe existir en disco (100 bytes recuperados son mejor que
         // nada), solo que reportado como incompleto en vez de éxito pleno.
-        let dest = output_dir.path().join("documentos").join("recovered_0001.test");
+        let dest = output_dir
+            .path()
+            .join("documentos")
+            .join("recovered_0001.test");
         assert!(dest.exists());
         assert_eq!(std::fs::metadata(&dest).unwrap().len(), 100);
     }

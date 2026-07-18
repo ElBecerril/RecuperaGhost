@@ -22,19 +22,19 @@ pub fn show_banner() {
     println!("{}", ghost.bright_cyan());
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_cyan()
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "     👻 R E C U P E G H O S T 👻              ".bright_white().bold(),
+        "     👻 R E C U P E G H O S T 👻              "
+            .bright_white()
+            .bold(),
         "║".bright_cyan()
     );
     println!(
         "{}",
-        "  ╠══════════════════════════════════════════════╣"
-            .bright_cyan()
+        "  ╠══════════════════════════════════════════════╣".bright_cyan()
     );
     println!(
         "{}{}{}",
@@ -44,20 +44,17 @@ pub fn show_banner() {
     );
     println!(
         "{}",
-        "  ╠══════════════════════════════════════════════╣"
-            .bright_cyan()
+        "  ╠══════════════════════════════════════════════╣".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        format!("   by El_Becerril - v{}                         ", VERSION)
-            .bright_green(),
+        format!("   by El_Becerril - v{}                         ", VERSION).bright_green(),
         "║".bright_cyan()
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_cyan()
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
     );
     println!();
     println!(

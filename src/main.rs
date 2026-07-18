@@ -184,8 +184,7 @@ fn main() -> Result<()> {
 
         // Validar que la ruta existe (excepto dispositivos raw)
         let src = config.source_path.to_string_lossy();
-        if !util::is_physical_device(&config.source_path) && !config.source_path.exists()
-        {
+        if !util::is_physical_device(&config.source_path) && !config.source_path.exists() {
             eprintln!(
                 "{}",
                 format!("  ❌ La ruta '{}' no existe.", src).bright_red()
@@ -233,19 +232,13 @@ fn main() -> Result<()> {
         println!();
 
         if let Err(e) = run_scan(config, true) {
-            eprintln!(
-                "{}",
-                format!("  ❌ Error: {}", e).bright_red()
-            );
+            eprintln!("{}", format!("  ❌ Error: {}", e).bright_red());
             if let Some(hint) = friendly_error_hint(&e) {
                 eprintln!("{}", hint.bright_yellow());
             }
             let mut source = e.source();
             while let Some(cause) = source {
-                eprintln!(
-                    "{}",
-                    format!("     Causa: {}", cause).bright_red()
-                );
+                eprintln!("{}", format!("     Causa: {}", cause).bright_red());
                 source = cause.source();
             }
             eprintln!();
@@ -302,10 +295,7 @@ fn main() -> Result<()> {
                             // Mostrar causa raíz si existe
                             let mut source = e.source();
                             while let Some(cause) = source {
-                                eprintln!(
-                                    "{}",
-                                    format!("     Causa: {}", cause).bright_red()
-                                );
+                                eprintln!("{}", format!("     Causa: {}", cause).bright_red());
                                 source = cause.source();
                             }
                             eprintln!();
@@ -362,10 +352,7 @@ o dañado — probá reconectarlo.",
 /// Espera a que el usuario presione ENTER antes de cerrar.
 /// Útil cuando se ejecuta con doble clic en Windows.
 fn wait_for_keypress() {
-    println!(
-        "{}",
-        "  Presiona ENTER para cerrar...".bright_black()
-    );
+    println!("{}", "  Presiona ENTER para cerrar...".bright_black());
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
@@ -373,8 +360,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_cyan()
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
     );
     println!(
         "{}{}{}",
@@ -386,18 +372,14 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_cyan()
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
     );
     println!();
 
     // Obtener firmas según las categorías seleccionadas
     let sigs = signatures_for_categories(&config.categories);
 
-    println!(
-        "  🔎 Buscando {} tipos de archivo...",
-        sigs.len()
-    );
+    println!("  🔎 Buscando {} tipos de archivo...", sigs.len());
     println!();
 
     // Ejecutar escaneo
@@ -411,24 +393,20 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         if result.cancelled {
             println!(
                 "{}",
-                "  ⏹️  Cancelaste antes de que se encontrara ningún archivo."
-                    .bright_yellow()
+                "  ⏹️  Cancelaste antes de que se encontrara ningún archivo.".bright_yellow()
             );
             println!(
                 "{}",
-                "     Podés volver a escanear cuando quieras."
-                    .bright_black()
+                "     Podés volver a escanear cuando quieras.".bright_black()
             );
         } else {
             println!(
                 "{}",
-                "  😔 No se encontraron archivos multimedia."
-                    .bright_yellow()
+                "  😔 No se encontraron archivos multimedia.".bright_yellow()
             );
             println!(
                 "{}",
-                "     Intenta con otra imagen de disco o categorías diferentes."
-                    .bright_black()
+                "     Intenta con otra imagen de disco o categorías diferentes.".bright_black()
             );
         }
         println!();
@@ -436,10 +414,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     }
 
     // Mostrar lista de archivos encontrados
-    println!(
-        "{}",
-        "  ═══ Archivos encontrados ═══".bright_cyan()
-    );
+    println!("{}", "  ═══ Archivos encontrados ═══".bright_cyan());
     println!(
         "{}",
         "  (se guardan con este nombre; no conservan el nombre ni la carpeta original)"
@@ -449,10 +424,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         if i < 20 {
             println!("  {}", found.friendly_summary());
         } else if i == 20 {
-            println!(
-                "  ... y {} archivos más",
-                result.found_files.len() - 20
-            );
+            println!("  ... y {} archivos más", result.found_files.len() - 20);
             break;
         }
     }
@@ -465,8 +437,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         println!();
         println!(
             "{}",
-            "  ╔══════════════════════════════════════════════╗"
-                .bright_green()
+            "  ╔══════════════════════════════════════════════╗".bright_green()
         );
         println!(
             "{}{}{}",
@@ -478,22 +449,17 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         );
         println!(
             "{}",
-            "  ╚══════════════════════════════════════════════╝"
-                .bright_green()
+            "  ╚══════════════════════════════════════════════╝".bright_green()
         );
         println!();
 
-        let recovery_result = recovery::recover_files(
-            &config.source_path,
-            &result.found_files,
-            &config.output_dir,
-        )?;
+        let recovery_result =
+            recovery::recover_files(&config.source_path, &result.found_files, &config.output_dir)?;
 
         println!();
         println!(
             "{}",
-            "  ╔══════════════════════════════════════════════╗"
-                .bright_green()
+            "  ╔══════════════════════════════════════════════╗".bright_green()
         );
         println!(
             "{}{}{}",
@@ -505,14 +471,12 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         );
         println!(
             "{}",
-            "  ╠══════════════════════════════════════════════╣"
-                .bright_green()
+            "  ╠══════════════════════════════════════════════╣".bright_green()
         );
         println!("{}", recovery_result.summary());
         println!(
             "{}",
-            "  ╚══════════════════════════════════════════════╝"
-                .bright_green()
+            "  ╚══════════════════════════════════════════════╝".bright_green()
         );
         println!();
     }

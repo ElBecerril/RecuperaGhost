@@ -48,25 +48,24 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_cyan()
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "         🔍 CONFIGURAR ESCANEO                  ".bright_white().bold(),
+        "         🔍 CONFIGURAR ESCANEO                  "
+            .bright_white()
+            .bold(),
         "║".bright_cyan()
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_cyan()
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
     );
     println!();
     println!(
         "{}",
-        "  En todos los menús: usá las flechas ↑↓ para moverte y ENTER para elegir."
-            .bright_black()
+        "  En todos los menús: usá las flechas ↑↓ para moverte y ENTER para elegir.".bright_black()
     );
     println!();
 
@@ -126,10 +125,7 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
         );
         println!();
 
-        let retry_options = vec![
-            "🔄 Intentar de todas formas",
-            "↩️  Volver al menú",
-        ];
+        let retry_options = vec!["🔄 Intentar de todas formas", "↩️  Volver al menú"];
 
         let choice = Select::new()
             .with_prompt("  ¿Qué deseas hacer?")
@@ -171,8 +167,7 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     if selected_types.is_empty() {
         println!(
             "{}",
-            "  ❌ Debes seleccionar al menos un tipo de archivo."
-                .bright_red()
+            "  ❌ Debes seleccionar al menos un tipo de archivo.".bright_red()
         );
         return Ok(None);
     }
@@ -304,12 +299,27 @@ fn normalize_to_whole_disk(path: &str) -> String {
             }
         }
 
-        // Caso simple sd*, vd*, hd*, xvd*, etc. (letras + dígitos, sin 'p'):
-        // /dev/<letras><digitos> -> /dev/<letras>
+        // Caso simple sd*, vd*, hd*, xvd* (letras + dígitos, sin 'p'):
+        // /dev/<letras><digitos> -> /dev/<letras> (ej. /dev/sdb1 -> /dev/sdb).
+        //
+        // OJO (bug dormido corregido): esto SOLO aplica a las familias cuyo
+        // disco completo es puramente alfabético (sda, vdb, hdc, xvda) y cuya
+        // partición añade un dígito. Familias como mmcblk0, nbd0, loop0, sr0,
+        // md0 tienen el número como parte del NOMBRE del disco completo (sus
+        // particiones usan el sufijo `pN`, ya cubierto por la rama de arriba, o
+        // directamente no tienen particiones). Recortarles el dígito devolvía
+        // un dispositivo inexistente (/dev/mmcblk, /dev/loop) y rompía la
+        // comparación. Por eso restringimos a un whitelist de prefijos
+        // conocidos: si el nombre no matchea, se devuelve tal cual y
+        // same_device_warning cae en su fail-safe (advertir), nunca en un falso
+        // negativo silencioso.
         let letters_end = rest.find(|c: char| c.is_ascii_digit());
         if let Some(idx) = letters_end {
             let (letters, digits) = rest.split_at(idx);
-            if !letters.is_empty()
+            let is_alpha_whole_disk_family = ["sd", "hd", "vd", "xvd"]
+                .iter()
+                .any(|prefix| letters.starts_with(prefix));
+            if is_alpha_whole_disk_family
                 && letters.chars().all(|c| c.is_ascii_alphabetic())
                 && !digits.is_empty()
                 && digits.chars().all(|c| c.is_ascii_digit())
@@ -322,7 +332,10 @@ fn normalize_to_whole_disk(path: &str) -> String {
     path.to_string()
 }
 
-pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path::Path) -> Option<String> {
+pub fn same_device_warning(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Option<String> {
     let src_str = source_path.to_string_lossy();
     if !crate::util::is_physical_device(source_path) {
         return None;
@@ -343,7 +356,11 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
     let matched_drive = drives
         .iter()
         .find(|d| d.path.eq_ignore_ascii_case(&src_str))
-        .or_else(|| drives.iter().find(|d| d.path.eq_ignore_ascii_case(&normalized_src)));
+        .or_else(|| {
+            drives
+                .iter()
+                .find(|d| d.path.eq_ignore_ascii_case(&normalized_src))
+        });
 
     // Bug #1/#2: usar TODOS los mountpoints/letras del disco origen, no solo
     // el primero (`all_mounts`), para no perder de vista particiones
@@ -398,7 +415,8 @@ pub fn same_device_warning(source_path: &std::path::Path, output_dir: &std::path
         // la comprobación de device id de más abajo.
         let mut same = candidate_str == mount_str
             || candidate_str == mount_prefix
-            || (!mount_prefix.is_empty() && candidate_str.starts_with(&format!("{}/", mount_prefix)));
+            || (!mount_prefix.is_empty()
+                && candidate_str.starts_with(&format!("{}/", mount_prefix)));
 
         // Comprobación adicional en Unix vía device id (best-effort, si es posible).
         #[cfg(unix)]
@@ -462,10 +480,7 @@ fn select_source() -> Result<Option<PathBuf>> {
 /// Detecta y lista discos removibles (USB, externos) para que el usuario elija.
 fn select_removable_drive() -> Result<Option<PathBuf>> {
     println!();
-    println!(
-        "{}",
-        "  🔎 Detectando dispositivos...".bright_cyan()
-    );
+    println!("{}", "  🔎 Detectando dispositivos...".bright_cyan());
 
     // Verificar permisos de administrador en Windows
     #[cfg(target_os = "windows")]
@@ -473,13 +488,11 @@ fn select_removable_drive() -> Result<Option<PathBuf>> {
         println!();
         println!(
             "{}",
-            "  ⚠️  Para escanear discos físicos, ejecuta como Administrador"
-                .bright_yellow()
+            "  ⚠️  Para escanear discos físicos, ejecuta como Administrador".bright_yellow()
         );
         println!(
             "{}",
-            "     (clic derecho → Ejecutar como administrador)"
-                .bright_yellow()
+            "     (clic derecho → Ejecutar como administrador)".bright_yellow()
         );
         println!();
         println!(
@@ -494,8 +507,7 @@ fn select_removable_drive() -> Result<Option<PathBuf>> {
         println!();
         println!(
             "{}",
-            "  😔 No se detectaron memorias USB ni discos externos."
-                .bright_yellow()
+            "  😔 No se detectaron memorias USB ni discos externos.".bright_yellow()
         );
         println!();
 
@@ -619,8 +631,7 @@ fn select_image_file() -> Result<Option<PathBuf>> {
     println!();
     println!(
         "{}",
-        "  🔎 Buscando archivos de imagen en el directorio actual..."
-            .bright_cyan()
+        "  🔎 Buscando archivos de imagen en el directorio actual...".bright_cyan()
     );
 
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -632,7 +643,11 @@ fn select_image_file() -> Result<Option<PathBuf>> {
             if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_lowercase();
-                    if ext_lower == "img" || ext_lower == "dd" || ext_lower == "raw" || ext_lower == "iso" {
+                    if ext_lower == "img"
+                        || ext_lower == "dd"
+                        || ext_lower == "raw"
+                        || ext_lower == "iso"
+                    {
                         image_files.push(path);
                     }
                 }
@@ -649,10 +664,7 @@ fn select_image_file() -> Result<Option<PathBuf>> {
         );
         println!();
 
-        let no_auto_options = vec![
-            "✏️  Escribir ruta manualmente",
-            "↩️  Volver",
-        ];
+        let no_auto_options = vec!["✏️  Escribir ruta manualmente", "↩️  Volver"];
         let choice = Select::new()
             .with_prompt("  ¿Qué deseas hacer?")
             .items(&no_auto_options)
@@ -725,14 +737,13 @@ fn prompt_path_or_cancel(prompt: &str, allow_raw_device: bool) -> Result<Option<
     }
 
     let path = PathBuf::from(trimmed);
-    let is_raw_device = allow_raw_device
-        && (trimmed.starts_with("\\\\.\\") || trimmed.starts_with("/dev/"));
+    let is_raw_device =
+        allow_raw_device && (trimmed.starts_with("\\\\.\\") || trimmed.starts_with("/dev/"));
 
     if !is_raw_device && !path.exists() {
         println!(
             "{}",
-            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo."
-                .bright_red()
+            "  ❌ La ruta especificada no existe. Verifica e intenta de nuevo.".bright_red()
         );
         return Ok(None);
     }
@@ -771,19 +782,19 @@ pub fn show_about() {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_cyan()
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "         ℹ️  ACERCA DE RECUPEGHOST               ".bright_white().bold(),
+        "         ℹ️  ACERCA DE RECUPEGHOST               "
+            .bright_white()
+            .bold(),
         "║".bright_cyan()
     );
     println!(
         "{}",
-        "  ╠══════════════════════════════════════════════╣"
-            .bright_cyan()
+        "  ╠══════════════════════════════════════════════╣".bright_cyan()
     );
     println!(
         "{}{}{}",
@@ -913,8 +924,7 @@ pub fn show_about() {
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_cyan()
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
     );
     println!();
 }
@@ -924,8 +934,7 @@ pub fn show_goodbye() {
     println!();
     println!(
         "{}",
-        "  ╔══════════════════════════════════════════════╗"
-            .bright_cyan()
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
     );
     println!(
         "{}{}{}",
@@ -944,22 +953,19 @@ pub fn show_goodbye() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  RecupeGhost es 100% gratis y open source.     "
-            .bright_yellow(),
+        "  RecupeGhost es 100% gratis y open source.     ".bright_yellow(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  Si te ayudó a recuperar tus archivos,         "
-            .bright_yellow(),
+        "  Si te ayudó a recuperar tus archivos,         ".bright_yellow(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  apóyanos viendo nuestros videos.              "
-            .bright_yellow(),
+        "  apóyanos viendo nuestros videos.              ".bright_yellow(),
         "║".bright_cyan()
     );
     println!(
@@ -970,8 +976,7 @@ pub fn show_goodbye() {
     );
     println!(
         "{}",
-        "  ╚══════════════════════════════════════════════╝"
-            .bright_cyan()
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
     );
     println!();
 
@@ -989,10 +994,10 @@ pub fn show_goodbye() {
 
     match selection {
         Ok(0) => {
-            let _ = open_url("https://www.youtube.com/@el_becerril");
+            open_url("https://www.youtube.com/@el_becerril");
         }
         Ok(1) => {
-            let _ = open_url("https://www.facebook.com/ElBecerril");
+            open_url("https://www.facebook.com/ElBecerril");
         }
         _ => {}
     }
@@ -1067,5 +1072,83 @@ mod tests {
         // Un disco con /home como primer mount y / como segundo sigue siendo el disco de
         // sistema (bug #1/#2 de la sesion anterior: antes solo se guardaba el primer mount).
         assert!(is_likely_system_disk(&drive_with_mounts(&["/home", "/"])));
+    }
+
+    // --- normalize_to_whole_disk ---
+
+    #[test]
+    fn test_normalize_sd_family_partitions_to_whole_disk() {
+        // Familias con disco completo puramente alfabético: la partición añade
+        // un dígito, que se recorta para quedarnos con el disco.
+        assert_eq!(normalize_to_whole_disk("/dev/sdb1"), "/dev/sdb");
+        assert_eq!(normalize_to_whole_disk("/dev/sda2"), "/dev/sda");
+        assert_eq!(normalize_to_whole_disk("/dev/hda1"), "/dev/hda");
+        assert_eq!(normalize_to_whole_disk("/dev/vdb3"), "/dev/vdb");
+        assert_eq!(normalize_to_whole_disk("/dev/xvda1"), "/dev/xvda");
+    }
+
+    #[test]
+    fn test_normalize_sd_family_whole_disk_unchanged() {
+        // Un disco completo (sin número de partición) se devuelve tal cual.
+        assert_eq!(normalize_to_whole_disk("/dev/sda"), "/dev/sda");
+        assert_eq!(normalize_to_whole_disk("/dev/sdb"), "/dev/sdb");
+    }
+
+    #[test]
+    fn test_normalize_pn_separator_families() {
+        // Familias que separan la partición con `pN` (el número forma parte del
+        // nombre del disco completo): se corta en la 'p'.
+        assert_eq!(normalize_to_whole_disk("/dev/nvme0n1p2"), "/dev/nvme0n1");
+        assert_eq!(normalize_to_whole_disk("/dev/mmcblk0p1"), "/dev/mmcblk0");
+        assert_eq!(normalize_to_whole_disk("/dev/nbd0p1"), "/dev/nbd0");
+    }
+
+    #[test]
+    fn test_normalize_digit_terminal_whole_disks_unchanged() {
+        // BUG DORMIDO CORREGIDO: estos discos completos terminan en dígito y NO
+        // deben normalizarse (antes devolvían /dev/mmcblk, /dev/nbd, etc., que
+        // no existen). Sus particiones usan el sufijo `pN`, no un dígito pelado.
+        assert_eq!(normalize_to_whole_disk("/dev/mmcblk0"), "/dev/mmcblk0");
+        assert_eq!(normalize_to_whole_disk("/dev/nbd0"), "/dev/nbd0");
+        assert_eq!(normalize_to_whole_disk("/dev/loop0"), "/dev/loop0");
+        assert_eq!(normalize_to_whole_disk("/dev/sr0"), "/dev/sr0");
+        assert_eq!(normalize_to_whole_disk("/dev/md0"), "/dev/md0");
+        // nvme0n1 es el disco completo; sin sufijo pN no se toca.
+        assert_eq!(normalize_to_whole_disk("/dev/nvme0n1"), "/dev/nvme0n1");
+    }
+
+    #[test]
+    fn test_normalize_macos_disk_partitions() {
+        assert_eq!(normalize_to_whole_disk("/dev/disk2s1"), "/dev/disk2");
+        assert_eq!(normalize_to_whole_disk("/dev/disk0s2"), "/dev/disk0");
+        // Disco completo de macOS sin partición: sin cambios.
+        assert_eq!(normalize_to_whole_disk("/dev/disk2"), "/dev/disk2");
+    }
+
+    #[test]
+    fn test_normalize_non_partition_paths_unchanged() {
+        // Rutas de Windows y rutas que no son de dispositivo se devuelven tal cual.
+        assert_eq!(
+            normalize_to_whole_disk("\\\\.\\PhysicalDrive0"),
+            "\\\\.\\PhysicalDrive0"
+        );
+        assert_eq!(
+            normalize_to_whole_disk("/home/usuario/imagen.dd"),
+            "/home/usuario/imagen.dd"
+        );
+    }
+
+    // --- same_device_warning ---
+
+    #[test]
+    fn test_same_device_warning_none_for_non_physical_source() {
+        // Si el origen no es un dispositivo físico (ej. un archivo de imagen),
+        // no hay riesgo de escribir sobre el disco escaneado → sin advertencia.
+        use std::path::Path;
+        assert!(same_device_warning(
+            Path::new("/home/usuario/imagen.dd"),
+            Path::new("/home/usuario/recuperados")
+        )
+        .is_none());
     }
 }

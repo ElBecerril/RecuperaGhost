@@ -20,6 +20,10 @@ impl fmt::Display for FileCategory {
     }
 }
 
+/// Validación bit-level adicional para firmas de header corto:
+/// `(validador, bytes_necesarios_desde_el_inicio_del_header)`.
+pub type SignatureValidator = (fn(&[u8]) -> bool, usize);
+
 /// Firma de archivo: magic bytes de cabecera y pie opcional
 #[derive(Debug, Clone)]
 pub struct FileSignature {
@@ -37,7 +41,7 @@ pub struct FileSignature {
     /// generan falsos positivos masivos en datos de alta entropía (ej. MP3 Sync, AAC ADTS).
     /// `(validador, bytes_necesarios_desde_el_inicio_del_header)`. El validador recibe el slice
     /// del buffer que empieza en el inicio del header y debe tener al menos esa cantidad de bytes.
-    pub validator: Option<(fn(&[u8]) -> bool, usize)>,
+    pub validator: Option<SignatureValidator>,
     /// Para formatos que codifican su propio tamaño en el header (ej. BMP: BITMAPFILEHEADER
     /// trae el tamaño total en offset 2, 4 bytes little-endian) en vez de usar un footer o
     /// `max_size` fijo. `(offset_desde_inicio_del_header, cantidad_de_bytes_LE)`.
@@ -134,8 +138,7 @@ fn validate_aac_adts(bytes: &[u8]) -> bool {
     let b3 = bytes[3];
     let b4 = bytes[4];
     let b5 = bytes[5];
-    let frame_length =
-        (((b3 & 0x03) as usize) << 11) | ((b4 as usize) << 3) | ((b5 >> 5) as usize);
+    let frame_length = (((b3 & 0x03) as usize) << 11) | ((b4 as usize) << 3) | ((b5 >> 5) as usize);
 
     // frame_length incluye el propio header ADTS (mínimo 7 bytes sin CRC); un valor menor es
     // estructuralmente inválido.
@@ -206,6 +209,7 @@ fn validate_mp4_generic_ftyp(bytes: &[u8]) -> bool {
 /// - offset 2-5 (u32): tamaño total del archivo (`bfSize`)
 /// - offset 6-9: reservado1 + reservado2 (no se usan acá)
 /// - offset 10-13 (u32): offset a los datos de píxeles (`bfOffBits`)
+///
 /// Se verifica que `bfSize` sea mayor al tamaño mínimo de header (14 bytes) y no exceda
 /// `max_bmp_size` (el `max_size` de la firma), y que `bfOffBits` sea mayor a 14 y no mayor que
 /// `bfSize`. Ambos campos son estructuralmente coherentes en cualquier BMP real, así que este
@@ -372,7 +376,6 @@ pub fn all_signatures() -> Vec<FileSignature> {
             validator: Some((validate_heic_ftyp, 8)),
             size_from_header: None,
         },
-
         // ═══════════════════════ VIDEOS ═══════════════════════
         FileSignature {
             name: "MP4/M4V",
@@ -422,7 +425,7 @@ pub fn all_signatures() -> Vec<FileSignature> {
             header_offset: 0,
             extra_check: None,
             footer: None,
-            max_size: 1 * 1024 * 1024 * 1024,
+            max_size: 1024 * 1024 * 1024,
             validator: None,
             size_from_header: None,
         },
@@ -444,7 +447,6 @@ pub fn all_signatures() -> Vec<FileSignature> {
             validator: None,
             size_from_header: None,
         },
-
         // ═══════════════════════ AUDIO ═══════════════════════
         FileSignature {
             name: "MP3 (ID3)",
@@ -572,7 +574,6 @@ pub fn all_signatures() -> Vec<FileSignature> {
             validator: None,
             size_from_header: None,
         },
-
         // ═══════════════════════ DOCUMENTOS ═══════════════════════
         FileSignature {
             name: "PDF",
@@ -596,4 +597,3 @@ pub fn signatures_for_categories(categories: &[FileCategory]) -> Vec<FileSignatu
         .filter(|sig| categories.contains(&sig.category))
         .collect()
 }
-

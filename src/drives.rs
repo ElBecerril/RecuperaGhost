@@ -56,10 +56,7 @@ pub fn list_removable() -> Vec<DriveInfo> {
 pub fn is_admin() -> bool {
     use std::fs::OpenOptions;
     // Intentar abrir PhysicalDrive0 como prueba de permisos
-    match OpenOptions::new()
-        .read(true)
-        .open(r"\\.\PhysicalDrive0")
-    {
+    match OpenOptions::new().read(true).open(r"\\.\PhysicalDrive0") {
         Ok(_) => true,
         Err(_) => false,
     }
@@ -195,9 +192,19 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
         let letter = all_mounts.first().cloned();
 
         let display_name = if let Some(ref l) = letter {
-            format!("{} - {} ({})", l, model, crate::util::format_size(size_bytes))
+            format!(
+                "{} - {} ({})",
+                l,
+                model,
+                crate::util::format_size(size_bytes)
+            )
         } else {
-            format!("{} - {} ({})", device_id, model, crate::util::format_size(size_bytes))
+            format!(
+                "{} - {} ({})",
+                device_id,
+                model,
+                crate::util::format_size(size_bytes)
+            )
         };
 
         drives.push(DriveInfo {
@@ -292,7 +299,12 @@ fn extract_drive_letter(dependent: &str) -> Option<String> {
 #[cfg(target_os = "windows")]
 fn list_drives_wmic() -> Option<Vec<DriveInfo>> {
     let output = Command::new("wmic")
-        .args(["diskdrive", "get", "DeviceID,Model,Size,MediaType", "/format:csv"])
+        .args([
+            "diskdrive",
+            "get",
+            "DeviceID,Model,Size,MediaType",
+            "/format:csv",
+        ])
         .output()
         .ok()?;
 
@@ -478,9 +490,20 @@ fn list_drives_linux() -> Vec<DriveInfo> {
         let mount = all_mounts.first().cloned();
 
         let display_name = if let Some(ref m) = mount {
-            format!("{} - {} ({}) [{}]", path, model, crate::util::format_size(size_bytes), m)
+            format!(
+                "{} - {} ({}) [{}]",
+                path,
+                model,
+                crate::util::format_size(size_bytes),
+                m
+            )
         } else {
-            format!("{} - {} ({})", path, model, crate::util::format_size(size_bytes))
+            format!(
+                "{} - {} ({})",
+                path,
+                model,
+                crate::util::format_size(size_bytes)
+            )
         };
 
         drives.push(DriveInfo {
@@ -502,10 +525,7 @@ fn list_drives_linux() -> Vec<DriveInfo> {
 #[cfg(target_os = "macos")]
 fn list_drives_macos() -> Vec<DriveInfo> {
     // Usar diskutil list para obtener discos
-    let output = match Command::new("diskutil")
-        .args(["list", "-plist"])
-        .output()
-    {
+    let output = match Command::new("diskutil").args(["list", "-plist"]).output() {
         Ok(o) if o.status.success() => o,
         _ => return Vec::new(),
     };
