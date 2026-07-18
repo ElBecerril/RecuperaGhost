@@ -68,6 +68,26 @@ Presenta un menu inteligente donde puedes:
 3. Escanear con barra de progreso en tiempo real
 4. Recuperar los archivos encontrados a una carpeta organizada
 
+Tambien podes **clonar un disco que esta fallando a un archivo de imagen** antes de escanear
+(ver abajo).
+
+### Clonar un disco que esta fallando (recomendado para discos con problemas)
+
+Si el disco o memoria esta fallando, lo mas seguro es copiarlo entero a un archivo de imagen
+**antes** de buscar nada, y despues escanear esa copia. Asi no se estresa el disco enfermo (cada
+lectura extra puede acelerar su muerte). En el menu principal:
+
+```
+📀 Clonar un disco que esta fallando (copiarlo a una imagen primero)
+```
+
+- Copia byte a byte a un `.img`. Los sectores que no se puedan leer se **saltan** (se rellenan
+  con ceros y se registran): un solo sector danado no aborta la copia.
+- Muestra barra de progreso y se puede **cancelar con Ctrl+C** en cualquier momento; la copia
+  parcial queda guardada y se puede escanear igual.
+- Al terminar, ofrece escanear la imagen recien creada directamente.
+- **La imagen se guarda en un disco distinto al que se clona** (avisa si detecta que es el mismo).
+
 ### Modo batch (CLI)
 
 ```bash
@@ -147,7 +167,8 @@ src/
   banner.rs            -> Banner ASCII y branding
   drives.rs            -> Deteccion de discos por plataforma (Windows/Linux/macOS)
   signatures/mod.rs    -> 25 firmas de archivo (magic bytes, extra_check, footer)
-  scanner/mod.rs       -> Motor de escaneo multi-hilo por file carving + IOCTL + 9 tests
+  scanner/mod.rs       -> Motor de escaneo multi-hilo por file carving + IOCTL + tests
+  clone/mod.rs         -> Clonado de disco a imagen .img tolerante a sectores danados
   recovery/mod.rs      -> Extraccion de archivos a carpetas organizadas
   ui/mod.rs            -> Menus interactivos con seleccion inteligente de origen
   updater.rs           -> Sistema de auto-actualizacion via GitHub Releases
@@ -159,7 +180,7 @@ src/
 cargo test
 ```
 
-40 tests automatizados:
+42 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -183,6 +204,8 @@ cargo test
 - Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
 - Normalizacion de particion a disco completo (sd/nvme/mmcblk/nbd/loop/macOS), sin mal-normalizar discos que terminan en digito
 - same_device_warning no advierte cuando el origen es un archivo de imagen (no un disco fisico)
+- Clonado de disco a imagen: copia byte a byte exacta (ida y vuelta, multi-bloque)
+- Clonado cancelable: corta y conserva la copia parcial
 
 ## Contribuir
 

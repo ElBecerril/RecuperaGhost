@@ -1,4 +1,5 @@
 mod banner;
+mod clone;
 mod drives;
 mod recovery;
 mod scanner;
@@ -16,6 +17,8 @@ use colored::Colorize;
 
 use signatures::{signatures_for_categories, FileCategory};
 use ui::{MainMenuChoice, ScanConfig};
+
+use crate::ui::CloneConfig;
 
 /// RecupeGhost - El Detective de Archivos Perdidos
 ///
@@ -156,6 +159,8 @@ fn main() -> Result<()> {
     let _ = ctrlc::set_handler(|| {
         if scanner::is_scan_in_progress() {
             scanner::request_cancel();
+        } else if clone::is_clone_in_progress() {
+            clone::request_cancel();
         } else {
             process::exit(130);
         }
@@ -304,6 +309,26 @@ fn main() -> Result<()> {
                                 "  💡 Si estás escaneando un disco físico, ejecuta como Administrador."
                                     .bright_yellow()
                             );
+                            eprintln!();
+                        }
+                    }
+                }
+                MainMenuChoice::Clone => {
+                    if let Some(config) = ui::clone_menu()? {
+                        if let Err(e) = run_clone(config) {
+                            eprintln!();
+                            eprintln!(
+                                "{}",
+                                format!("  ❌ Error durante el clonado: {}", e).bright_red()
+                            );
+                            if let Some(hint) = friendly_error_hint(&e) {
+                                eprintln!("{}", hint.bright_yellow());
+                            }
+                            let mut source = e.source();
+                            while let Some(cause) = source {
+                                eprintln!("{}", format!("     Causa: {}", cause).bright_red());
+                                source = cause.source();
+                            }
                             eprintln!();
                         }
                     }
@@ -479,6 +504,48 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
             "  ╚══════════════════════════════════════════════╝".bright_green()
         );
         println!();
+    }
+
+    Ok(())
+}
+
+/// Clona un disco a un archivo de imagen y, si sale bien, ofrece escanear la imagen recién creada.
+fn run_clone(config: CloneConfig) -> Result<()> {
+    println!();
+    println!("{}", "  📀 Clonando el disco a una imagen...".bright_cyan());
+    println!(
+        "{}",
+        "  Podés cancelar cuando quieras con Ctrl+C: se guarda todo lo copiado hasta ahí."
+            .bright_black()
+    );
+    println!();
+
+    let result = clone::clone_to_image(&config.source_path, &config.output_path)?;
+
+    println!();
+    println!("{}", result.summary());
+    println!();
+
+    // Si no se copió nada (cancelado de entrada), no hay imagen útil que escanear.
+    if result.good_bytes == 0 {
+        return Ok(());
+    }
+
+    // Ofrecer escanear la imagen recién creada sin volver a pedir el origen.
+    if ui::ask_scan_cloned_image(&config.output_path)? {
+        if let Some(scan_config) = ui::scan_menu_with_source(Some(config.output_path.clone()))? {
+            run_scan(scan_config, false)?;
+        }
+    } else {
+        println!();
+        println!(
+            "{}",
+            format!(
+                "  💡 Cuando quieras, escaneá la imagen desde el menú principal → \"Escanear\" →\n     \"Archivo de imagen\", y pegá esta ruta:\n     {}",
+                config.output_path.display()
+            )
+            .bright_cyan()
+        );
     }
 
     Ok(())

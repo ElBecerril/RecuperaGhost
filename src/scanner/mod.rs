@@ -135,6 +135,15 @@ impl ScanResult {
     }
 }
 
+/// Tamaño de un origen (disco físico o archivo) abriéndolo, reusando la misma lógica que el
+/// escaneo (IOCTL en discos físicos de Windows, `seek(End)` en el resto). Lo usa el módulo de
+/// clonado para saber cuántos bytes copiar.
+pub fn device_or_file_size(source_path: &Path) -> Result<u64> {
+    let mut file = File::open(source_path)
+        .with_context(|| format!("No se pudo abrir: {}", source_path.display()))?;
+    get_source_size(&mut file, source_path)
+}
+
 /// Obtiene el tamaño de la fuente (archivo o disco físico).
 /// En discos físicos de Windows, `seek(End)` no funciona; se usa `IOCTL_DISK_GET_LENGTH_INFO`.
 fn get_source_size(file: &mut File, source_path: &Path) -> Result<u64> {

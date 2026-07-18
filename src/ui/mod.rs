@@ -11,6 +11,7 @@ use crate::signatures::FileCategory;
 #[derive(Debug)]
 pub enum MainMenuChoice {
     Scan,
+    Clone,
     About,
     Exit,
 }
@@ -22,10 +23,17 @@ pub struct ScanConfig {
     pub categories: Vec<FileCategory>,
 }
 
+/// Configuración de un clonado a imagen elegida por el usuario
+pub struct CloneConfig {
+    pub source_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
 /// Muestra el menú principal y retorna la opción elegida
 pub fn main_menu() -> Result<MainMenuChoice> {
     let options = vec![
         "🔍 Escanear disco/imagen",
+        "📀 Clonar un disco que está fallando (copiarlo a una imagen primero)",
         "ℹ️  Acerca de RecupeGhost",
         "🚪 Salir",
     ];
@@ -38,13 +46,20 @@ pub fn main_menu() -> Result<MainMenuChoice> {
 
     match selection {
         0 => Ok(MainMenuChoice::Scan),
-        1 => Ok(MainMenuChoice::About),
+        1 => Ok(MainMenuChoice::Clone),
+        2 => Ok(MainMenuChoice::About),
         _ => Ok(MainMenuChoice::Exit),
     }
 }
 
-/// Menú de configuración del escaneo
+/// Menú de configuración del escaneo (el usuario elige el origen).
 pub fn scan_menu() -> Result<Option<ScanConfig>> {
+    scan_menu_with_source(None)
+}
+
+/// Igual que `scan_menu`, pero permite entrar con un origen ya elegido (`preselected`), para el
+/// flujo "clonar y después escanear la imagen recién creada" sin volver a pedir el origen.
+pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<ScanConfig>> {
     println!();
     println!(
         "{}",
@@ -69,30 +84,40 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
     );
     println!();
 
-    // 1. Seleccionar origen con menú inteligente
-    println!(
-        "{}",
-        "  ¿De dónde querés recuperar archivos?".bright_yellow()
-    );
-    println!(
-        "{}",
-        "  · Memoria USB / disco externo: para una memoria, tarjeta SD o disco que conectaste aparte."
-            .bright_black()
-    );
-    println!(
-        "{}",
-        "  · Disco interno: para el disco de tu PC (fotos borradas del disco principal)."
-            .bright_black()
-    );
-    println!(
-        "{}",
-        "  · Archivo de imagen: para un archivo .img/.dd/.raw que ya tenés (uso avanzado)."
-            .bright_black()
-    );
-    println!();
-    let source_path = match select_source()? {
-        Some(path) => path,
-        None => return Ok(None),
+    // 1. Seleccionar origen con menú inteligente (o usar el pre-seleccionado, ej. una imagen
+    //    recién clonada).
+    let source_path = match preselected {
+        Some(path) => {
+            println!("  📁 Origen: {}", path.display());
+            println!();
+            path
+        }
+        None => {
+            println!(
+                "{}",
+                "  ¿De dónde querés recuperar archivos?".bright_yellow()
+            );
+            println!(
+                "{}",
+                "  · Memoria USB / disco externo: para una memoria, tarjeta SD o disco que conectaste aparte."
+                    .bright_black()
+            );
+            println!(
+                "{}",
+                "  · Disco interno: para el disco de tu PC (fotos borradas del disco principal)."
+                    .bright_black()
+            );
+            println!(
+                "{}",
+                "  · Archivo de imagen: para un archivo .img/.dd/.raw que ya tenés (uso avanzado)."
+                    .bright_black()
+            );
+            println!();
+            match select_source()? {
+                Some(path) => path,
+                None => return Ok(None),
+            }
+        }
     };
 
     // Verificar permisos si es un disco físico
@@ -236,6 +261,181 @@ pub fn scan_menu() -> Result<Option<ScanConfig>> {
         output_dir,
         categories,
     }))
+}
+
+/// Menú para clonar un disco (que puede estar fallando) a un archivo de imagen.
+/// Devuelve el origen y el archivo `.img` de destino elegidos, o `None` si se cancela.
+pub fn clone_menu() -> Result<Option<CloneConfig>> {
+    println!();
+    println!(
+        "{}",
+        "  ╔══════════════════════════════════════════════╗".bright_cyan()
+    );
+    println!(
+        "{}{}{}",
+        "  ║".bright_cyan(),
+        "        📀 CLONAR DISCO A IMAGEN                "
+            .bright_white()
+            .bold(),
+        "║".bright_cyan()
+    );
+    println!(
+        "{}",
+        "  ╚══════════════════════════════════════════════╝".bright_cyan()
+    );
+    println!();
+    println!(
+        "{}",
+        "  Si tu disco o memoria está fallando, lo más seguro es copiarlo entero a un"
+            .bright_black()
+    );
+    println!(
+        "{}",
+        "  archivo de imagen ANTES de buscar nada, y después escanear esa copia. Así no"
+            .bright_black()
+    );
+    println!(
+        "{}",
+        "  estresás el disco enfermo (cada lectura extra puede acelerar su muerte).".bright_black()
+    );
+    println!();
+    println!(
+        "{}",
+        "  Los sectores que no se puedan leer se saltan: la copia sigue con lo demás."
+            .bright_black()
+    );
+    println!();
+
+    // 1. Elegir el disco/origen a clonar (mismo menú inteligente que el escaneo).
+    println!("{}", "  ¿Qué disco querés clonar?".bright_yellow());
+    println!();
+    let source_path = match select_source()? {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+
+    // Permisos: clonar un disco físico requiere admin igual que escanearlo.
+    let is_physical = crate::util::is_physical_device(&source_path);
+    if is_physical && !drives::is_admin() {
+        println!();
+        println!(
+            "{}",
+            "  ⚠️  No tienes permisos de Administrador.".bright_yellow()
+        );
+        println!(
+            "{}",
+            "     Clonar un disco físico requiere permisos elevados.".bright_yellow()
+        );
+        #[cfg(target_os = "windows")]
+        println!(
+            "{}",
+            "  💡 Cerrá el programa y volvé a abrirlo como Administrador.".bright_cyan()
+        );
+        #[cfg(not(target_os = "windows"))]
+        println!(
+            "{}",
+            "  💡 Ejecutá el programa con: sudo ./recupe_ghost".bright_cyan()
+        );
+        println!();
+        let retry = vec!["🔄 Intentar de todas formas", "↩️  Volver al menú"];
+        let choice = Select::new()
+            .with_prompt("  ¿Qué deseas hacer?")
+            .items(&retry)
+            .default(1)
+            .interact()?;
+        if choice == 1 {
+            return Ok(None);
+        }
+    }
+
+    // 2. Tamaño esperado de la imagen (best-effort: si no se puede leer, seguimos igual).
+    println!();
+    match crate::scanner::device_or_file_size(&source_path) {
+        Ok(size) => {
+            println!(
+                "  📏 La imagen va a ocupar aproximadamente {} (el tamaño del disco).",
+                crate::util::format_size(size).bright_white()
+            );
+            println!(
+                "{}",
+                "     Asegurate de tener ese espacio libre en el destino.".bright_black()
+            );
+        }
+        Err(_) => {
+            println!(
+                "{}",
+                "  ℹ️  No pudimos calcular el tamaño del disco (¿permisos?). La imagen va a ser"
+                    .bright_black()
+            );
+            println!(
+                "{}",
+                "     del tamaño completo del disco; asegurate de tener espacio de sobra."
+                    .bright_black()
+            );
+        }
+    }
+    println!();
+
+    // 3. Archivo .img de destino.
+    println!(
+        "{}",
+        "  ¿Dónde guardo la imagen? (elegí un disco DISTINTO al que estás clonando)"
+            .bright_yellow()
+    );
+    let default_output = format!(
+        "RecupeGhost_imagen_{}.img",
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    );
+    let output: String = Input::new()
+        .with_prompt("  📀 Archivo de imagen de salida")
+        .default(default_output)
+        .interact_text()?;
+    let mut output_path = PathBuf::from(output.trim());
+    // Asegurar extensión .img si el usuario no puso ninguna extensión reconocible.
+    if output_path.extension().is_none() {
+        output_path.set_extension("img");
+    }
+    let output_path = crate::util::to_absolute_output(output_path);
+
+    println!();
+
+    // 4. Resumen + advertencia crítica de mismo-disco (clonar sobre el propio disco de origen
+    //    lo sobrescribiría y perdería justo lo que se intenta rescatar).
+    println!("{}", "  ═══ Resumen del clonado ═══".bright_cyan());
+    println!("  📁 Disco a clonar: {}", source_path.display());
+    println!("  📀 Imagen destino: {}", output_path.display());
+    println!();
+
+    if let Some(warning) = same_device_warning(&source_path, &output_path) {
+        println!("{}", warning.bright_yellow());
+        println!();
+    }
+
+    let confirm = Confirm::new()
+        .with_prompt("  ¿Iniciar el clonado?")
+        .default(true)
+        .interact()?;
+    if !confirm {
+        println!("  ⏹️  Clonado cancelado.");
+        return Ok(None);
+    }
+
+    Ok(Some(CloneConfig {
+        source_path,
+        output_path,
+    }))
+}
+
+/// Pregunta si se quiere escanear ahora la imagen recién clonada.
+pub fn ask_scan_cloned_image(image: &std::path::Path) -> Result<bool> {
+    println!();
+    Ok(Confirm::new()
+        .with_prompt(format!(
+            "  🔍 ¿Escanear ahora la imagen recién creada ({})?",
+            image.display()
+        ))
+        .default(true)
+        .interact()?)
 }
 
 /// Verificación best-effort (no bloqueante): advierte si el directorio de salida
