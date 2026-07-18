@@ -152,17 +152,19 @@ RecupeGhost escanea byte por byte buscando **firmas de archivo** (magic bytes) e
 - Lecturas alineadas a 512 bytes (sector size) como requiere Windows
 - Requiere ejecucion como Administrador para acceder a discos fisicos
 
-## Auto-actualizacion
+## Aviso de nuevas versiones
 
-RecupeGhost verifica automaticamente si hay una nueva version disponible en GitHub Releases al iniciar:
+RecupeGhost verifica al iniciar si hay una version mas nueva en GitHub Releases y, si la hay,
+**solo te avisa** con el enlace para que la descargues a mano cuando quieras:
 
 1. Consulta la API de GitHub para obtener la ultima release
-2. Compara la version con la actual usando versionado semantico
-3. Si hay una nueva version, muestra un aviso y pregunta si deseas actualizar
-4. Descarga el nuevo binario con barra de progreso y reemplaza el ejecutable
-5. Si no hay internet o falla algo, continua normalmente sin bloquear
+2. Compara la version con la actual (versionado semantico)
+3. Si hay una nueva version, muestra un aviso con el link de descarga
+4. Si no hay internet o falla algo, continua normalmente sin bloquear
 
-La actualizacion funciona en Windows, Linux y macOS. En Windows usa la tecnica de renombrar el .exe en ejecucion para poder sobreescribirlo.
+**No se descarga ni se reemplaza el binario solo, a proposito.** Un ejecutable que se baja otro
+ejecutable de internet y se pisa a si mismo es justo el patron que los antivirus marcan como
+troyano/dropper. Preferimos avisarte y que descargues vos la version nueva.
 
 ## Arquitectura
 
@@ -176,7 +178,7 @@ src/
   clone/mod.rs         -> Clonado de disco a imagen .img tolerante a sectores danados
   recovery/mod.rs      -> Extraccion de archivos a carpetas organizadas
   ui/mod.rs            -> Menus interactivos con seleccion inteligente de origen
-  updater.rs           -> Sistema de auto-actualizacion via GitHub Releases
+  updater.rs           -> Aviso de nuevas versiones via GitHub Releases (solo avisa, no descarga)
 ```
 
 ## Tests
@@ -185,7 +187,7 @@ src/
 cargo test
 ```
 
-47 tests automatizados:
+45 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -204,7 +206,7 @@ cargo test
 - Deteccion de firmas en frontera de segmento
 - No-englobing de archivos adyacentes en el mismo buffer
 - Rechazo de falsos positivos MP3/AAC via frame-chaining
-- Parseo de versiones y busqueda de assets (updater)
+- Parseo de versiones y comparacion (aviso de nuevas versiones)
 - Deteccion del disco de sistema (Windows C: / raiz Unix) para avisos de UI
 - Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
 - Normalizacion de particion a disco completo (sd/nvme/mmcblk/nbd/loop/macOS), sin mal-normalizar discos que terminan en digito

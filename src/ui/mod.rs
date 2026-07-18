@@ -210,15 +210,43 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
 
     println!();
 
-    // 3. Directorio de salida
-    let default_output = format!(
+    // 3. Directorio de salida. Para un usuario no técnico, un nombre de carpeta suelto
+    //    (RecupeGhost_20260718_...) no dice nada: no se entiende qué es, dónde va a quedar, ni
+    //    que se puede cambiar. Explicamos las tres cosas antes de pedir el dato.
+    println!(
+        "{}",
+        "  ¿Dónde querés guardar los archivos recuperados?".bright_yellow()
+    );
+    let default_name = format!(
         "RecupeGhost_{}",
         chrono::Local::now().format("%Y%m%d_%H%M%S")
     );
+    // Mostrar la ruta absoluta donde caería la carpeta por defecto, así el usuario ve el lugar
+    // real (ej. C:\Users\...\Downloads\RecupeGhost_...) y no solo un nombre.
+    let default_abs = crate::util::to_absolute_output(PathBuf::from(&default_name));
+    println!(
+        "{}",
+        format!(
+            "  · Si dejás el nombre sugerido y presionás ENTER, se crea acá:\n      {}",
+            default_abs.display()
+        )
+        .bright_black()
+    );
+    println!(
+        "{}",
+        "  · O escribí una ruta completa a otro disco/USB (ej. en Windows: D:\\Recuperados)."
+            .bright_black()
+    );
+    println!(
+        "{}",
+        "  ⚠️  Guardá en un disco DISTINTO al que estás recuperando, nunca en el mismo."
+            .bright_yellow()
+    );
+    println!();
 
     let output: String = Input::new()
-        .with_prompt("  📂 Carpeta de salida")
-        .default(default_output)
+        .with_prompt("  📂 Carpeta donde guardar")
+        .default(default_name)
         .interact_text()?;
 
     // Resolver a ruta absoluta ahora (en vez de dejarla relativa): ver `to_absolute_output`.
