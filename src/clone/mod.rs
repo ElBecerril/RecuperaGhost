@@ -173,9 +173,14 @@ fn clone_to_image_impl(
         }
     }
 
-    dst.flush().with_context(|| {
+    // `sync_all` (fsync) fuerza el volcado a disco antes de declarar éxito. `File::flush` NO
+    // hace esto (es un no-op para un `File`): sin el fsync, el "clonado completado" podría salir
+    // con datos todavía en la page cache, y un usuario no técnico que desenchufa el USB sin
+    // "expulsar" se quedaría con una imagen corrupta pese al mensaje de éxito. Además, un
+    // ENOSPC/EIO diferido recién aflora acá.
+    dst.sync_all().with_context(|| {
         format!(
-            "No se pudo finalizar la imagen: {} (¿espacio insuficiente?)",
+            "No se pudo terminar de guardar la imagen: {} (¿espacio insuficiente o el disco de destino se desconectó?)",
             output_path.display()
         )
     })?;
@@ -222,10 +227,15 @@ fn copy_block(
                 return Ok((len as u64, 0));
             }
             Ok(n) => {
-                // EOF/short read prematuro: escribir lo bueno y rellenar el resto con ceros.
+                // `read_filling` solo devuelve un `Ok` corto cuando llegó a EOF real
+                // (`read()==0`), NUNCA por un sector dañado (eso devuelve `Err`). O sea: el
+                // origen terminó antes de lo que reportó `device_or_file_size` (archivo truncado,
+                // dispositivo que miente el tamaño). Rellenamos con ceros para mantener la imagen
+                // del tamaño declarado, pero eso NO son sectores dañados: `bad = 0` (contarlo como
+                // daño daría un resumen falso tipo "9 MB no se pudieron leer").
                 dst.write_all(&buf[..n])?;
                 dst.write_all(&zeros[..len - n])?;
-                return Ok((n as u64, (len - n) as u64));
+                return Ok((n as u64, 0));
             }
             Err(_) => {
                 // Sector dañado en algún punto del bloque: refinar sector por sector.
@@ -249,10 +259,11 @@ fn copy_block(
                     continue;
                 }
                 Ok(m) => {
+                    // Igual que en el camino rápido: un `Ok` corto acá es EOF del origen, no un
+                    // sector dañado. Se rellena con ceros pero no se cuenta como daño.
                     dst.write_all(&buf[..m])?;
                     dst.write_all(&zeros[..sl - m])?;
                     good += m as u64;
-                    bad += (sl - m) as u64;
                     off += sl;
                     continue;
                 }
@@ -287,6 +298,31 @@ fn read_filling(src: &mut File, buf: &mut [u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_copy_block_eof_is_not_counted_as_damage() {
+        // Origen más corto que el bloque pedido: el faltante es EOF (el origen se acabó), NO
+        // sectores dañados. Antes esto se contaba como bytes malos y daba un resumen falso.
+        let mut src = tempfile::NamedTempFile::new().unwrap();
+        src.write_all(&[0xABu8; 300]).unwrap();
+        src.flush().unwrap();
+        let mut src_file = File::open(src.path()).unwrap();
+
+        let dst = tempfile::NamedTempFile::new().unwrap();
+        let mut dst_file = File::create(dst.path()).unwrap();
+
+        let len = 1024usize;
+        let mut buf = vec![0u8; len];
+        let zeros = vec![0u8; len];
+        let (good, bad) =
+            copy_block(&mut src_file, &mut dst_file, 0, len, &mut buf, &zeros).unwrap();
+
+        assert_eq!(good, 300);
+        assert_eq!(bad, 0, "el relleno por EOF no debe contar como daño");
+        // La imagen igual queda del tamaño del bloque (300 datos + 724 ceros de padding).
+        dst_file.sync_all().unwrap();
+        assert_eq!(std::fs::metadata(dst.path()).unwrap().len(), len as u64);
+    }
 
     #[test]
     fn test_clone_copies_bytes_exactly() {

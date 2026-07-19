@@ -9,7 +9,10 @@ use crate::banner;
 const GITHUB_API_URL: &str =
     "https://api.github.com/repos/ElBecerril/RecuperaGhost/releases/latest";
 const CONNECT_TIMEOUT_SECS: u64 = 5;
-const READ_TIMEOUT_SECS: u64 = 30;
+// La respuesta de la API es un JSON de ~pocos KB; 8 s es de sobra. Un valor alto (antes 30 s)
+// podía colgar el arranque del programa hasta media cadena de timeouts en una red que acepta la
+// conexión TCP pero después no responde, sin mostrar el menú mientras tanto.
+const READ_TIMEOUT_SECS: u64 = 8;
 
 // ─── Tipos para deserializar la API de GitHub ───────────────────────────────
 

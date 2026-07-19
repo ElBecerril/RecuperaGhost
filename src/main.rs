@@ -550,7 +550,31 @@ fn run_clone(config: CloneConfig) -> Result<()> {
     );
     println!();
 
-    let result = clone::clone_to_image(&config.source_path, &config.output_path)?;
+    let result = match clone::clone_to_image(&config.source_path, &config.output_path) {
+        Ok(r) => r,
+        Err(e) => {
+            // Si la escritura falló a mitad (ej. destino lleno), la imagen parcial NO se borra:
+            // lo que se alcanzó a copiar sigue siendo válido y escaneable. Avisamos para que el
+            // usuario sepa que puede usarla (o borrarla para liberar espacio), en vez de dejarlo
+            // pensando que no quedó nada.
+            if let Ok(meta) = std::fs::metadata(&config.output_path) {
+                if meta.len() > 0 {
+                    println!();
+                    println!(
+                        "{}",
+                        format!(
+                            "  💡 Quedó una imagen PARCIAL de {} en:\n     {}\n     Podés intentar escanearla igual (Menú → Escanear → Archivo de imagen),\n     o borrarla si necesitás liberar ese espacio.",
+                            util::format_size(meta.len()),
+                            config.output_path.display()
+                        )
+                        .bright_yellow()
+                    );
+                    println!();
+                }
+            }
+            return Err(e);
+        }
+    };
 
     println!();
     println!("{}", result.summary());

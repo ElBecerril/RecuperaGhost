@@ -187,7 +187,7 @@ src/
 cargo test
 ```
 
-45 tests automatizados:
+46 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -213,6 +213,7 @@ cargo test
 - same_device_warning no advierte cuando el origen es un archivo de imagen (no un disco fisico)
 - Clonado de disco a imagen: copia byte a byte exacta (ida y vuelta, multi-bloque)
 - Clonado cancelable: corta y conserva la copia parcial
+- Clonado: EOF del origen no se contabiliza como sectores danados
 - Clasificacion de integridad de resultados (integro / posiblemente danado / no verificable) y orden de presentacion
 
 ## Contribuir

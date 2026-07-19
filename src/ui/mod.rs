@@ -252,6 +252,23 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
     // Resolver a ruta absoluta ahora (en vez de dejarla relativa): ver `to_absolute_output`.
     let output_dir = crate::util::to_absolute_output(PathBuf::from(output.trim()));
 
+    // La carpeta de salida no puede ser un dispositivo crudo (`/dev/...`, `\\.\PhysicalDriveN`):
+    // recuperar "dentro" de un disco así no tiene sentido y con permisos elevados es peligroso.
+    // (En la práctica `create_dir_all` sobre un nodo de dispositivo falla, pero lo rechazamos
+    // explícito y con un mensaje claro en vez de dejar que reviente después.)
+    if crate::util::is_physical_device(&output_dir) {
+        println!();
+        println!(
+            "{}",
+            "  ❌ La carpeta de salida no puede ser un disco/dispositivo.".bright_red()
+        );
+        println!(
+            "{}",
+            "     Elegí una carpeta normal (ej. una en otro USB o en tu disco).".bright_yellow()
+        );
+        return Ok(None);
+    }
+
     println!();
 
     // 4. Confirmar
@@ -268,15 +285,17 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
     );
     println!();
 
-    // Advertencia best-effort: no recuperar sobre el mismo disco que se escanea.
-    if let Some(warning) = same_device_warning(&source_path, &output_dir) {
-        println!("{}", warning.bright_yellow());
+    // Advertencia best-effort: no recuperar sobre el mismo disco que se escanea. Si disparó, el
+    // confirm arranca en NO (fail-safe para el público no técnico que avanza a ENTER).
+    let warning = same_device_warning(&source_path, &output_dir);
+    if let Some(w) = &warning {
+        println!("{}", w.bright_yellow());
         println!();
     }
 
     let confirm = Confirm::new()
         .with_prompt("  ¿Iniciar escaneo?")
-        .default(true)
+        .default(warning.is_none())
         .interact()?;
 
     if !confirm {
@@ -425,6 +444,26 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
     }
     let output_path = crate::util::to_absolute_output(output_path);
 
+    // PROTECCIÓN CRÍTICA DE DATOS: el destino JAMÁS puede ser un dispositivo crudo
+    // (`/dev/...`, `\\.\PhysicalDriveN`). Como el clonado corre con permisos elevados, un
+    // `File::create` sobre un dispositivo abriría el disco en escritura y el clon lo
+    // sobrescribiría entero — incluido el disco que se intenta rescatar, o el del sistema.
+    // Un archivo de imagen NUNCA es un dispositivo, así que esto solo puede ser un error.
+    if crate::util::is_physical_device(&output_path) {
+        println!();
+        println!(
+            "{}",
+            "  ❌ El destino no puede ser un disco/dispositivo, tiene que ser un ARCHIVO de imagen."
+                .bright_red()
+        );
+        println!(
+            "{}",
+            "     Escribí una ruta de archivo terminada en .img (ej. D:\\copia.img), no un disco."
+                .bright_yellow()
+        );
+        return Ok(None);
+    }
+
     println!();
 
     // 4. Resumen + advertencia crítica de mismo-disco (clonar sobre el propio disco de origen
@@ -434,14 +473,18 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
     println!("  📀 Imagen destino: {}", output_path.display());
     println!();
 
-    if let Some(warning) = same_device_warning(&source_path, &output_path) {
-        println!("{}", warning.bright_yellow());
+    // Si la advertencia de mismo-disco disparó, el confirm arranca en NO (fail-safe): para el
+    // público no técnico que avanza a ENTER, el default no debe empujar hacia una operación que
+    // puede destruir justo lo que se quiere rescatar.
+    let warning = same_device_warning(&source_path, &output_path);
+    if let Some(w) = &warning {
+        println!("{}", w.bright_yellow());
         println!();
     }
 
     let confirm = Confirm::new()
         .with_prompt("  ¿Iniciar el clonado?")
-        .default(true)
+        .default(warning.is_none())
         .interact()?;
     if !confirm {
         println!("  ⏹️  Clonado cancelado.");
