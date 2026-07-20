@@ -187,7 +187,7 @@ src/
 cargo test
 ```
 
-47 tests automatizados:
+49 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
