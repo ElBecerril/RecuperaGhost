@@ -54,3 +54,31 @@ jobs:
 
       - name: Correr tests
         run: cargo test --release --target ${{ matrix.target }}
+
+  gui:
+    name: Compilar GUI (Windows, artefacto de prueba)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Instalar Rust (target gnu + clippy)
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+
+      - name: Clippy de la GUI (sin warnings)
+        run: cargo clippy --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu -- -D warnings
+
+      - name: Compilar la GUI
+        run: cargo build --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
+
+      - name: Renombrar binario
+        shell: bash
+        run: cp target/x86_64-pc-windows-gnu/release/recupe_ghost_gui.exe recupe_ghost_gui.exe
+
+      - name: Subir artefacto descargable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recupe_ghost_gui-windows
+          path: recupe_ghost_gui.exe

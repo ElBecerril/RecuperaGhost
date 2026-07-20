@@ -26,10 +26,22 @@ use crate::util::format_size;
 static SCAN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SCAN_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+// Bytes leídos del origen en el escaneo en curso. Es la MISMA cuenta que alimenta la barra de
+// progreso de la terminal, expuesta como global para que la GUI (que corre el escaneo en un hilo
+// aparte y no tiene la ProgressBar de indicatif) pueda leer el avance y dibujar su propia barra.
+// Un solo escaneo por proceso a la vez, así que un global alcanza (igual que SCAN_IN_PROGRESS).
+static SCAN_PROGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// True si hay un escaneo corriendo ahora mismo. Lo usa el handler de Ctrl+C para decidir entre
 /// cancelar el escaneo o dejar que el programa termine normalmente.
 pub fn is_scan_in_progress() -> bool {
     SCAN_IN_PROGRESS.load(Ordering::SeqCst)
+}
+
+/// Bytes del origen ya escaneados en el escaneo en curso (0 si no hay ninguno). Lo usa la GUI para
+/// dibujar su barra de progreso mientras el escaneo corre en un hilo de fondo.
+pub fn scan_progress_bytes() -> u64 {
+    SCAN_PROGRESS_BYTES.load(Ordering::Relaxed)
 }
 
 /// Pide cancelar el escaneo en curso (lo llama el handler de Ctrl+C). El escaneo se detiene en
@@ -583,7 +595,22 @@ pub fn scan_source(source_path: &Path, signatures: &[FileSignature]) -> Result<S
     drop(file);
 
     let num_threads = select_thread_count(source_path, file_size);
-    scan_source_impl(source_path, signatures, file_size, num_threads)
+    scan_source_impl(source_path, signatures, file_size, num_threads, false)
+}
+
+/// Igual que `scan_source`, pero SIN salida por terminal (ni `println!` ni barra `indicatif`).
+/// Pensada para la GUI: un binario de subsistema gráfico en Windows no tiene consola, así que un
+/// `println!` paniquearía. El avance se sigue por `scan_progress_bytes()` (y el total con
+/// `device_or_file_size`), y la cancelación por `request_cancel()`, igual que en el CLI.
+pub fn scan_source_quiet(source_path: &Path, signatures: &[FileSignature]) -> Result<ScanResult> {
+    let mut file = File::open(source_path)
+        .with_context(|| format!("No se pudo abrir: {}", source_path.display()))?;
+    let file_size = get_source_size(&mut file, source_path)
+        .with_context(|| "No se pudo obtener el tamaño del origen")?;
+    drop(file);
+
+    let num_threads = select_thread_count(source_path, file_size);
+    scan_source_impl(source_path, signatures, file_size, num_threads, true)
 }
 
 /// Variante interna para testing: permite forzar un número específico de hilos.
@@ -599,30 +626,18 @@ fn scan_source_with_threads(
         .with_context(|| "No se pudo obtener el tamaño del origen")?;
     drop(file);
 
-    scan_source_impl(source_path, signatures, file_size, forced_threads.max(1))
+    scan_source_impl(
+        source_path,
+        signatures,
+        file_size,
+        forced_threads.max(1),
+        false,
+    )
 }
 
-/// Implementación central del escaneo: orquesta single-thread o multi-thread.
-fn scan_source_impl(
-    source_path: &Path,
-    signatures: &[FileSignature],
-    file_size: u64,
-    num_threads: usize,
-) -> Result<ScanResult> {
-    // Marcar el escaneo como "en progreso" para que el handler de Ctrl+C cancele en vez de
-    // cerrar el programa, y limpiar cualquier cancelación pendiente de un escaneo anterior (en
-    // modo interactivo se puede escanear, cancelar, volver al menú y reescanear). El guard con
-    // `Drop` garantiza que `SCAN_IN_PROGRESS` se limpie al salir de la función pase lo que pase.
-    struct ScanGuard;
-    impl Drop for ScanGuard {
-        fn drop(&mut self) {
-            SCAN_IN_PROGRESS.store(false, Ordering::SeqCst);
-        }
-    }
-    SCAN_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
-    let _scan_guard = ScanGuard;
-
+/// Preámbulo de terminal del escaneo (encabezado, tamaño, estimación de tiempo y aviso de Ctrl+C).
+/// Extraído para poder saltearlo por completo en modo GUI (`quiet`), donde no hay consola.
+fn print_scan_preamble(source_path: &Path, file_size: u64, num_threads: usize) {
     println!("  🔎 Escaneando: {}", source_path.display());
     println!("  📏 Tamaño: {}", format_size(file_size));
 
@@ -672,15 +687,52 @@ fn scan_source_impl(
             .bright_black()
     );
     println!();
+}
 
-    let pb = ProgressBar::new(file_size);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "  👻 [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
-        )
-        .unwrap()
-        .progress_chars("█▓▒░  "),
-    );
+/// Implementación central del escaneo: orquesta single-thread o multi-thread.
+/// `quiet`: si es true, no imprime nada por terminal ni usa la barra `indicatif` (modo GUI); el
+/// avance se expone igual por `SCAN_PROGRESS_BYTES`.
+fn scan_source_impl(
+    source_path: &Path,
+    signatures: &[FileSignature],
+    file_size: u64,
+    num_threads: usize,
+    quiet: bool,
+) -> Result<ScanResult> {
+    // Marcar el escaneo como "en progreso" para que el handler de Ctrl+C cancele en vez de
+    // cerrar el programa, y limpiar cualquier cancelación pendiente de un escaneo anterior (en
+    // modo interactivo se puede escanear, cancelar, volver al menú y reescanear). El guard con
+    // `Drop` garantiza que `SCAN_IN_PROGRESS` se limpie al salir de la función pase lo que pase.
+    struct ScanGuard;
+    impl Drop for ScanGuard {
+        fn drop(&mut self) {
+            SCAN_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+    SCAN_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
+    SCAN_PROGRESS_BYTES.store(0, Ordering::Relaxed);
+    let _scan_guard = ScanGuard;
+
+    if !quiet {
+        print_scan_preamble(source_path, file_size, num_threads);
+    }
+
+    // En modo GUI (`quiet`) la barra es oculta (sus métodos son no-ops); el avance real se sigue
+    // por `SCAN_PROGRESS_BYTES`. En CLI es la barra visible de siempre.
+    let pb = if quiet {
+        ProgressBar::hidden()
+    } else {
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  👻 [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
+            )
+            .unwrap()
+            .progress_chars("█▓▒░  "),
+        );
+        pb
+    };
 
     let max_header_len = max_signature_reach(signatures);
 
@@ -692,7 +744,6 @@ fn scan_source_impl(
             claim_start: 0,
             claim_end: file_size,
         };
-        let progress = AtomicU64::new(0);
         // (B1) scan_segment ya no propaga errores de I/O con `?` — un sector dañado en
         // cualquier punto del origen ya no descarta todo lo encontrado antes de llegar a él.
         let result = scan_segment(
@@ -701,29 +752,29 @@ fn scan_source_impl(
             signatures,
             file_size,
             max_header_len,
-            &progress,
+            &SCAN_PROGRESS_BYTES,
             Some(&pb),
             &SCAN_CANCEL_REQUESTED,
         );
-        if result.had_errors {
+        if result.had_errors && !quiet {
             eprintln!(
                 "  ⚠️  El escaneo tuvo errores de I/O leyendo el origen; el resultado es parcial."
             );
         }
         // B3: reportar lo realmente leído, no file_size fijo — un EOF prematuro (bytes_read
         // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo.
-        let scanned = progress.load(Ordering::Relaxed);
+        let scanned = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
         (result.found_files, scanned, result.had_errors)
     } else {
         // ── Multi-hilo ──
         let segments = calculate_segments(file_size, num_threads, max_header_len as u64);
-        let progress = Arc::new(AtomicU64::new(0));
 
-        // Hilo dedicado de progreso: lee el atomic cada 100ms y actualiza ProgressBar
-        let progress_monitor = progress.clone();
+        // Hilo dedicado de progreso: lee `SCAN_PROGRESS_BYTES` cada 100ms y actualiza la
+        // ProgressBar (en modo GUI la barra es oculta y esto es no-op; el avance lo lee la GUI del
+        // mismo global).
         let pb_monitor = pb.clone();
         let monitor_handle = std::thread::spawn(move || loop {
-            let pos = progress_monitor.load(Ordering::Relaxed);
+            let pos = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
             pb_monitor.set_position(std::cmp::min(pos, file_size));
             if pos >= file_size {
                 break;
@@ -740,17 +791,16 @@ fn scan_source_impl(
             .map(|segment| {
                 let path = source_buf.clone();
                 let sigs = sigs_arc.clone();
-                let prog = progress.clone();
                 std::thread::spawn(move || {
-                    // `&SCAN_CANCEL_REQUESTED` es una referencia 'static (es un static global),
-                    // así que se puede mover a cada worker sin clonar ni envolver en Arc.
+                    // `&SCAN_PROGRESS_BYTES` y `&SCAN_CANCEL_REQUESTED` son referencias 'static
+                    // (statics globales), así que se pueden usar en cada worker sin clonar ni Arc.
                     scan_segment(
                         &path,
                         &segment,
                         &sigs,
                         file_size,
                         max_header_len,
-                        &prog,
+                        &SCAN_PROGRESS_BYTES,
                         None,
                         &SCAN_CANCEL_REQUESTED,
                     )
@@ -776,21 +826,23 @@ fn scan_source_impl(
                     // El hilo panicó: perdemos SUS resultados (no hay forma de recuperarlos
                     // de un panic), pero los demás hilos ya recolectados en `all_files` se
                     // conservan igual.
-                    eprintln!("  ⚠️  Un hilo de escaneo falló inesperadamente (panic); se conservan los resultados de los demás hilos.");
+                    if !quiet {
+                        eprintln!("  ⚠️  Un hilo de escaneo falló inesperadamente (panic); se conservan los resultados de los demás hilos.");
+                    }
                     multi_had_errors = true;
                 }
             }
         }
-        if multi_had_errors {
+        if multi_had_errors && !quiet {
             eprintln!("  ⚠️  El escaneo tuvo errores en uno o más hilos; el resultado es parcial.");
         }
 
         // B3: capturar lo realmente acumulado ANTES de forzar el atomic a file_size (eso
         // último solo es para que el hilo de progreso se detenga, no refleja lo leído).
-        let scanned = progress.load(Ordering::Relaxed);
+        let scanned = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
 
         // Siempre señalar al monitor que termine
-        progress.store(file_size, Ordering::Relaxed);
+        SCAN_PROGRESS_BYTES.store(file_size, Ordering::Relaxed);
         let _ = monitor_handle.join();
 
         // Sort por offset, dedup defensivo, re-indexar
@@ -820,7 +872,9 @@ fn scan_source_impl(
     } else {
         pb.finish_with_message("✅ Escaneo completado");
     }
-    println!();
+    if !quiet {
+        println!();
+    }
 
     let photos_count = found_files
         .iter()

@@ -1,13 +1,3 @@
-mod banner;
-mod clone;
-mod drives;
-mod recovery;
-mod scanner;
-mod signatures;
-mod ui;
-mod updater;
-mod util;
-
 use std::path::PathBuf;
 use std::process;
 
@@ -15,10 +5,11 @@ use anyhow::Result;
 use clap::Parser;
 use colored::Colorize;
 
-use signatures::{signatures_for_categories, FileCategory};
-use ui::{MainMenuChoice, ScanConfig};
+// El motor vive en la biblioteca `recupe_ghost` (src/lib.rs), compartida con el binario de la GUI.
+use recupe_ghost::{banner, clone, recovery, scanner, ui, updater, util};
 
-use crate::ui::CloneConfig;
+use recupe_ghost::signatures::{signatures_for_categories, FileCategory};
+use recupe_ghost::ui::{CloneConfig, MainMenuChoice, ScanConfig};
 
 /// RecupeGhost - El Detective de Archivos Perdidos
 ///
