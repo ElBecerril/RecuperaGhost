@@ -772,14 +772,25 @@ fn scan_source_impl(
         // Hilo dedicado de progreso: lee `SCAN_PROGRESS_BYTES` cada 100ms y actualiza la
         // ProgressBar (en modo GUI la barra es oculta y esto es no-op; el avance lo lee la GUI del
         // mismo global).
+        //
+        // El monitor termina por un flag PROPIO de este escaneo, no por el contador de bytes.
+        // Antes salía con `if pos >= file_size`, y eso era un cuelgue infinito esperando: el
+        // contador es un GLOBAL, así que cualquier otro escaneo que arranque en el mismo proceso
+        // lo resetea a 0 (`SCAN_PROGRESS_BYTES.store(0)`). Si ese reset caía después del
+        // `store(file_size)` que señalaba el fin y antes de que el monitor lo leyera (ventana de
+        // 100ms), el monitor giraba para siempre y `monitor_handle.join()` no volvía nunca. Se
+        // manifestó como el job de macOS del CI colgado 6 h en
+        // `test_signature_at_segment_boundary` (los tests corren en paralelo en un mismo proceso).
+        // La terminación de un hilo no debe depender de un contador compartido y mutable.
+        let monitor_done = Arc::new(AtomicBool::new(false));
+        let monitor_flag = monitor_done.clone();
         let pb_monitor = pb.clone();
-        let monitor_handle = std::thread::spawn(move || loop {
-            let pos = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
-            pb_monitor.set_position(std::cmp::min(pos, file_size));
-            if pos >= file_size {
-                break;
+        let monitor_handle = std::thread::spawn(move || {
+            while !monitor_flag.load(Ordering::Acquire) {
+                let pos = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
+                pb_monitor.set_position(std::cmp::min(pos, file_size));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         });
 
         // Spawn N hilos workers
@@ -837,12 +848,12 @@ fn scan_source_impl(
             eprintln!("  ⚠️  El escaneo tuvo errores en uno o más hilos; el resultado es parcial.");
         }
 
-        // B3: capturar lo realmente acumulado ANTES de forzar el atomic a file_size (eso
-        // último solo es para que el hilo de progreso se detenga, no refleja lo leído).
+        // B3: reportar lo realmente leído, no `file_size` fijo (un EOF prematuro corta antes).
         let scanned = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
 
-        // Siempre señalar al monitor que termine
-        SCAN_PROGRESS_BYTES.store(file_size, Ordering::Relaxed);
+        // Siempre señalar al monitor que termine. Ya no hace falta falsear el contador a
+        // `file_size` para lograrlo: el flag es propio de este escaneo y nadie más lo toca.
+        monitor_done.store(true, Ordering::Release);
         let _ = monitor_handle.join();
 
         // Sort por offset, dedup defensivo, re-indexar
@@ -1883,6 +1894,63 @@ mod tests {
         println!(
             "\nFirma en frontera de segmento 0x{:X} detectada correctamente.",
             boundary
+        );
+    }
+
+    /// Regresión: un escaneo multi-hilo tiene que terminar aunque OTRO escaneo del mismo proceso
+    /// esté reseteando el contador global de progreso.
+    ///
+    /// El hilo monitor salía del loop con `if pos >= file_size`, leyendo el global
+    /// `SCAN_PROGRESS_BYTES`. Como cualquier escaneo que arranca lo pone en 0, un reset que caía
+    /// en la ventana equivocada dejaba al monitor girando para siempre y a `join()` colgado. En el
+    /// CI de macOS esto colgó el job 6 h en `test_signature_at_segment_boundary` (los tests corren
+    /// en paralelo en un mismo proceso). Acá se fuerza el escenario a propósito: se martilla el
+    /// global con escaneos concurrentes mientras corre el multi-hilo, y se exige que termine.
+    #[test]
+    fn test_multithread_scan_terminates_despite_concurrent_progress_resets() {
+        use std::sync::mpsc;
+
+        // Origen grande: fuerza el camino multi-hilo, el único que tiene hilo monitor.
+        let mut big = tempfile::NamedTempFile::new().unwrap();
+        big.write_all(&vec![0u8; 20 * 1024 * 1024]).unwrap();
+        big.flush().unwrap();
+
+        // Origen chico: cada escaneo sobre él resetea SCAN_PROGRESS_BYTES a 0.
+        let mut small = tempfile::NamedTempFile::new().unwrap();
+        small.write_all(&vec![0u8; 64 * 1024]).unwrap();
+        small.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammer_stop = stop.clone();
+        let small_path = small.path().to_path_buf();
+        let hammer_sigs = sigs.clone();
+        let hammer = std::thread::spawn(move || {
+            while !hammer_stop.load(Ordering::Relaxed) {
+                let _ = scan_source_quiet(&small_path, &hammer_sigs);
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let big_path = big.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(scan_source_with_threads(&big_path, &sigs, 2).is_ok());
+        });
+
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(60));
+
+        // Frenar el martilleo ANTES de cualquier assert: si el assert falla y paniquea, no puede
+        // quedar un hilo girando para el resto de la suite.
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
+
+        // A propósito no se hace join del hilo del escaneo: si el bug está vivo, ese hilo está
+        // colgado y el join colgaría el test en vez de hacerlo fallar.
+        assert!(
+            finished.is_ok(),
+            "El escaneo multi-hilo no terminó en 60s: el hilo monitor quedó girando porque su \
+             condición de salida depende del contador global de progreso."
         );
     }
 

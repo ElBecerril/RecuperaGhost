@@ -187,7 +187,7 @@ src/
 cargo test
 ```
 
-46 tests automatizados:
+47 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -204,6 +204,7 @@ cargo test
 - Seleccion automatica de hilos (dispositivo vs archivo)
 - Consistencia multi-hilo (1 vs N hilos, todas las categorias)
 - Deteccion de firmas en frontera de segmento
+- El escaneo multi-hilo termina aunque otro escaneo del proceso resetee el contador de progreso
 - No-englobing de archivos adyacentes en el mismo buffer
 - Rechazo de falsos positivos MP3/AAC via frame-chaining
 - Parseo de versiones y comparacion (aviso de nuevas versiones)
