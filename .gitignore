@@ -19,3 +19,7 @@ CLAUDE.md
 # OS
 Thumbs.db
 .DS_Store
+
+# Log de sesiones archivado: contexto interno, no aporta al usuario del repo publico
+# (misma linea que contexto_proyecto.json y REPORTE_SESION.md)
+docs/session-context/
