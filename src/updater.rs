@@ -29,6 +29,9 @@ struct Version {
     major: u32,
     minor: u32,
     patch: u32,
+    /// True si la versión trae sufijo de pre-release o build-metadata ("0.5.0-beta.1").
+    /// Se usa para desempatar: con la misma tripleta, la estable es más nueva que la beta.
+    pre: bool,
 }
 
 /// Parsea un componente numérico de versión. Si el parseo directo falla (por ejemplo
@@ -51,7 +54,18 @@ fn parse_version_component(part: &str) -> Option<u32> {
 
 fn parse_version(s: &str) -> Option<Version> {
     let s = s.strip_prefix('v').unwrap_or(s);
-    let parts: Vec<&str> = s.split('.').collect();
+
+    // El sufijo de pre-release / build-metadata se corta ANTES de separar por puntos. Sin esto,
+    // "0.5.0-beta.1" se partía en 4 pedazos (["0","5","0-beta","1"]), no en 3, y el parseo
+    // devolvía None: el updater quedaba mudo para siempre en cualquier binario de una beta.
+    // El usuario nunca se enteraba de la estable que venía a reemplazarla, y el error se traga
+    // en silencio, así que tampoco había síntoma visible.
+    let (core, pre) = match s.find(['-', '+']) {
+        Some(i) => (&s[..i], true),
+        None => (s, false),
+    };
+
+    let parts: Vec<&str> = core.split('.').collect();
     if parts.len() != 3 {
         return None;
     }
@@ -59,11 +73,22 @@ fn parse_version(s: &str) -> Option<Version> {
         major: parse_version_component(parts[0])?,
         minor: parse_version_component(parts[1])?,
         patch: parse_version_component(parts[2])?,
+        pre,
     })
 }
 
 fn is_newer(latest: &Version, current: &Version) -> bool {
-    (latest.major, latest.minor, latest.patch) > (current.major, current.minor, current.patch)
+    let (l, c) = (
+        (latest.major, latest.minor, latest.patch),
+        (current.major, current.minor, current.patch),
+    );
+    if l != c {
+        return l > c;
+    }
+    // Misma tripleta: la estable le gana a la pre-release. Es lo que saca del canal beta a quien
+    // instaló 0.5.0-beta.1 cuando sale 0.5.0 — sin esto se quedaba varado en la beta, que es
+    // justo la versión que se quiere retirar.
+    current.pre && !latest.pre
 }
 
 // ─── API pública ────────────────────────────────────────────────────────────
@@ -182,7 +207,8 @@ mod tests {
             Some(Version {
                 major: 0,
                 minor: 2,
-                patch: 0
+                patch: 0,
+                pre: false
             })
         );
     }
@@ -194,7 +220,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 3,
-                patch: 7
+                patch: 7,
+                pre: false
             })
         );
     }
@@ -212,7 +239,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                pre: true
             })
         );
         assert_eq!(
@@ -220,7 +248,8 @@ mod tests {
             Some(Version {
                 major: 1,
                 minor: 2,
-                patch: 3
+                patch: 3,
+                pre: true
             })
         );
         // Sin ningún dígito al principio de la última parte, debe seguir fallando
@@ -233,21 +262,75 @@ mod tests {
             major: 0,
             minor: 1,
             patch: 0,
+            pre: false,
         };
         let v2 = Version {
             major: 0,
             minor: 2,
             patch: 0,
+            pre: false,
         };
         let v3 = Version {
             major: 1,
             minor: 0,
             patch: 0,
+            pre: false,
         };
 
         assert!(!is_newer(&v1, &v1)); // misma versión
         assert!(is_newer(&v2, &v1)); // 0.2.0 > 0.1.0
         assert!(!is_newer(&v1, &v2)); // 0.1.0 < 0.2.0
         assert!(is_newer(&v3, &v2)); // 1.0.0 > 0.2.0
+    }
+
+    /// Regresión: el sufijo de pre-release agrega un punto y rompía el `split('.')`.
+    /// "0.5.0-beta.1" daba 4 partes en vez de 3 → `parse_version` devolvía None → el updater
+    /// quedaba mudo en TODO binario de una beta, en silencio y para siempre.
+    #[test]
+    fn test_parse_version_beta_with_dotted_suffix() {
+        assert_eq!(
+            parse_version("v0.5.0-beta.1"),
+            Some(Version {
+                major: 0,
+                minor: 5,
+                patch: 0,
+                pre: true
+            })
+        );
+        assert_eq!(
+            parse_version("1.0.0-rc.2+build.5"),
+            Some(Version {
+                major: 1,
+                minor: 0,
+                patch: 0,
+                pre: true
+            })
+        );
+    }
+
+    /// Quien instaló una beta tiene que enterarse de la estable que la reemplaza: misma
+    /// tripleta, pero la estable gana. Sin esto se quedaba varado justo en la versión que se
+    /// quiere retirar.
+    #[test]
+    fn test_stable_is_newer_than_its_own_prerelease() {
+        let beta = parse_version("0.5.0-beta.1").unwrap();
+        let stable = parse_version("0.5.0").unwrap();
+
+        assert!(
+            is_newer(&stable, &beta),
+            "0.5.0 debe superar a 0.5.0-beta.1"
+        );
+        assert!(
+            !is_newer(&beta, &stable),
+            "la beta no debe superar a la estable"
+        );
+        assert!(
+            !is_newer(&beta, &beta),
+            "la misma beta no se supera a sí misma"
+        );
+
+        // Y una beta posterior sigue sin avisarle a quien ya está en la estable.
+        let beta_next = parse_version("0.5.0-beta.2").unwrap();
+        assert!(!is_newer(&beta_next, &stable));
     }
 }

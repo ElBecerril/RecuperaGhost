@@ -782,8 +782,21 @@ fn scan_source_impl(
         // manifestó como el job de macOS del CI colgado 6 h en
         // `test_signature_at_segment_boundary` (los tests corren en paralelo en un mismo proceso).
         // La terminación de un hilo no debe depender de un contador compartido y mutable.
+        // El flag va detrás de un guard con `Drop` para que también se levante si este hilo se
+        // va por un panic (por ejemplo, si el OS no puede crear un worker). Sin el guard, en la
+        // GUI —donde el escaneo corre en un hilo y un panic no mata el proceso— quedaría un hilo
+        // monitor girando en background por cada escaneo que falle así. Es la misma clase de bug
+        // que se acaba de arreglar: que la terminación de un hilo dependa de que otro llegue a
+        // una línea.
+        struct MonitorGuard(Arc<AtomicBool>);
+        impl Drop for MonitorGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         let monitor_done = Arc::new(AtomicBool::new(false));
         let monitor_flag = monitor_done.clone();
+        let _monitor_guard = MonitorGuard(monitor_done.clone());
         let pb_monitor = pb.clone();
         let monitor_handle = std::thread::spawn(move || {
             while !monitor_flag.load(Ordering::Acquire) {

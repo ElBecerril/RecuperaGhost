@@ -229,7 +229,7 @@ fn main() -> Result<()> {
 
         if let Err(e) = run_scan(config, true) {
             eprintln!("{}", format!("  ❌ Error: {}", e).bright_red());
-            if let Some(hint) = friendly_error_hint(&e) {
+            if let Some(hint) = util::friendly_error_hint(&e) {
                 eprintln!("{}", hint.bright_yellow());
             }
             let mut source = e.source();
@@ -285,7 +285,7 @@ fn main() -> Result<()> {
                                 "{}",
                                 format!("  ❌ Error durante el escaneo: {}", e).bright_red()
                             );
-                            if let Some(hint) = friendly_error_hint(&e) {
+                            if let Some(hint) = util::friendly_error_hint(&e) {
                                 eprintln!("{}", hint.bright_yellow());
                             }
                             // Mostrar causa raíz si existe
@@ -312,7 +312,7 @@ fn main() -> Result<()> {
                                 "{}",
                                 format!("  ❌ Error durante el clonado: {}", e).bright_red()
                             );
-                            if let Some(hint) = friendly_error_hint(&e) {
+                            if let Some(hint) = util::friendly_error_hint(&e) {
                                 eprintln!("{}", hint.bright_yellow());
                             }
                             let mut source = e.source();
@@ -336,33 +336,6 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Busca un `std::io::Error` en la cadena de causas del error y devuelve una traducción
-/// amigable en español para los casos más comunes con los que alguien sin conocimiento técnico
-/// puede toparse (permisos, dispositivo desconectado). El mensaje técnico original se sigue
-/// mostrando abajo como "Causa:" para quien lo necesite; esto es un resumen en criollo antes.
-fn friendly_error_hint(e: &anyhow::Error) -> Option<&'static str> {
-    for cause in e.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            return match io_err.kind() {
-                std::io::ErrorKind::PermissionDenied => Some(
-                    "  🔒 No tenés permisos suficientes para acceder a ese disco o archivo. \
-Si es un disco físico, ejecutá el programa como Administrador (Windows) o con sudo (Linux/macOS).",
-                ),
-                std::io::ErrorKind::NotFound => Some(
-                    "  🔍 No se encontró la ruta indicada. Verificá que el disco/USB siga conectado \
-y que la ruta esté bien escrita.",
-                ),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted => Some(
-                    "  ⏱️  El dispositivo tardó demasiado en responder. Puede estar desconectado \
-o dañado — probá reconectarlo.",
-                ),
-                _ => None,
-            };
-        }
-    }
-    None
 }
 
 /// Espera a que el usuario presione ENTER antes de cerrar.

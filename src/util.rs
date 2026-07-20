@@ -43,3 +43,36 @@ pub fn to_absolute_output(dir: std::path::PathBuf) -> std::path::PathBuf {
             .unwrap_or(dir)
     }
 }
+
+/// Busca un `std::io::Error` en la cadena de causas del error y devuelve una traducción
+/// amigable en español para los casos más comunes con los que alguien sin conocimiento técnico
+/// puede toparse (permisos, dispositivo desconectado). El mensaje técnico original se sigue
+/// mostrando abajo como "Causa:" para quien lo necesite; esto es un resumen en criollo antes.
+///
+/// Vive en `util` (y no en el binario del CLI) porque la GUI necesita lo mismo: sin esto, su
+/// pantalla de error mostraba el texto crudo del sistema operativo — para el público de esta
+/// herramienta, un "Acceso denegado. (os error 5)" es el final del intento, cuando la solución
+/// era abrir el programa como administrador. Los textos arrancan con sangría para el CLI; quien
+/// los muestre en otro contexto que use `trim_start()`.
+pub fn friendly_error_hint(e: &anyhow::Error) -> Option<&'static str> {
+    for cause in e.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::PermissionDenied => Some(
+                    "  🔒 No tenés permisos suficientes para acceder a ese disco o archivo. \
+Si es un disco físico, ejecutá el programa como Administrador (Windows) o con sudo (Linux/macOS).",
+                ),
+                std::io::ErrorKind::NotFound => Some(
+                    "  🔍 No se encontró la ruta indicada. Verificá que el disco/USB siga conectado \
+y que la ruta esté bien escrita.",
+                ),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted => Some(
+                    "  ⏱️  El dispositivo tardó demasiado en responder. Puede estar desconectado \
+o dañado — probá reconectarlo.",
+                ),
+                _ => None,
+            };
+        }
+    }
+    None
+}
