@@ -684,6 +684,9 @@ pub fn same_device_warning(
         // aplicamos el chequeo de prefijo cuando `mount_prefix` no es vacío;
         // el caso `mount == "/"` sigue cubierto por la igualdad exacta y por
         // la comprobación de device id de más abajo.
+        // `mut` porque el bloque `#[cfg(unix)]` de abajo reasigna `same` vía device id; en
+        // Windows ese bloque no se compila y `mut` quedaría sin usar (de ahí el allow).
+        #[allow(unused_mut)]
         let mut same = candidate_str == mount_str
             || candidate_str == mount_prefix
             || (!mount_prefix.is_empty()

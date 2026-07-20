@@ -56,10 +56,10 @@ pub fn list_removable() -> Vec<DriveInfo> {
 pub fn is_admin() -> bool {
     use std::fs::OpenOptions;
     // Intentar abrir PhysicalDrive0 como prueba de permisos
-    match OpenOptions::new().read(true).open(r"\\.\PhysicalDrive0") {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    OpenOptions::new()
+        .read(true)
+        .open(r"\\.\PhysicalDrive0")
+        .is_ok()
 }
 
 #[cfg(not(target_os = "windows"))]
