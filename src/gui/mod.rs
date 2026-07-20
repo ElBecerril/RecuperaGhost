@@ -63,9 +63,11 @@ struct RecupeGhostApp {
     /// Advertencia de "vas a guardar en el mismo disco que estás recuperando" pendiente de
     /// resolver, con la acción que quedó frenada esperándola.
     pending_warning: Option<(String, PendingAction)>,
-    /// El usuario ya aceptó explícitamente el riesgo de mismo-disco en este flujo; no se le
-    /// vuelve a preguntar (repetir la advertencia la devalúa y entrena a descartarla).
-    same_device_accepted: bool,
+    /// Combinación (origen, destino) EXACTA para la que el usuario ya aceptó el riesgo de
+    /// mismo-disco. No alcanza con un booleano: una aceptación puntual no puede apagar la
+    /// protección para discos y carpetas que la persona nunca aprobó. Con la pareja guardada,
+    /// cambiar cualquiera de las dos puntas vuelve a disparar la advertencia sola.
+    same_device_accepted: Option<(PathBuf, PathBuf)>,
 
     phase: Phase,
     // Trabajo en background y sus resultados.
@@ -94,7 +96,7 @@ impl RecupeGhostApp {
             cats: [true, true, true, true],
             output_dir: default_output_name(),
             pending_warning: None,
-            same_device_accepted: false,
+            same_device_accepted: None,
             phase: Phase::Setup,
             source: None,
             scan_total: 0,
@@ -138,6 +140,7 @@ impl RecupeGhostApp {
     fn fail(&mut self, msg: impl Into<String>) {
         self.error_msg = msg.into();
         self.error_hint = None;
+        self.pending_warning = None;
         self.phase = Phase::Error;
     }
 
@@ -145,6 +148,7 @@ impl RecupeGhostApp {
     fn fail_io(&mut self, prefix: &str, e: &anyhow::Error) {
         self.error_msg = format!("{prefix}: {e:#}");
         self.error_hint = util::friendly_error_hint(e);
+        self.pending_warning = None;
         self.phase = Phase::Error;
     }
 
@@ -161,10 +165,12 @@ impl RecupeGhostApp {
     /// en sus tres flujos; la GUI no lo hacía en ninguno, y su única defensa era un cartel fijo
     /// que no verificaba nada.
     fn blocked_by_same_device(&mut self, source: &std::path::Path, action: PendingAction) -> bool {
-        if self.same_device_accepted {
+        let out = self.output_path();
+        // La aceptación vale solo para la combinación exacta que se aprobó.
+        if self.same_device_accepted.as_ref() == Some(&(source.to_path_buf(), out.clone())) {
             return false;
         }
-        match crate::ui::same_device_warning(source, &self.output_path()) {
+        match crate::ui::same_device_warning(source, &out) {
             Some(warning) => {
                 self.pending_warning = Some((warning, action));
                 true
@@ -174,6 +180,13 @@ impl RecupeGhostApp {
     }
 
     fn start_scan(&mut self) {
+        // Con la advertencia en pantalla no se arranca nada: la `Window` de egui flota sobre el
+        // panel pero NO lo bloquea por sí sola, así que sin este guard se podía disparar un
+        // segundo escaneo concurrente desde abajo (dos hilos pisando los mismos globales de
+        // progreso y cancelación del scanner).
+        if self.pending_warning.is_some() {
+            return;
+        }
         let source = match self.resolve_source() {
             Some(s) => s,
             None => return self.fail("Elegí un disco o escribí una ruta de imagen."),
@@ -214,6 +227,9 @@ impl RecupeGhostApp {
     }
 
     fn start_recovery(&mut self) {
+        if self.pending_warning.is_some() {
+            return;
+        }
         let (source, files) = match (&self.source, &self.scan_result) {
             (Some(s), Some(r)) => (s.clone(), r.found_files.clone()),
             _ => return,
@@ -285,6 +301,25 @@ impl RecupeGhostApp {
 
     fn ui_setup(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
+
+        // Si hay un escaneo hecho, ofrecer volver a sus resultados. Sin esto, alguien que llega
+        // acá desde la advertencia de mismo-disco para CORREGIR la carpeta perdía un escaneo que
+        // pudo durar horas — o sea, elegir la opción segura salía más caro que aceptar el riesgo.
+        // Un diálogo de protección de datos no puede tener los incentivos al revés.
+        if self.scan_result.is_some() {
+            ui.horizontal(|ui| {
+                if ui.button("↩ Volver a los resultados del escaneo").clicked() {
+                    self.phase = Phase::Results;
+                }
+                ui.label(
+                    egui::RichText::new("(no hace falta escanear de nuevo)")
+                        .size(12.0)
+                        .weak(),
+                );
+            });
+            ui.separator();
+        }
+
         ui.strong("1. ¿Qué disco o imagen querés recuperar?");
         ui.horizontal(|ui| {
             if ui.button("🔄 Actualizar discos").clicked() {
@@ -579,7 +614,17 @@ impl RecupeGhostApp {
 impl eframe::App for RecupeGhostApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
+
+        // Con la advertencia de mismo-disco en pantalla, TODO lo de atrás queda deshabilitado.
+        // `egui::Window` es una ventana flotante, no un modal (`egui::Modal` recién existe desde
+        // 0.31): sin esto el usuario puede seguir tocando los controles de abajo, y una decisión
+        // de protección de datos no puede quedar dando vueltas mientras el estado que la motivó
+        // cambia atrás.
+        let blocked = self.pending_warning.is_some();
         egui::CentralPanel::default().show(ctx, |ui| {
+            if blocked {
+                ui.disable();
+            }
             ui.add_space(6.0);
             ui.heading("👻 RecupeGhost");
             ui.label("Recuperá fotos, videos, audios y documentos borrados.");
@@ -658,7 +703,9 @@ impl RecupeGhostApp {
         match choice {
             Some(true) => {
                 self.pending_warning = None;
-                self.same_device_accepted = true;
+                if let Some(src) = self.resolve_source() {
+                    self.same_device_accepted = Some((src, self.output_path()));
+                }
                 match action {
                     PendingAction::Scan => self.start_scan(),
                     PendingAction::Recover => self.start_recovery(),
@@ -668,6 +715,8 @@ impl RecupeGhostApp {
                 // Volver siempre a donde se elige la carpeta: es el único lugar donde el usuario
                 // puede corregir el destino. La pantalla de resultados no tiene ese campo, así
                 // que dejarlo ahí sería un callejón sin salida con la advertencia ya descartada.
+                // Si venía de recuperar, `scan_result` se conserva y `ui_setup` ofrece volver a
+                // los resultados: corregir la carpeta no cuesta re-escanear.
                 self.pending_warning = None;
                 self.phase = Phase::Setup;
             }

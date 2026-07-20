@@ -53,15 +53,21 @@ fn parse_version_component(part: &str) -> Option<u32> {
 }
 
 fn parse_version(s: &str) -> Option<Version> {
-    let s = s.strip_prefix('v').unwrap_or(s);
+    // Case-insensitive a propósito: un tag tipeado "V0.6.0" con la V grande devolvía None y
+    // dejaba el updater mudo en silencio — la misma clase de falla sin síntoma que este parseo
+    // vino a matar.
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
 
     // El sufijo de pre-release / build-metadata se corta ANTES de separar por puntos. Sin esto,
     // "0.5.0-beta.1" se partía en 4 pedazos (["0","5","0-beta","1"]), no en 3, y el parseo
     // devolvía None: el updater quedaba mudo para siempre en cualquier binario de una beta.
     // El usuario nunca se enteraba de la estable que venía a reemplazarla, y el error se traga
     // en silencio, así que tampoco había síntoma visible.
+    //
+    // Solo el `-` marca pre-release: por semver, el `+build-metadata` NO afecta la precedencia
+    // (si no, "1.2.3+build" recibiría aviso de actualización hacia su propia versión).
     let (core, pre) = match s.find(['-', '+']) {
-        Some(i) => (&s[..i], true),
+        Some(i) => (&s[..i], s.as_bytes()[i] == b'-'),
         None => (s, false),
     };
 
@@ -243,13 +249,27 @@ mod tests {
                 pre: true
             })
         );
+        // El build-metadata (`+`) NO es pre-release: por semver no afecta la precedencia. Si se
+        // marcara como pre, "1.2.3+build" recibiría aviso de actualización hacia su propia
+        // versión 1.2.3.
         assert_eq!(
             parse_version("1.2.3+build"),
             Some(Version {
                 major: 1,
                 minor: 2,
                 patch: 3,
-                pre: true
+                pre: false
+            })
+        );
+        // La `V` mayúscula (típico typo al taguear) tiene que parsear igual: si devuelve None,
+        // el updater queda mudo en silencio para toda la base instalada.
+        assert_eq!(
+            parse_version("V1.2.3"),
+            Some(Version {
+                major: 1,
+                minor: 2,
+                patch: 3,
+                pre: false
             })
         );
         // Sin ningún dígito al principio de la última parte, debe seguir fallando

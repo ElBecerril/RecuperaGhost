@@ -796,6 +796,10 @@ fn scan_source_impl(
         }
         let monitor_done = Arc::new(AtomicBool::new(false));
         let monitor_flag = monitor_done.clone();
+        // OJO: tiene que ser un binding CON NOMBRE. Si esto se "simplifica" a
+        // `let _ = MonitorGuard(...)`, el guard se dropea en el acto, el flag queda en true antes
+        // de que el monitor entre al loop, y la barra de progreso se congela en 0 durante todo el
+        // escaneo — en un disco grande, horas de pantalla muerta. Ni los tests ni clippy avisan.
         let _monitor_guard = MonitorGuard(monitor_done.clone());
         let pb_monitor = pb.clone();
         let monitor_handle = std::thread::spawn(move || {
@@ -806,31 +810,56 @@ fn scan_source_impl(
             }
         });
 
-        // Spawn N hilos workers
+        // Los workers también van detrás de un guard, y este es el que importa de verdad: son
+        // los hilos que LEEN EL DISCO. Si el orquestador se va por un panic a mitad del spawn
+        // (el OS puede rechazar la creación de un hilo por límite de procesos o memoria), los
+        // workers ya creados quedan detached y siguen leyendo. En el CLI da igual porque el
+        // proceso muere, pero en la GUI el escaneo corre en un hilo y el panic no mata nada:
+        // quedaban hilos huérfanos machacando un disco que puede estar muriéndose, con el handle
+        // de `\\.\PhysicalDriveN` abierto, y sumando al contador global de progreso — así que el
+        // escaneo SIGUIENTE mostraba una barra que avanzaba más rápido que la realidad.
+        struct WorkersGuard(Vec<std::thread::JoinHandle<SegmentResult>>);
+        impl Drop for WorkersGuard {
+            fn drop(&mut self) {
+                if self.0.is_empty() {
+                    return; // Camino feliz: los handles ya se consumieron al recolectar.
+                }
+                // Se pide cancelación y se ESPERA de verdad: soltar sin joinear no serviría,
+                // porque el escaneo siguiente limpia el flag y los huérfanos nunca lo verían.
+                // La cancelación es cooperativa y se chequea por bloque de 1 MB, así que salen
+                // rápido. El flag queda en true, pero el próximo escaneo lo resetea al arrancar.
+                SCAN_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+                for h in self.0.drain(..) {
+                    let _ = h.join();
+                }
+            }
+        }
+
         let source_buf = source_path.to_path_buf();
         let sigs_arc: Arc<Vec<FileSignature>> = Arc::new(signatures.to_vec());
 
-        let handles: Vec<_> = segments
-            .into_iter()
-            .map(|segment| {
-                let path = source_buf.clone();
-                let sigs = sigs_arc.clone();
-                std::thread::spawn(move || {
-                    // `&SCAN_PROGRESS_BYTES` y `&SCAN_CANCEL_REQUESTED` son referencias 'static
-                    // (statics globales), así que se pueden usar en cada worker sin clonar ni Arc.
-                    scan_segment(
-                        &path,
-                        &segment,
-                        &sigs,
-                        file_size,
-                        max_header_len,
-                        &SCAN_PROGRESS_BYTES,
-                        None,
-                        &SCAN_CANCEL_REQUESTED,
-                    )
-                })
-            })
-            .collect();
+        let mut workers = WorkersGuard(Vec::with_capacity(segments.len()));
+        for segment in segments {
+            let path = source_buf.clone();
+            let sigs = sigs_arc.clone();
+            workers.0.push(std::thread::spawn(move || {
+                // `&SCAN_PROGRESS_BYTES` y `&SCAN_CANCEL_REQUESTED` son referencias 'static
+                // (statics globales), así que se pueden usar en cada worker sin clonar ni Arc.
+                scan_segment(
+                    &path,
+                    &segment,
+                    &sigs,
+                    file_size,
+                    max_header_len,
+                    &SCAN_PROGRESS_BYTES,
+                    None,
+                    &SCAN_CANCEL_REQUESTED,
+                )
+            }));
+        }
+        // Se sacan del guard para recolectarlos; a partir de acá el guard queda vacío y su Drop
+        // es un no-op.
+        let handles: Vec<_> = workers.0.drain(..).collect();
 
         // Recolectar resultados de todos los hilos. (B1) A propósito NO se aborta ni se
         // descarta nada si un hilo tuvo errores de I/O o incluso panicó: los demás hilos que
