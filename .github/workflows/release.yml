@@ -70,8 +70,55 @@ jobs:
             ${{ matrix.artifact }}
             ${{ matrix.artifact }}.sha256
 
+  # La GUI SOLO se publica en tags de beta (`vX.Y.Z-beta.N`). Mientras el falso positivo de
+  # antivirus no esté resuelto, no sale en el canal estable: el público del canal no debe
+  # toparse con un .exe que Defender manda a cuarentena. En un tag estable este job se saltea
+  # y el release queda igual que siempre (solo CLI).
+  build_gui:
+    if: contains(github.ref_name, 'beta')
+    name: Compilar GUI (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Compilar la GUI
+        run: cargo build --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
+
+      - name: Renombrar binario
+        shell: bash
+        run: cp target/x86_64-pc-windows-gnu/release/recupe_ghost_gui.exe recupe_ghost_gui.exe
+
+      - name: Calcular checksum SHA256
+        shell: bash
+        run: |
+          hash=$(CertUtil -hashfile recupe_ghost_gui.exe SHA256 | sed -n '2p' | tr -d ' \r')
+          echo "$hash  recupe_ghost_gui.exe" > recupe_ghost_gui.exe.sha256
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recupe_ghost_gui.exe
+          path: |
+            recupe_ghost_gui.exe
+            recupe_ghost_gui.exe.sha256
+
   release:
-    needs: build
+    needs: [build, build_gui]
+    # `build_gui` se saltea en tags estables; sin `always()` un `needs` salteado cancelaría el
+    # release entero. Igual se exige que el CLI haya compilado bien y que la GUI, cuando SÍ
+    # corre, no haya fallado: un beta a medias (sin el .exe que se viene a probar) sería peor
+    # que ningún beta.
+    if: >
+      always()
+      && needs.build.result == 'success'
+      && needs.build_gui.result != 'failure'
+      && needs.build_gui.result != 'cancelled'
     runs-on: ubuntu-latest
 
     steps:
@@ -80,18 +127,22 @@ jobs:
         with:
           path: artifacts
 
+      # Se juntan todos los .sha256 que hayan bajado, en vez de listarlos a mano: así la GUI
+      # entra sola en los betas y el archivo no queda incompleto (ni el paso falla) en los
+      # tags estables, donde ese binario no existe.
       - name: Generar SHA256SUMS.txt
-        run: |
-          cat artifacts/recupe_ghost.exe/recupe_ghost.exe.sha256 \
-              artifacts/recupe_ghost-linux/recupe_ghost-linux.sha256 \
-              artifacts/recupe_ghost-macos/recupe_ghost-macos.sha256 \
-              > artifacts/SHA256SUMS.txt
+        run: cat artifacts/*/*.sha256 > artifacts/SHA256SUMS.txt
 
       - name: Subir binarios al Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          # Marca el release como prerelease cuando el tag dice "beta". Esto es lo que evita
+          # que la beta llegue al público estable: la API `releases/latest` que consulta el
+          # updater IGNORA los prereleases, así que un usuario de v0.4.2 no recibe el aviso.
+          prerelease: ${{ contains(github.ref_name, 'beta') }}
           files: |
             artifacts/recupe_ghost.exe/recupe_ghost.exe
             artifacts/recupe_ghost-linux/recupe_ghost-linux
             artifacts/recupe_ghost-macos/recupe_ghost-macos
+            artifacts/recupe_ghost_gui.exe/recupe_ghost_gui.exe
             artifacts/SHA256SUMS.txt
