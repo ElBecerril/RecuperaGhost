@@ -71,6 +71,15 @@ pub fn request_cancel() {
     SCAN_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Si ya se pidió cancelar el escaneo en curso.
+///
+/// La GUI la usa para pasar el botón a "Deteniendo…": la cancelación es cooperativa y puede tardar
+/// (el bloque en curso se termina de leer), así que sin esta señal el botón parece no haber hecho
+/// nada y la persona lo aprieta de nuevo creyendo que se colgó.
+pub fn cancel_requested() -> bool {
+    is_cancel_requested()
+}
+
 fn is_cancel_requested() -> bool {
     SCAN_CANCEL_REQUESTED.load(Ordering::SeqCst)
 }

@@ -43,9 +43,49 @@ pub fn run() -> eframe::Result<()> {
     )
 }
 
+/// Pasos del asistente previo a la búsqueda.
+///
+/// Se separó el formulario único en cuatro pantallas a propósito: el público de esta herramienta
+/// llega asustado y con poca confianza. Una pantalla con todo junto obliga a decidir tres cosas a
+/// la vez sin saber cuántas faltan; de a una, cada pantalla hace UNA pregunta en castellano y la
+/// barra de arriba muestra cuánto queda.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Qué disco o imagen revisar.
+    Source,
+    /// Qué tipos de archivo buscar.
+    Types,
+    /// Dónde guardar lo recuperado.
+    Output,
+    /// Repaso de las tres respuestas antes de una espera que puede durar horas.
+    Summary,
+}
+
+impl Step {
+    /// Los pasos en orden, para dibujar la barra de progreso del asistente.
+    const ALL: [Step; 4] = [Step::Source, Step::Types, Step::Output, Step::Summary];
+
+    fn label(self) -> &'static str {
+        match self {
+            Step::Source => "Disco",
+            Step::Types => "Tipos",
+            Step::Output => "Guardar",
+            Step::Summary => "Buscar",
+        }
+    }
+
+    fn index(self) -> usize {
+        Step::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+
+    fn prev(self) -> Option<Step> {
+        Step::ALL.get(self.index().checked_sub(1)?).copied()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    Setup,
+    Setup(Step),
     Scanning,
     Results,
     Recovering,
@@ -104,7 +144,7 @@ impl RecupeGhostApp {
             output_dir: default_output_name(),
             pending_warning: None,
             same_device_accepted: None,
-            phase: Phase::Setup,
+            phase: Phase::Setup(Step::Source),
             source: None,
             scan_total: 0,
             scan_rx: None,
@@ -137,6 +177,22 @@ impl RecupeGhostApp {
                         .to_string(),
                     PendingAction::Scan,
                 ));
+            }
+            // Pasos del asistente: para poder mirarlos sin tener que clickear.
+            Ok("types") => self.phase = Phase::Setup(Step::Types),
+            Ok("output") => self.phase = Phase::Setup(Step::Output),
+            Ok("summary") => self.phase = Phase::Setup(Step::Summary),
+            // Escaneo de verdad sobre una imagen de prueba. Un archivo .img NO es un dispositivo
+            // físico, así que `same_device_warning` devuelve None y no se cruza el diálogo.
+            Ok("scanning") => {
+                if let Ok(img) = std::env::var("RECUPEGHOST_GUI_DEMO_IMG") {
+                    self.manual_path = img;
+                    self.output_dir = std::env::temp_dir()
+                        .join("recupeghost_demo")
+                        .display()
+                        .to_string();
+                    self.start_scan();
+                }
             }
             Ok("done") => {
                 self.recovery_result = Some(RecoveryResult {
@@ -291,7 +347,7 @@ impl RecupeGhostApp {
         let out = self.output_path();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(recovery::recover_files(&source, &files, &out));
+            let _ = tx.send(recovery::recover_files_quiet(&source, &files, &out));
         });
         self.recovery_rx = Some(rx);
         self.phase = Phase::Recovering;
@@ -347,115 +403,439 @@ impl RecupeGhostApp {
 
     // ── Pantallas ──
 
-    fn ui_setup(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
-
-        // Si hay un escaneo hecho, ofrecer volver a sus resultados. Sin esto, alguien que llega
-        // acá desde la advertencia de mismo-disco para CORREGIR la carpeta perdía un escaneo que
-        // pudo durar horas — o sea, elegir la opción segura salía más caro que aceptar el riesgo.
-        // Un diálogo de protección de datos no puede tener los incentivos al revés.
-        if self.scan_result.is_some() {
-            ui.horizontal(|ui| {
-                if ui.button("↩ Volver a los resultados del escaneo").clicked() {
-                    self.phase = Phase::Results;
-                }
-                ui.label(
-                    egui::RichText::new("(no hace falta escanear de nuevo)")
-                        .size(12.0)
-                        .weak(),
-                );
-            });
-            ui.separator();
-        }
-
-        theme::section_title(ui, "1. ¿Qué disco o imagen querés recuperar?");
+    /// Barra de pasos del asistente. Responde sin que haya que preguntar "¿cuánto falta?", que es
+    /// la duda que hace abandonar a alguien que ya está nervioso.
+    fn ui_stepper(&self, ui: &mut egui::Ui, current: Step) {
         ui.horizontal(|ui| {
-            if ui.button("🔄 Actualizar discos").clicked() {
-                self.drives = drives::list_drives();
-                if self.selected_drive >= self.drives.len() {
-                    self.selected_drive = 0;
+            for (i, step) in Step::ALL.iter().enumerate() {
+                if i > 0 {
+                    ui.label(egui::RichText::new("—").color(theme::BORDER));
+                }
+                let done = step.index() < current.index();
+                let activo = *step == current;
+                // El punto se DIBUJA en vez de escribirse con un carácter: "●" no existe en
+                // Atkinson Hyperlegible y salía como un cuadrito de "glifo faltante".
+                let color = if done {
+                    theme::OK
+                } else if activo {
+                    theme::BRAND
+                } else {
+                    theme::NEUTRAL
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(11.0, 11.0), egui::Sense::hover());
+                if done || activo {
+                    ui.painter().circle_filled(rect.center(), 5.0, color);
+                } else {
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        4.5,
+                        egui::Stroke::new(1.5_f32, color),
+                    );
+                }
+                let texto = egui::RichText::new(step.label()).size(13.0);
+                ui.label(if activo {
+                    texto.color(theme::BRAND).strong()
+                } else if done {
+                    texto.color(theme::TEXT_WEAK)
+                } else {
+                    texto.color(theme::NEUTRAL)
+                });
+            }
+        });
+    }
+
+    /// Pie de navegación común: "Volver" a la izquierda y la acción principal a la derecha.
+    ///
+    /// `bloqueo` es el motivo por el que no se puede avanzar, si lo hay. Se muestra **al lado del
+    /// botón deshabilitado** en vez de dejar apretar y mandar a una pantalla de error roja: para
+    /// alguien no técnico, un ❌ después de un clic se lee como "rompí algo", cuando lo único que
+    /// pasó es que falta un dato.
+    fn ui_nav(
+        &mut self,
+        ui: &mut egui::Ui,
+        actual: Step,
+        etiqueta: &str,
+        bloqueo: Option<&str>,
+    ) -> bool {
+        let mut avanzar = false;
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            if let Some(anterior) = actual.prev() {
+                if ui.button("↩  Volver").clicked() {
+                    self.phase = Phase::Setup(anterior);
                 }
             }
-            ui.label(egui::RichText::new("(elegí uno de la lista)").weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let habilitado = bloqueo.is_none();
+                if ui
+                    .add_enabled(habilitado, theme::primary_button(etiqueta))
+                    .clicked()
+                {
+                    avanzar = true;
+                }
+                if let Some(motivo) = bloqueo {
+                    ui.label(egui::RichText::new(motivo).color(theme::WARN).size(13.0));
+                }
+            });
         });
-        if self.drives.is_empty() {
-            ui.label(
-                egui::RichText::new(
-                    "No se detectaron discos. Probá 'Actualizar' o usá una ruta manual abajo.",
-                )
-                .weak(),
-            );
+        avanzar
+    }
+
+    /// Atajo para volver a unos resultados que ya costaron horas de escaneo.
+    ///
+    /// Sin esto, alguien que llega al asistente desde la advertencia de mismo-disco para CORREGIR
+    /// la carpeta perdía el escaneo — o sea, elegir la opción segura salía más caro que aceptar el
+    /// riesgo. Un diálogo de protección de datos no puede tener los incentivos al revés.
+    fn ui_volver_a_resultados(&mut self, ui: &mut egui::Ui) {
+        if self.scan_result.is_none() {
+            return;
         }
+        ui.horizontal(|ui| {
+            if ui
+                .button("↩  Volver a los resultados del escaneo")
+                .clicked()
+            {
+                self.phase = Phase::Results;
+            }
+            ui.label(
+                egui::RichText::new("(no hace falta buscar de nuevo)")
+                    .size(13.0)
+                    .color(theme::TEXT_WEAK),
+            );
+        });
+        ui.add_space(6.0);
+    }
+
+    fn ui_step_source(&mut self, ui: &mut egui::Ui) {
+        self.ui_volver_a_resultados(ui);
+        theme::section_title(ui, "¿Dónde estaban tus archivos?");
+        ui.label(
+            egui::RichText::new("Elegí el disco o la memoria que querés revisar.")
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(10.0);
+
+        if self.drives.is_empty() {
+            theme::notice(
+                ui,
+                theme::WARN,
+                theme::WARN_BG,
+                "No se detectó ningún disco. Si el programa no se abrió como administrador, \
+                 Windows no lo deja verlos. Probá 'Buscar de nuevo', o usá las opciones avanzadas \
+                 para abrir un archivo de imagen.",
+            );
+            ui.add_space(8.0);
+        }
+
         egui::ScrollArea::vertical()
             .id_salt("drives_list")
-            .max_height(120.0)
+            .max_height(190.0)
             .show(ui, |ui| {
                 for (i, d) in self.drives.iter().enumerate() {
+                    let elegido = self.selected_drive == i;
                     if ui
-                        .selectable_label(self.selected_drive == i, drive_label(d))
+                        .selectable_label(elegido, drive_label(d))
+                        .on_hover_text(d.path.clone())
                         .clicked()
                     {
                         self.selected_drive = i;
                     }
                 }
             });
-        ui.horizontal(|ui| {
-            ui.label("o ruta manual:");
-            ui.text_edit_singleline(&mut self.manual_path);
-        });
-        ui.label(
-            egui::RichText::new(
-                "Dejá la ruta manual vacía para usar el disco de arriba, o poné un archivo de imagen (.img/.dd/.raw).",
-            )
-            .weak(),
-        );
 
-        ui.add_space(12.0);
-        theme::section_title(ui, "2. ¿Qué buscar?");
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.cats[0], "📷 Fotos");
-            ui.checkbox(&mut self.cats[1], "🎬 Videos");
-            ui.checkbox(&mut self.cats[2], "🎵 Audio");
-            ui.checkbox(&mut self.cats[3], "📄 Documentos");
+            if ui.button("🔄  Buscar discos de nuevo").clicked() {
+                self.drives = drives::list_drives();
+                self.selected_drive = self
+                    .drives
+                    .iter()
+                    .position(|d| d.is_removable)
+                    .unwrap_or(0)
+                    .min(self.drives.len().saturating_sub(1));
+            }
         });
 
-        ui.add_space(12.0);
-        theme::section_title(ui, "3. ¿Dónde guardo lo recuperado?");
-        ui.text_edit_singleline(&mut self.output_dir);
+        ui.add_space(8.0);
+        // La ruta manual se esconde detrás de "opciones avanzadas". Cuando estaba siempre visible
+        // PISABA EN SILENCIO al disco elegido en la lista: alguien clickeaba su USB, quedaba texto
+        // viejo en el campo, y se escaneaba otra cosa sin ningún aviso.
+        egui::CollapsingHeader::new("Opciones avanzadas: usar un archivo de imagen (.img)")
+            .id_salt("avanzadas_origen")
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Solo si ya tenés una copia del disco en un archivo. Si escribís algo acá, \
+                         se usa esto en lugar del disco elegido arriba.",
+                    )
+                    .size(13.0)
+                    .color(theme::TEXT_WEAK),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.manual_path);
+                    if ui.button("Buscar archivo…").clicked() {
+                        if let Some(f) = rfd::FileDialog::new()
+                            .set_title("Elegí el archivo de imagen del disco")
+                            .add_filter("Imagen de disco", &["img", "dd", "raw", "iso"])
+                            .pick_file()
+                        {
+                            self.manual_path = f.display().to_string();
+                        }
+                    }
+                });
+            });
+
+        // Si el usuario eligió una imagen a mano, se dice explícitamente cuál gana. Nunca en
+        // silencio.
+        if !self.manual_path.trim().is_empty() {
+            ui.add_space(6.0);
+            theme::notice(
+                ui,
+                theme::WARN,
+                theme::WARN_BG,
+                "Se va a revisar el archivo de imagen que escribiste en opciones avanzadas, no el \
+                 disco de la lista. Vaciá ese campo para volver a usar el disco.",
+            );
+        }
+
+        let bloqueo = if self.resolve_source().is_none() {
+            Some("Elegí un disco o un archivo de imagen")
+        } else {
+            None
+        };
+        if self.ui_nav(ui, Step::Source, "Continuar", bloqueo) {
+            self.phase = Phase::Setup(Step::Types);
+        }
+    }
+
+    fn ui_step_types(&mut self, ui: &mut egui::Ui) {
+        theme::section_title(ui, "¿Qué querés recuperar?");
         ui.label(
-            egui::RichText::new("⚠ Guardá en un disco DISTINTO al que estás recuperando.")
-                .color(theme::WARN),
+            egui::RichText::new("Si no estás seguro, dejá todo marcado.").color(theme::TEXT_WEAK),
+        );
+        ui.add_space(12.0);
+
+        // Casillas con el ejemplo de extensiones al lado: alguien que busca "las fotos del
+        // celular" no tiene por qué saber que eso es un JPG.
+        const TIPOS: [(&str, &str); 4] = [
+            ("📷  Fotos", "JPG, PNG, HEIC, RAW de cámara…"),
+            ("🎬  Videos", "MP4, MOV, AVI, MKV…"),
+            ("🎵  Audio", "MP3, WAV, FLAC, M4A…"),
+            ("📄  Documentos", "PDF"),
+        ];
+        for (i, (nombre, ejemplos)) in TIPOS.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.cats[i], *nombre);
+                ui.label(
+                    egui::RichText::new(*ejemplos)
+                        .size(13.0)
+                        .color(theme::TEXT_WEAK),
+                );
+            });
+            ui.add_space(6.0);
+        }
+
+        let bloqueo = if self.selected_categories().is_empty() {
+            Some("Marcá al menos un tipo")
+        } else {
+            None
+        };
+        if self.ui_nav(ui, Step::Types, "Continuar", bloqueo) {
+            self.phase = Phase::Setup(Step::Output);
+        }
+    }
+
+    fn ui_step_output(&mut self, ui: &mut egui::Ui) {
+        self.ui_volver_a_resultados(ui);
+        theme::section_title(ui, "¿Dónde guardamos lo que encontremos?");
+        ui.label(
+            egui::RichText::new("Se va a crear una carpeta nueva acá:").color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+
+        // La RUTA ABSOLUTA, siempre. El campo mostraba solo "RecupeGhost_20260720_153012", que es
+        // relativo al directorio desde donde se abrió el programa: nadie podía saber dónde iba a
+        // caer eso. El CLI ya había aprendido esta lección.
+        let destino = self.output_path();
+        ui.label(
+            egui::RichText::new(destino.display().to_string())
+                .font(egui::FontId::monospace(14.0))
+                .color(theme::TEXT),
+        );
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("📁  Elegir carpeta…").clicked() {
+                // Diálogo nativo del sistema: es el que esta gente ya sabe usar. Tipear rutas a
+                // mano era lo peor de los dos mundos en una interfaz gráfica.
+                let inicio = destino
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."));
+                if let Some(carpeta) = rfd::FileDialog::new()
+                    .set_title("Elegí dónde guardar los archivos recuperados")
+                    .set_directory(inicio)
+                    .pick_folder()
+                {
+                    self.output_dir = carpeta.display().to_string();
+                }
+            }
+            ui.label(
+                egui::RichText::new("o escribila a mano:")
+                    .size(13.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.text_edit_singleline(&mut self.output_dir);
+        });
+
+        ui.add_space(12.0);
+        theme::notice(
+            ui,
+            theme::WARN,
+            theme::WARN_BG,
+            "Guardá en un disco DISTINTO del que estás revisando. Si guardás en la misma memoria, \
+             podés borrar para siempre lo que estás tratando de recuperar.",
         );
 
-        ui.add_space(18.0);
-        if ui.add(theme::primary_button("🔍  Escanear")).clicked() {
+        let vacio = self.output_dir.trim().is_empty();
+        let es_dispositivo = !vacio && util::is_physical_device(&self.output_path());
+        let bloqueo = if vacio {
+            Some("Elegí una carpeta")
+        } else if es_dispositivo {
+            // Misma protección crítica que el CLI: escribir sobre la ruta de un dispositivo con
+            // permisos de administrador sobrescribiría el disco entero.
+            Some("Eso es un disco, no una carpeta")
+        } else {
+            None
+        };
+        if self.ui_nav(ui, Step::Output, "Continuar", bloqueo) {
+            self.phase = Phase::Setup(Step::Summary);
+        }
+    }
+
+    fn ui_step_summary(&mut self, ui: &mut egui::Ui) {
+        theme::section_title(ui, "Todo listo. Revisá antes de empezar:");
+        ui.add_space(10.0);
+
+        let origen = match self.resolve_source() {
+            Some(s) => self
+                .drives
+                .iter()
+                .find(|d| self.manual_path.trim().is_empty() && std::path::Path::new(&d.path) == s)
+                .map(|d| d.display_name.clone())
+                .unwrap_or_else(|| s.display().to_string()),
+            None => "(sin elegir)".to_string(),
+        };
+        let tipos: Vec<&str> = [
+            (self.cats[0], "fotos"),
+            (self.cats[1], "videos"),
+            (self.cats[2], "audio"),
+            (self.cats[3], "documentos"),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, n)| *n)
+        .collect();
+
+        for (rotulo, valor) in [
+            ("Buscar en", origen),
+            ("Qué buscar", tipos.join(", ")),
+            ("Guardar en", self.output_path().display().to_string()),
+        ] {
+            ui.label(
+                egui::RichText::new(rotulo)
+                    .size(13.0)
+                    .color(theme::TEXT_WEAK),
+            );
+            ui.label(egui::RichText::new(valor).color(theme::TEXT));
+            ui.add_space(8.0);
+        }
+
+        ui.add_space(4.0);
+        // El aviso de los nombres perdidos va ACÁ, que es la última pantalla que se lee con calma
+        // antes de una espera larga. Estaba en gris chico debajo del botón de recuperar: o sea, se
+        // leía después de haber clickeado, o nunca. Y se explica que es una propiedad del borrado,
+        // no un defecto del programa, para desactivar el "este programa me rompió los nombres".
+        theme::notice(
+            ui,
+            theme::TEXT_WEAK,
+            theme::GROUND,
+            "La búsqueda puede tardar desde unos minutos hasta más de una hora, según el tamaño \
+             del disco. Podés dejar la computadora trabajando.\n\nLos archivos recuperados van a \
+             tener nombres nuevos (recovered_0001.jpg). El nombre original se pierde cuando un \
+             archivo se borra: es normal y no afecta al contenido.",
+        );
+
+        if self.ui_nav(ui, Step::Summary, "🔍  Empezar la búsqueda", None) {
             self.start_scan();
         }
     }
 
     fn ui_scanning(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(24.0);
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Escaneando… esto puede tardar según el tamaño del disco.");
-        });
-        ui.add_space(8.0);
+        ui.add_space(20.0);
+        theme::section_title(ui, "Buscando tus archivos…");
+        ui.label(
+            egui::RichText::new("Esto puede tardar. No desconectes la memoria.")
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(14.0);
+
         let done = scanner::scan_progress_bytes();
         let frac = if self.scan_total > 0 {
             (done as f32 / self.scan_total as f32).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        ui.add(egui::ProgressBar::new(frac).show_percentage());
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .show_percentage()
+                .desired_height(24.0),
+        );
         if self.scan_total > 0 {
-            ui.label(format!(
-                "{} de {}",
-                format_size(done.min(self.scan_total)),
-                format_size(self.scan_total)
-            ));
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} de {} revisados",
+                    format_size(done.min(self.scan_total)),
+                    format_size(self.scan_total)
+                ))
+                .color(theme::TEXT_WEAK),
+            );
         }
+
+        // El contador vivo de hallazgos es el ansiolítico de esta pantalla: durante una espera que
+        // puede durar horas es la única señal de que algo bueno está pasando. Sin él, la barra
+        // avanzando sola no dice si se está encontrando algo o si el disco está vacío.
         ui.add_space(12.0);
-        if ui.button("⏹ Cancelar").clicked() {
+        let encontrados = scanner::scan_progress_files();
+        ui.label(
+            egui::RichText::new(format!("Encontrados hasta ahora: {encontrados}"))
+                .font(egui::FontId::new(17.0, theme::bold_family()))
+                .color(if encontrados > 0 {
+                    theme::OK
+                } else {
+                    theme::TEXT
+                }),
+        );
+        ui.label(
+            egui::RichText::new("Podés usar la computadora normalmente mientras tanto.")
+                .size(13.0)
+                .color(theme::TEXT_WEAK),
+        );
+
+        ui.add_space(18.0);
+        // "Detener y ver lo encontrado", no "Cancelar". Para alguien asustado "cancelar" suena a
+        // perder todo, cuando el motor en realidad conserva lo hallado: el texto del botón hace el
+        // trabajo de una explicación. Y como la cancelación es cooperativa y tarda, el botón pasa
+        // a "Deteniendo…" deshabilitado — si no, parece que el clic no hizo nada y se vuelve a
+        // apretar pensando que se colgó.
+        let deteniendo = scanner::cancel_requested();
+        if deteniendo {
+            ui.add_enabled(false, egui::Button::new("Deteniendo…"));
+        } else if ui.button("⏹  Detener y ver lo encontrado").clicked() {
             scanner::request_cancel();
         }
         ui.ctx().request_repaint();
@@ -519,7 +899,7 @@ impl RecupeGhostApp {
                 );
             }
             if ui.button("↩ Volver").clicked() {
-                self.phase = Phase::Setup;
+                self.phase = Phase::Setup(Step::Source);
                 self.scan_result = None;
             }
             return;
@@ -552,7 +932,7 @@ impl RecupeGhostApp {
                 self.start_recovery();
             }
             if ui.button("↩ Volver").clicked() {
-                self.phase = Phase::Setup;
+                self.phase = Phase::Setup(Step::Source);
                 self.scan_result = None;
             }
         });
@@ -565,11 +945,53 @@ impl RecupeGhostApp {
     }
 
     fn ui_recovering(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(24.0);
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Recuperando y guardando los archivos…");
-        });
+        ui.add_space(20.0);
+        theme::section_title(ui, "Guardando tus archivos…");
+        ui.label(
+            egui::RichText::new("No cierres el programa ni desconectes la memoria.")
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(14.0);
+
+        // Progreso real, no un spinner indefinido. Recuperar miles de archivos también puede
+        // tardar, y una animación que gira sin decir nada no distingue "trabajando" de "colgado".
+        let total = self
+            .scan_result
+            .as_ref()
+            .map(|r| r.found_files.len() as u64)
+            .unwrap_or(0);
+        let hechos = recovery::recovery_progress_files();
+        let frac = if total > 0 {
+            (hechos as f32 / total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .show_percentage()
+                .desired_height(24.0),
+        );
+        if total > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} de {} archivos  ·  {} guardados",
+                    hechos.min(total),
+                    total,
+                    format_size(recovery::recovery_progress_bytes())
+                ))
+                .color(theme::TEXT_WEAK),
+            );
+        }
+
+        ui.add_space(18.0);
+        // Se puede detener, y lo ya guardado sirve: son archivos completos en disco, no un estado
+        // a medias que haya que descartar.
+        let deteniendo = recovery::cancel_requested();
+        if deteniendo {
+            ui.add_enabled(false, egui::Button::new("Deteniendo…"));
+        } else if ui.button("⏹  Detener y quedarme con lo guardado").clicked() {
+            recovery::request_cancel();
+        }
         ui.ctx().request_repaint();
     }
 
@@ -625,7 +1047,7 @@ impl RecupeGhostApp {
         );
         ui.add_space(12.0);
         if ui.button("↩ Volver al inicio").clicked() {
-            self.phase = Phase::Setup;
+            self.phase = Phase::Setup(Step::Source);
             self.scan_result = None;
             self.recovery_result = None;
         }
@@ -686,7 +1108,7 @@ impl RecupeGhostApp {
         }
         ui.add_space(12.0);
         if ui.button("↩ Volver").clicked() {
-            self.phase = Phase::Setup;
+            self.phase = Phase::Setup(Step::Source);
         }
     }
 }
@@ -710,7 +1132,16 @@ impl eframe::App for RecupeGhostApp {
             ui.label("Recuperá fotos, videos, audios y documentos borrados.");
             ui.separator();
             match self.phase {
-                Phase::Setup => self.ui_setup(ui),
+                Phase::Setup(step) => {
+                    self.ui_stepper(ui, step);
+                    ui.add_space(10.0);
+                    match step {
+                        Step::Source => self.ui_step_source(ui),
+                        Step::Types => self.ui_step_types(ui),
+                        Step::Output => self.ui_step_output(ui),
+                        Step::Summary => self.ui_step_summary(ui),
+                    }
+                }
                 Phase::Scanning => self.ui_scanning(ui),
                 Phase::Results => self.ui_results(ui),
                 Phase::Recovering => self.ui_recovering(ui),
@@ -795,20 +1226,25 @@ impl RecupeGhostApp {
                 // Si venía de recuperar, `scan_result` se conserva y `ui_setup` ofrece volver a
                 // los resultados: corregir la carpeta no cuesta re-escanear.
                 self.pending_warning = None;
-                self.phase = Phase::Setup;
+                self.phase = Phase::Setup(Step::Output);
             }
             None => {}
         }
     }
 }
 
+/// Etiqueta de un disco para la lista de elección.
+///
+/// `display_name` ya viene armado por `drives` con lo que le sirve al usuario (en Windows arranca
+/// con la letra de unidad: `D: - Kingston DataTraveler (14.5 GB)`). Acá solo se le agrega la marca
+/// de extraíble, que es el dato que de verdad ayuda a reconocer "este es mi USB". La ruta cruda
+/// del dispositivo queda en el tooltip: no le dice nada al público objetivo y encima asusta.
 fn drive_label(d: &DriveInfo) -> String {
-    format!(
-        "{}  ·  {}  ({})",
-        d.display_name,
-        d.path,
-        format_size(d.size_bytes)
-    )
+    if d.is_removable {
+        format!("{}  ·  Extraíble", d.display_name)
+    } else {
+        d.display_name.clone()
+    }
 }
 
 /// Abre la carpeta de resultados en el explorador de archivos del sistema. Best-effort: si el

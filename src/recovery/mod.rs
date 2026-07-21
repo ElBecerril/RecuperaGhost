@@ -44,6 +44,14 @@ pub fn request_cancel() {
     RECOVERY_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Si ya se pidió cancelar la recuperación en curso.
+///
+/// La GUI la usa para pasar el botón a "Deteniendo…": la cancelación es cooperativa y el archivo
+/// en curso se termina de procesar, así que sin esta señal el botón parece no haber hecho nada.
+pub fn cancel_requested() -> bool {
+    RECOVERY_CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
+
 /// Archivos ya procesados (recuperados + truncados + fallidos) en la recuperación en curso.
 /// El total contra el que se compara es `files.len()`, que la GUI ya tiene en la mano.
 pub fn recovery_progress_files() -> u64 {

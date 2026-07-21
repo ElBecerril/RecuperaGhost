@@ -21,9 +21,18 @@ ctrlc = "3.4"
 # GUI: opcional, detrás del feature `gui`. Así el binario CLI NO arrastra las librerías gráficas
 # (más chico, y menos superficie nueva para el antivirus). La GUI se compila con --features gui.
 eframe = { version = "0.29", optional = true }
+# Diálogos nativos de "elegir carpeta". Tipear rutas a mano es lo peor de los dos mundos en una
+# interfaz gráfica: el público de esta herramienta no sabe qué escribir ni dónde va a caer.
+#
+# En WINDOWS (el target que se distribuye) su única dependencia es `windows-sys`, que eframe/winit
+# ya arrastran: llama a IFileDialog, la misma API COM que usa cualquier programa de Windows. O sea
+# que no agrega superficie nueva para el antivirus. En Linux se elige el backend `gtk3`, que enlaza
+# las librerías del sistema, en vez del default `xdg-portal`, que arrastraría tokio y zbus enteros
+# solo para el entorno de desarrollo.
+rfd = { version = "0.15", default-features = false, features = ["gtk3"], optional = true }
 
 [features]
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:rfd"]
 
 [[bin]]
 name = "recupe_ghost"
