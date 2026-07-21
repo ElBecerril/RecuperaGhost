@@ -225,6 +225,11 @@ Las contribuciones son bienvenidas. Consulta [CONTRIBUTING.md](CONTRIBUTING.md) 
 
 Este proyecto esta licenciado bajo la **GNU General Public License v3.0**. Consulta el archivo [LICENSE](LICENSE) para los detalles completos.
 
+La interfaz grafica usa la tipografia **Atkinson Hyperlegible**, disenada por el Braille Institute
+of America para mejorar la legibilidad en personas con baja vision. Copyright 2020 Braille
+Institute of America, Inc., distribuida bajo la **SIL Open Font License 1.1**
+([assets/fonts/OFL.txt](assets/fonts/OFL.txt)).
+
 ## Autor
 
 **El_Becerril** - [YouTube](https://www.youtube.com/@el_becerril)

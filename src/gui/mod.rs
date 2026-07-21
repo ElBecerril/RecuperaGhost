@@ -129,13 +129,27 @@ impl RecupeGhostApp {
     /// `RECUPEGHOST_GUI_DEMO=same_device cargo run --features gui --bin recupe_ghost_gui`
     #[cfg(debug_assertions)]
     fn apply_demo_state(&mut self) {
-        if std::env::var("RECUPEGHOST_GUI_DEMO").as_deref() == Ok("same_device") {
-            self.pending_warning = Some((
-                "Vas a guardar los archivos recuperados en el MISMO disco del que los estás \
-                 recuperando."
-                    .to_string(),
-                PendingAction::Scan,
-            ));
+        match std::env::var("RECUPEGHOST_GUI_DEMO").as_deref() {
+            Ok("same_device") => {
+                self.pending_warning = Some((
+                    "Vas a guardar los archivos recuperados en el MISMO disco del que los estás \
+                     recuperando."
+                        .to_string(),
+                    PendingAction::Scan,
+                ));
+            }
+            Ok("done") => {
+                self.recovery_result = Some(RecoveryResult {
+                    recovered: 214,
+                    truncated: 0,
+                    failed: 0,
+                    total_bytes: 1_476_395_008,
+                    output_dir: self.output_path(),
+                    errors: Vec::new(),
+                });
+                self.phase = Phase::Done;
+            }
+            _ => {}
         }
     }
 
@@ -353,7 +367,7 @@ impl RecupeGhostApp {
             ui.separator();
         }
 
-        ui.strong("1. ¿Qué disco o imagen querés recuperar?");
+        theme::section_title(ui, "1. ¿Qué disco o imagen querés recuperar?");
         ui.horizontal(|ui| {
             if ui.button("🔄 Actualizar discos").clicked() {
                 self.drives = drives::list_drives();
@@ -396,7 +410,7 @@ impl RecupeGhostApp {
         );
 
         ui.add_space(12.0);
-        ui.strong("2. ¿Qué buscar?");
+        theme::section_title(ui, "2. ¿Qué buscar?");
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.cats[0], "📷 Fotos");
             ui.checkbox(&mut self.cats[1], "🎬 Videos");
@@ -405,7 +419,7 @@ impl RecupeGhostApp {
         });
 
         ui.add_space(12.0);
-        ui.strong("3. ¿Dónde guardo lo recuperado?");
+        theme::section_title(ui, "3. ¿Dónde guardo lo recuperado?");
         ui.text_edit_singleline(&mut self.output_dir);
         ui.label(
             egui::RichText::new("⚠ Guardá en un disco DISTINTO al que estás recuperando.")
@@ -490,7 +504,7 @@ impl RecupeGhostApp {
             ui.add_space(4.0);
         }
 
-        ui.strong(format!("Se encontraron {count} archivos."));
+        theme::section_title(ui, format!("Se encontraron {count} archivos."));
         if count == 0 {
             if cancelled {
                 ui.label(
@@ -569,15 +583,21 @@ impl RecupeGhostApp {
         // El titular no puede decir "¡Listo!" a secas si algo quedó a medias: eso es mentir por
         // omisión justo cuando el usuario decide si sigue buscando o da el tema por cerrado.
         if incomplete > 0 {
-            ui.strong(format!(
-                "Se recuperaron {recovered} archivos, y {incomplete} quedaron incompletos."
-            ));
+            theme::section_title(
+                ui,
+                format!(
+                    "Se recuperaron {recovered} archivos, y {incomplete} quedaron incompletos."
+                ),
+            );
             ui.label(
                 "Los incompletos también están en la carpeta, por si sirven en parte. Suele pasar \
                  cuando el disco tiene zonas dañadas.",
             );
         } else {
-            ui.strong(format!("✅ ¡Listo! Se recuperaron {recovered} archivos."));
+            theme::section_title(
+                ui,
+                format!("✅ ¡Listo! Se recuperaron {recovered} archivos."),
+            );
         }
         ui.add_space(6.0);
         ui.label(summary);
@@ -586,11 +606,9 @@ impl RecupeGhostApp {
         // Abrir la carpeta es lo que el usuario quiere hacer a continuación, siempre. Sin esto
         // se le entrega una ruta en texto plano y mucha gente no la encuentra.
         if ui
-            .button(
-                egui::RichText::new("📂 Abrir la carpeta con mis archivos")
-                    .size(16.0)
-                    .strong(),
-            )
+            .add(theme::primary_button(
+                "📂  Abrir la carpeta con mis archivos",
+            ))
             .clicked()
         {
             open_folder(&out);
@@ -610,6 +628,43 @@ impl RecupeGhostApp {
             self.scan_result = None;
             self.recovery_result = None;
         }
+
+        self.ui_apoyo(ui);
+    }
+
+    /// Bloque de apoyo al canal. El CLI ya lo tenía en `ui::show_goodbye()` y la GUI no lo tenía
+    /// en ninguna parte.
+    ///
+    /// Va **solo acá**, en la pantalla final: es el único momento en que la herramienta ya cumplió
+    /// lo que prometió, así que es el único momento en que pedir algo no le estorba a alguien que
+    /// todavía está tratando de rescatar sus fotos. Y no interrumpe: son dos enlaces al pie, no un
+    /// diálogo. Un pedido de apoyo nunca puede competir por atención con una advertencia.
+    fn ui_apoyo(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new("👻 ¿Te sirvió RecupeGhost?")
+                .font(egui::FontId::new(17.0, theme::bold_family()))
+                .color(theme::TEXT),
+        );
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(
+                "Es gratis y de código abierto. Si te ayudó a recuperar tus archivos, la mejor \
+                 forma de apoyar es ver los videos del canal.",
+            )
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("🎬  YouTube  ·  @el_becerril").clicked() {
+                crate::ui::open_url("https://www.youtube.com/@el_becerril");
+            }
+            if ui.button("📘  Facebook  ·  El Becerril").clicked() {
+                crate::ui::open_url("https://www.facebook.com/ElBecerril");
+            }
+        });
     }
 
     fn ui_error(&mut self, ui: &mut egui::Ui) {

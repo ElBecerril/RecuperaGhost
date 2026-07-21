@@ -50,8 +50,62 @@ pub const NEUTRAL: Color32 = Color32::from_rgb(0x66, 0x70, 0x85);
 /// Alto mínimo del botón de la acción principal de cada pantalla.
 pub const PRIMARY_BUTTON_HEIGHT: f32 = 48.0;
 
+/// Nombre de la familia en negrita, para títulos. egui no deriva negritas solas: `ui.strong()`
+/// solo cambia el color, así que la única forma de tener trazo grueso es registrar la variante
+/// Bold como una familia aparte y pedirla explícitamente.
+const BOLD: &str = "bold";
+
+/// Embebe Atkinson Hyperlegible como fuente de la interfaz.
+///
+/// La que trae egui por defecto es Ubuntu-Light: chica **y** de trazo fino, la peor combinación
+/// para el público de esta herramienta. Atkinson Hyperlegible está diseñada por el Braille
+/// Institute justamente para baja visión: diferencia las formas que se confunden entre sí
+/// (I/l/1, O/0, b/d), que es donde se pierde alguien leyendo una ruta o un nombre de archivo.
+///
+/// Licencia SIL Open Font License 1.1 (`assets/fonts/OFL.txt`), compatible con distribuir el
+/// binario. Son ~110 KB sobre un `.exe` de 18 MB.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "atkinson".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/AtkinsonHyperlegible-Regular.ttf"
+        )),
+    );
+    fonts.font_data.insert(
+        "atkinson_bold".to_owned(),
+        egui::FontData::from_static(include_bytes!(
+            "../../assets/fonts/AtkinsonHyperlegible-Bold.ttf"
+        )),
+    );
+
+    // OJO: se INSERTA al principio, no se reemplaza la lista. Detrás de Atkinson quedan las
+    // fuentes de respaldo de egui, que son las que dibujan los emoji (📷 🎬 ⚠ 👻) y símbolos
+    // sueltos. Pisar la lista entera los rompe todos.
+    let proportional = fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .clone();
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "atkinson".to_owned());
+
+    // La familia en negrita: la Bold adelante y los MISMOS respaldos detrás, para que un título
+    // con un emoji no quede con un hueco.
+    let mut bold = vec!["atkinson_bold".to_owned()];
+    bold.extend(proportional);
+    fonts.families.insert(FontFamily::Name(BOLD.into()), bold);
+
+    ctx.set_fonts(fonts);
+}
+
 /// Aplica el sistema visual completo. Se llama una vez, desde el `CreationContext`.
 pub fn apply(ctx: &egui::Context) {
+    install_fonts(ctx);
     let mut style = (*ctx.style()).clone();
 
     // Escala tipográfica. El default de egui es 12.5 para casi todo, que a un metro de distancia
@@ -66,10 +120,7 @@ pub fn apply(ctx: &egui::Context) {
             TextStyle::Button,
             FontId::new(17.0, FontFamily::Proportional),
         ),
-        (
-            TextStyle::Heading,
-            FontId::new(26.0, FontFamily::Proportional),
-        ),
+        (TextStyle::Heading, FontId::new(26.0, bold_family())),
         (
             TextStyle::Monospace,
             FontId::new(14.0, FontFamily::Monospace),
@@ -145,6 +196,23 @@ pub fn apply(ctx: &egui::Context) {
 
     style.visuals = v;
     ctx.set_style(style);
+}
+
+/// La familia en negrita, para pedirla en un `FontId`.
+pub fn bold_family() -> FontFamily {
+    FontFamily::Name(BOLD.into())
+}
+
+/// Título de una sección o de una pantalla: negrita de verdad, no solo un color más oscuro.
+///
+/// Reemplaza a `ui.strong()` en los títulos. `strong()` en egui únicamente cambia el color del
+/// texto, así que un título quedaba del mismo grosor que el párrafo de al lado.
+pub fn section_title(ui: &mut egui::Ui, text: impl Into<String>) {
+    ui.label(
+        egui::RichText::new(text.into())
+            .font(FontId::new(17.0, bold_family()))
+            .color(TEXT),
+    );
 }
 
 /// Panel de aviso: fondo tenue, borde del mismo color y el texto adentro.

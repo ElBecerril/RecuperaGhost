@@ -1288,8 +1288,9 @@ pub fn show_goodbye() {
     println!();
 }
 
-/// Abre una URL en el navegador predeterminado
-fn open_url(url: &str) {
+/// Abre una URL en el navegador predeterminado. `pub(crate)` porque la GUI la reusa para los
+/// enlaces a las redes, y no tiene sentido tener dos implementaciones de lo mismo.
+pub(crate) fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("cmd")
