@@ -23,19 +23,40 @@ fn main() -> eframe::Result<()> {
 /// Muestra los panics en un cartel del sistema en vez de dejarlos desaparecer.
 ///
 /// Sin consola, el mensaje de un panic no va a ningún lado: para la persona el programa
-/// simplemente se esfuma, sin nada que contar ni que reportar. El cartel al menos deja claro que
-/// falló el programa y no sus archivos, y da un texto que se puede mandar por el canal.
+/// simplemente se esfuma, sin nada que contar ni que reportar.
+///
+/// Tres cuidados, todos aprendidos de una revisión adversarial:
+///
+/// 1. **Solo se avisa desde el hilo principal.** Un panic en un hilo worker del escaneo NO mata la
+///    aplicación: `scan_source_impl` los recolecta y conserva lo encontrado por los demás hilos.
+///    Avisar desde ahí sacaba un cartel de "el programa se cerró" mientras el programa seguía
+///    funcionando, y hasta varios carteles apilados si paniqueaban varios hilos.
+/// 2. **No se promete lo que no se puede cumplir.** La versión anterior decía "tus archivos no se
+///    tocaron: solo leemos el disco de origen". Es falso si el usuario aceptó el riesgo de
+///    guardar en el mismo disco: ahí sí se estaba escribiendo, que es justo cuando necesita saber
+///    lo contrario.
+/// 3. **Un solo cartel.** Un panic durante el manejo de otro panic no puede encadenar diálogos.
 fn instalar_aviso_de_panico() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static YA_AVISADO: AtomicBool = AtomicBool::new(false);
+
     let anterior = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         anterior(info);
+
+        let es_principal = std::thread::current().name() == Some("main");
+        if !es_principal || YA_AVISADO.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
         let detalle = info.to_string();
         rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
             .set_title("RecupeGhost tuvo un problema")
             .set_description(format!(
-                "El programa se cerró por un error interno.\n\nTus archivos NO se tocaron: \
-                 RecupeGhost solo lee el disco de origen, nunca escribe en él.\n\nSi podés, \
+                "El programa se cerró por un error interno.\n\nLo que ya se haya guardado en la \
+                 carpeta de destino sigue ahí y se puede abrir. El disco que estabas revisando no \
+                 se modificó, salvo que hayas elegido guardar en ese mismo disco.\n\nSi podés, \
                  mandanos este detalle:\n\n{detalle}"
             ))
             .show();

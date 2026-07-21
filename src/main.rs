@@ -486,9 +486,9 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         // cuando el usuario decide si sigue intentando o da el tema por cerrado. Es la misma
         // lección que ya se había aplicado en la pantalla final de la GUI.
         let (titulo, color_ok) = if recovery_result.cancelled {
-            ("      ⏹️  RECUPERACIÓN INTERRUMPIDA             ", false)
+            ("         ⏹️  RECUPERACIÓN INTERRUMPIDA         ", false)
         } else {
-            ("         ✅ RECUPERACIÓN COMPLETADA              ", true)
+            ("          ✅ RECUPERACIÓN COMPLETADA          ", true)
         };
         let marco = |s: &str| {
             if color_ok {

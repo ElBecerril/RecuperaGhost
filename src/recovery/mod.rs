@@ -101,6 +101,10 @@ fn recover_files_entry(
             RECOVERY_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
     }
+    // `RECOVERY_IN_PROGRESS` se levanta AL FINAL, con el resto del estado ya limpio: la GUI usa
+    // ese flag para saber cuándo mostrar el progreso y ofrecer "Detener". Si se levantara antes,
+    // un clic en Detener caído en esa ventana lo pisaría el reset de acá y la cancelación se
+    // perdería en silencio.
     RECOVERY_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     RECOVERY_PROGRESS.files.store(0, Ordering::Relaxed);
     RECOVERY_PROGRESS.bytes.store(0, Ordering::Relaxed);
@@ -197,7 +201,14 @@ fn recover_files_impl(
             Ok(bytes_written) => {
                 total_bytes += bytes_written;
                 progress.bytes.fetch_add(bytes_written, Ordering::Relaxed);
-                if bytes_written != found.size {
+                if bytes_written == 0 {
+                    // Si la cancelación cayó justo entre crear el archivo y escribir el primer
+                    // bloque, queda un archivo de 0 bytes: basura no abrible en la carpeta que el
+                    // usuario va a mirar, y encima contada como "truncado" con un detalle que no
+                    // le dice nada. No hay nada que conservar, así que se borra. Best-effort: si
+                    // el borrado falla, se sigue igual (es cosmético, no pérdida de datos).
+                    let _ = fs::remove_file(&dest_path);
+                } else if bytes_written != found.size {
                     // Un archivo cortado a mitad por la cancelación cae acá: queda en disco pero
                     // incompleto, así que se cuenta como `truncated`, NUNCA como `recovered`.
                     truncated += 1;
@@ -225,8 +236,12 @@ fn recover_files_impl(
         }
     }
 
-    // Si `copy_to_dest` cortó a mitad de un archivo, la cancelación se ve recién acá.
-    if cancel.load(Ordering::SeqCst) {
+    // Si `copy_to_dest` cortó a mitad de un archivo, la cancelación se ve recién acá. Pero solo
+    // cuenta como "interrumpida" si de verdad quedó algo sin procesar: apretar Ctrl+C mientras se
+    // escribía el ÚLTIMO archivo, que igual se completó, no dejó nada afuera. Titular "RECUPERACIÓN
+    // INTERRUMPIDA" ahí le hace creer a alguien no técnico que perdió archivos que sí tiene.
+    let procesados = recovered + truncated + failed;
+    if cancel.load(Ordering::SeqCst) && procesados < files.len() as u64 {
         cancelled = true;
     }
 
@@ -363,7 +378,8 @@ fn copy_to_dest(
 /// Resultado de la recuperación
 pub struct RecoveryResult {
     pub recovered: u64,
-    /// Archivos que llegaron a EOF del origen antes de completar `found.size` bytes: se
+    /// Archivos que quedaron incompletos: o llegaron a EOF del origen antes de completar
+    /// `found.size` bytes, o el usuario canceló mientras se escribía ese archivo. Se
     /// escribieron al destino pero quedaron incompletos/truncados. No cuentan como
     /// `recovered` ni como `failed` — son su propia categoría para que el resumen no los
     /// reporte como éxito pleno silenciosamente.

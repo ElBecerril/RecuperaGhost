@@ -118,7 +118,7 @@ fn list_drives_windows() -> Vec<DriveInfo> {
 #[cfg(target_os = "windows")]
 fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
     // Obtener discos físicos
-    let disk_output = Command::new("powershell")
+    let disk_output = crate::util::sin_ventana(&mut Command::new("powershell"))
         .args([
             "-NoProfile",
             "-Command",
@@ -224,7 +224,7 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
 #[cfg(target_os = "windows")]
 fn get_drive_letter_map() -> Vec<(String, String)> {
     // Usamos una consulta más directa: para cada LogicalDisk, obtener el disco físico
-    let output = Command::new("powershell")
+    let output = crate::util::sin_ventana(&mut Command::new("powershell"))
         .args([
             "-NoProfile",
             "-Command",
@@ -298,7 +298,7 @@ fn extract_drive_letter(dependent: &str) -> Option<String> {
 
 #[cfg(target_os = "windows")]
 fn list_drives_wmic() -> Option<Vec<DriveInfo>> {
-    let output = Command::new("wmic")
+    let output = crate::util::sin_ventana(&mut Command::new("wmic"))
         .args([
             "diskdrive",
             "get",

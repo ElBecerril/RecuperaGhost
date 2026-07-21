@@ -109,7 +109,10 @@ struct RecupeGhostApp {
 
     /// Advertencia de "vas a guardar en el mismo disco que estás recuperando" pendiente de
     /// resolver, con la acción que quedó frenada esperándola.
-    pending_warning: Option<(String, PendingAction)>,
+    /// Se guarda también el ORIGEN exacto que se chequeó: al aceptar el riesgo hay que registrar
+    /// ese mismo par, no recalcularlo. `resolve_source()` devuelve el disco seleccionado AHORA en
+    /// la lista, que puede haber cambiado desde que se lanzó la advertencia.
+    pending_warning: Option<(String, PendingAction, PathBuf)>,
     /// Combinación (origen, destino) EXACTA para la que el usuario ya aceptó el riesgo de
     /// mismo-disco. No alcanza con un booleano: una aceptación puntual no puede apagar la
     /// protección para discos y carpetas que la persona nunca aprobó. Con la pareja guardada,
@@ -176,6 +179,7 @@ impl RecupeGhostApp {
                      recuperando."
                         .to_string(),
                     PendingAction::Scan,
+                    PathBuf::from("/dev/demo"),
                 ));
             }
             // Pasos del asistente: para poder mirarlos sin tener que clickear.
@@ -193,6 +197,20 @@ impl RecupeGhostApp {
                         .to_string();
                     self.start_scan();
                 }
+            }
+            // La pantalla final tras DETENER el guardado: el caso que la revisión adversarial
+            // encontró anunciándose como "✅ ¡Listo!".
+            Ok("done_cancelled") => {
+                self.recovery_result = Some(RecoveryResult {
+                    recovered: 60,
+                    truncated: 0,
+                    failed: 0,
+                    total_bytes: 412_876_800,
+                    cancelled: true,
+                    output_dir: self.output_path(),
+                    errors: Vec::new(),
+                });
+                self.phase = Phase::Done;
             }
             Ok("done") => {
                 self.recovery_result = Some(RecoveryResult {
@@ -276,7 +294,7 @@ impl RecupeGhostApp {
         }
         match crate::ui::same_device_warning(source, &out) {
             Some(warning) => {
-                self.pending_warning = Some((warning, action));
+                self.pending_warning = Some((warning, action, source.to_path_buf()));
                 true
             }
             None => false,
@@ -338,6 +356,22 @@ impl RecupeGhostApp {
             (Some(s), Some(r)) => (s.clone(), r.found_files.clone()),
             _ => return,
         };
+        // Estas dos validaciones estaban solo en `start_scan`, pero el que ESCRIBE es este. Se
+        // podían esquivar entrando a los resultados con el atajo "volver a los resultados", que se
+        // dibuja arriba del gate del paso Guardar. Con el destino vacío, `to_absolute_output("")`
+        // cae en el directorio de trabajo — que puede ser el propio USB de origen si el usuario
+        // copió el programa ahí.
+        if self.output_dir.trim().is_empty() {
+            return self.fail(
+                "Elegí una carpeta donde guardar lo recuperado. Tiene que estar en un disco \
+                 distinto del que estás recuperando.",
+            );
+        }
+        if util::is_physical_device(&self.output_path()) {
+            return self.fail(
+                "La carpeta de salida no puede ser un disco/dispositivo. Elegí una carpeta normal.",
+            );
+        }
         // Segunda barrera, en el momento en que de verdad se escribe. El escaneo pudo haber
         // durado horas: acá se vuelve a chequear por si el escenario cambió (por ejemplo, se
         // desmontó y remontó un disco entre medio).
@@ -602,8 +636,13 @@ impl RecupeGhostApp {
             );
         }
 
+        let manual = self.manual_path.trim();
         let bloqueo = if self.resolve_source().is_none() {
             Some("Elegí un disco o un archivo de imagen")
+        } else if !manual.is_empty() && !std::path::Path::new(manual).exists() {
+            // Se avisa acá y no tres pantallas después: un typo en la ruta terminaba en la
+            // pantalla de error roja recién al apretar "Empezar la búsqueda".
+            Some("Esa ruta no existe")
         } else {
             None
         };
@@ -784,6 +823,18 @@ impl RecupeGhostApp {
         );
         ui.add_space(14.0);
 
+        // Hasta que el hilo de escaneo no levantó su flag, los contadores globales todavía tienen
+        // los valores del escaneo ANTERIOR: se veía la barra al 100% y el botón congelado en
+        // "Deteniendo…". Peor: un clic en Detener caído en esa ventana lo pisaba el reset que hace
+        // el hilo al arrancar, y la cancelación se perdía en silencio.
+        if !scanner::is_scan_in_progress() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Preparando…");
+            });
+            ui.ctx().request_repaint();
+            return;
+        }
         let done = scanner::scan_progress_bytes();
         let frac = if self.scan_total > 0 {
             (done as f32 / self.scan_total as f32).clamp(0.0, 1.0)
@@ -955,6 +1006,16 @@ impl RecupeGhostApp {
 
         // Progreso real, no un spinner indefinido. Recuperar miles de archivos también puede
         // tardar, y una animación que gira sin decir nada no distingue "trabajando" de "colgado".
+        // Mismo motivo que en la pantalla de búsqueda: sin este gate se muestran los contadores
+        // de la recuperación anterior y se puede perder un "Detener".
+        if !recovery::is_recovery_in_progress() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Preparando…");
+            });
+            ui.ctx().request_repaint();
+            return;
+        }
         let total = self
             .scan_result
             .as_ref()
@@ -996,16 +1057,36 @@ impl RecupeGhostApp {
     }
 
     fn ui_done(&mut self, ui: &mut egui::Ui) {
-        let (summary, recovered, incomplete) = match self.recovery_result.as_ref() {
-            Some(r) => (r.summary(), r.recovered, r.truncated + r.failed),
-            None => (String::new(), 0, 0),
+        let (summary, recovered, incomplete, cancelled, out) = match self.recovery_result.as_ref() {
+            Some(r) => (
+                r.summary(),
+                r.recovered,
+                r.truncated + r.failed,
+                r.cancelled,
+                // La carpeta que la recuperación REPORTÓ, no una recalculada: `output_path()`
+                // depende del directorio de trabajo actual y del campo de texto, que el usuario
+                // pudo haber tocado.
+                r.output_dir.clone(),
+            ),
+            None => (String::new(), 0, 0, false, self.output_path()),
         };
-        let out = self.output_path();
 
         ui.add_space(12.0);
-        // El titular no puede decir "¡Listo!" a secas si algo quedó a medias: eso es mentir por
-        // omisión justo cuando el usuario decide si sigue buscando o da el tema por cerrado.
-        if incomplete > 0 {
+        // El titular tiene que decir la verdad. Si el usuario DETUVO la recuperación, anunciar
+        // "✅ ¡Listo!" es mentir por omisión justo cuando decide si cierra el tema: alguien que
+        // paró en el archivo 60 de 800 leería que rescató todo, borraría el USB y perdería las
+        // otras 740 para siempre. La cancelación cae casi siempre ENTRE archivos, así que
+        // `truncated`/`failed` quedan en 0 y sin este chequeo el caso pasaba por éxito pleno.
+        if cancelled {
+            theme::section_title(
+                ui,
+                format!("⏹ Detuviste el guardado. Se alcanzaron a guardar {recovered} archivos."),
+            );
+            ui.label(
+                "Los que se guardaron están completos y se pueden abrir. Los que faltaban NO se \
+                 recuperaron: si querés, volvé y guardá de nuevo, que los vuelve a escribir.",
+            );
+        } else if incomplete > 0 {
             theme::section_title(
                 ui,
                 format!(
@@ -1131,23 +1212,30 @@ impl eframe::App for RecupeGhostApp {
             ui.heading("👻 RecupeGhost");
             ui.label("Recuperá fotos, videos, audios y documentos borrados.");
             ui.separator();
-            match self.phase {
-                Phase::Setup(step) => {
-                    self.ui_stepper(ui, step);
-                    ui.add_space(10.0);
-                    match step {
-                        Step::Source => self.ui_step_source(ui),
-                        Step::Types => self.ui_step_types(ui),
-                        Step::Output => self.ui_step_output(ui),
-                        Step::Summary => self.ui_step_summary(ui),
+            // El contenido va dentro de un área con scroll. Sin esto, en una ventana chica (una
+            // notebook de 768 px de alto, o alguien que achica la ventana) el contenido se corta
+            // SIN barra de desplazamiento: se vio en la pantalla final, donde los enlaces al canal
+            // quedaban fuera de vista. En un paso del asistente eso deja al usuario sin poder
+            // llegar al botón "Continuar", o sea trabado sin forma de saber por qué.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| match self.phase {
+                    Phase::Setup(step) => {
+                        self.ui_stepper(ui, step);
+                        ui.add_space(10.0);
+                        match step {
+                            Step::Source => self.ui_step_source(ui),
+                            Step::Types => self.ui_step_types(ui),
+                            Step::Output => self.ui_step_output(ui),
+                            Step::Summary => self.ui_step_summary(ui),
+                        }
                     }
-                }
-                Phase::Scanning => self.ui_scanning(ui),
-                Phase::Results => self.ui_results(ui),
-                Phase::Recovering => self.ui_recovering(ui),
-                Phase::Done => self.ui_done(ui),
-                Phase::Error => self.ui_error(ui),
-            }
+                    Phase::Scanning => self.ui_scanning(ui),
+                    Phase::Results => self.ui_results(ui),
+                    Phase::Recovering => self.ui_recovering(ui),
+                    Phase::Done => self.ui_done(ui),
+                    Phase::Error => self.ui_error(ui),
+                });
         });
         self.ui_same_device_dialog(ctx);
     }
@@ -1166,7 +1254,7 @@ impl RecupeGhostApp {
     /// egui 0.29 todavía no tiene `Modal` (llegó en 0.31), así que se arma con una `Window` fija
     /// y no colapsable.
     fn ui_same_device_dialog(&mut self, ctx: &egui::Context) {
-        let Some((warning, action)) = self.pending_warning.clone() else {
+        let Some((warning, action, origen_avisado)) = self.pending_warning.clone() else {
             return;
         };
 
@@ -1211,9 +1299,12 @@ impl RecupeGhostApp {
         match choice {
             Some(true) => {
                 self.pending_warning = None;
-                if let Some(src) = self.resolve_source() {
-                    self.same_device_accepted = Some((src, self.output_path()));
-                }
+                // El par que se registra es EXACTAMENTE el que se advirtió. Recalcularlo con
+                // `resolve_source()` tenía dos consecuencias feas cuando el usuario había tocado
+                // la lista de discos entre medio: la recuperación quedaba en un bucle infinito
+                // (se aceptaba un par y se chequeaba otro, así que la advertencia volvía siempre),
+                // y encima quedaba autorizado un par que nunca se le mostró.
+                self.same_device_accepted = Some((origen_avisado, self.output_path()));
                 match action {
                     PendingAction::Scan => self.start_scan(),
                     PendingAction::Recover => self.start_recovery(),

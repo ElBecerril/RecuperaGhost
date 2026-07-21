@@ -457,6 +457,14 @@ struct ScanProgress<'a> {
     files: &'a AtomicU64,
     mirror_bytes: Option<&'a AtomicU64>,
     mirror_files: Option<&'a AtomicU64>,
+    /// Sin salida por terminal. Viaja acá y no como un argumento suelto porque `scan_segment` ya
+    /// tiene la lista de argumentos al límite, y porque es por escaneo: nada de globales.
+    ///
+    /// Que los avisos de error de I/O lo respeten es CRÍTICO: la GUI se compila con
+    /// `windows_subsystem = "windows"`, o sea sin consola. Ahí un `eprintln!` no tiene a dónde ir
+    /// y, si el handle existe pero la escritura falla, `std` paniquea. Y justo esos avisos salen
+    /// en el escenario CENTRAL de la herramienta: un disco que está fallando.
+    quiet: bool,
 }
 
 impl ScanProgress<'_> {
@@ -464,7 +472,11 @@ impl ScanProgress<'_> {
     fn add_bytes(&self, n: u64) -> u64 {
         let total = self.bytes.fetch_add(n, Ordering::Relaxed) + n;
         if let Some(m) = self.mirror_bytes {
-            m.store(total, Ordering::Relaxed);
+            // `fetch_max`, no `store`: con varios hilos, dos pueden invertir el orden entre su
+            // `fetch_add` y su escritura al espejo, y el espejo RETROCEDERÍA. Una barra de
+            // progreso que va para atrás, a alguien no técnico y asustado, se le lee como que el
+            // programa se rompió.
+            m.fetch_max(total, Ordering::Relaxed);
         }
         total
     }
@@ -473,7 +485,9 @@ impl ScanProgress<'_> {
     fn add_files(&self, n: u64) {
         let total = self.files.fetch_add(n, Ordering::Relaxed) + n;
         if let Some(m) = self.mirror_files {
-            m.store(total, Ordering::Relaxed);
+            // Mismo motivo que en `add_bytes`: el contador de "encontrados hasta ahora" nunca
+            // puede bajar delante del usuario.
+            m.fetch_max(total, Ordering::Relaxed);
         }
     }
 }
@@ -525,13 +539,15 @@ fn scan_segment(
     let mut file = match File::open(source_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "  ⚠️  No se pudo abrir {} para escanear [0x{:X}, 0x{:X}): {} — este segmento se omite",
-                source_path.display(),
-                segment.start,
-                segment.end,
-                e
-            );
+            if !progress.quiet {
+                eprintln!(
+                    "  ⚠️  No se pudo abrir {} para escanear [0x{:X}, 0x{:X}): {} — este segmento se omite",
+                    source_path.display(),
+                    segment.start,
+                    segment.end,
+                    e
+                );
+            }
             return SegmentResult {
                 found_files: Vec::new(),
                 had_errors: true,
@@ -539,10 +555,12 @@ fn scan_segment(
         }
     };
     if let Err(e) = file.seek(SeekFrom::Start(segment.start)) {
-        eprintln!(
-            "  ⚠️  No se pudo posicionar en 0x{:X}: {} — este segmento se omite",
-            segment.start, e
-        );
+        if !progress.quiet {
+            eprintln!(
+                "  ⚠️  No se pudo posicionar en 0x{:X}: {} — este segmento se omite",
+                segment.start, e
+            );
+        }
         return SegmentResult {
             found_files: Vec::new(),
             had_errors: true,
@@ -581,10 +599,12 @@ fn scan_segment(
                 // handle después de él) y seguir escaneando el resto del segmento. El
                 // `overlap` de antes del error ya no es válido (hay un hueco sin leer), así
                 // que se descarta para no combinar bytes no contiguos.
-                eprintln!(
-                    "  ⚠️  Error de I/O leyendo en offset 0x{:X}: {} — saltando este bloque y continuando",
-                    position, e
-                );
+                if !progress.quiet {
+                    eprintln!(
+                        "  ⚠️  Error de I/O leyendo en offset 0x{:X}: {} — saltando este bloque y continuando",
+                        position, e
+                    );
+                }
                 had_errors = true;
                 overlap.clear();
                 let next_position = position + max_to_read as u64;
@@ -601,10 +621,12 @@ fn scan_segment(
                         continue;
                     }
                     Err(seek_err) => {
-                        eprintln!(
-                            "  ⚠️  No se pudo reposicionar tras error de I/O: {} — abandonando el resto de este segmento",
-                            seek_err
-                        );
+                        if !progress.quiet {
+                            eprintln!(
+                                "  ⚠️  No se pudo reposicionar tras error de I/O: {} — abandonando el resto de este segmento",
+                                seek_err
+                            );
+                        }
                         break;
                     }
                 }
@@ -794,10 +816,14 @@ fn scan_source_impl(
             SCAN_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
     }
+    // El orden importa: `SCAN_IN_PROGRESS` se levanta AL FINAL, cuando el resto del estado ya
+    // quedó limpio. La GUI usa ese flag para saber cuándo puede empezar a mostrar el progreso y a
+    // ofrecer el botón de detener; si se levantara primero, alcanzaría a dibujar los contadores
+    // del escaneo ANTERIOR (barra al 100%) y un "Detener" cuyo pedido el reset de acá pisaría.
     SCAN_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
     SCAN_PROGRESS_BYTES.store(0, Ordering::Relaxed);
     SCAN_PROGRESS_FILES.store(0, Ordering::Relaxed);
+    SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
     let _scan_guard = ScanGuard;
 
     // Contadores propios de ESTE escaneo (fuente de verdad; los globales son solo el espejo que
@@ -848,6 +874,7 @@ fn scan_source_impl(
                 files: &progress_files,
                 mirror_bytes: Some(&SCAN_PROGRESS_BYTES),
                 mirror_files: Some(&SCAN_PROGRESS_FILES),
+                quiet,
             },
             Some(&pb),
             &SCAN_CANCEL_REQUESTED,
@@ -959,6 +986,7 @@ fn scan_source_impl(
                         files: &files,
                         mirror_bytes: Some(&SCAN_PROGRESS_BYTES),
                         mirror_files: Some(&SCAN_PROGRESS_FILES),
+                        quiet,
                     },
                     None,
                     &SCAN_CANCEL_REQUESTED,
@@ -1432,6 +1460,8 @@ mod tests {
             files,
             mirror_bytes: None,
             mirror_files: None,
+            // Los tests no deben ensuciar la salida de `cargo test`.
+            quiet: true,
         }
     }
 
@@ -2775,9 +2805,14 @@ mod tests {
     /// "Encontrados hasta ahora: N".
     #[test]
     fn test_scan_progress_files_visible_during_scan() {
-        use std::sync::mpsc;
-
-        // Origen grande y con muchos hallazgos: da tiempo a muestrear mientras escanea.
+        // Se muestrean contadores LOCALES, no el global `SCAN_PROGRESS_FILES`.
+        //
+        // La versión anterior de este test muestreaba el global y era un FALSO VERDE: otros tests
+        // corriendo en paralelo escanean y escriben ese mismo global, así que le inyectaban
+        // muestras intermedias y el assert se satisfacía con el ruido del vecino. Se comprobó que
+        // pasaba en verde incluso borrando por completo el conteo en vivo (y que fallaba con
+        // `--test-threads=1`). Es la misma familia de bug que el cuelgue de macOS: atar una
+        // aserción a un global mutable compartido entre tests paralelos.
         let size = 24 * 1024 * 1024usize;
         let mut data = vec![0u8; size];
         let mut pos = 4096usize;
@@ -2794,38 +2829,56 @@ mod tests {
 
         let sigs = signatures_for_categories(&[FileCategory::Photo]);
         let path = file.path().to_path_buf();
-        let (tx, rx) = mpsc::channel();
+        let segment = Segment {
+            start: 0,
+            end: size as u64,
+            claim_start: 0,
+            claim_end: size as u64,
+        };
+        let max_header_len = sigs.iter().map(|s| s.header.len()).max().unwrap_or(0);
+
+        let bytes = Arc::new(AtomicU64::new(0));
+        let files = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let (b, f, c) = (bytes.clone(), files.clone(), cancel.clone());
         let scan = std::thread::spawn(move || {
-            let r = scan_source_quiet(&path, &sigs);
-            let _ = tx.send(());
-            r
+            scan_segment(
+                &path,
+                &segment,
+                &sigs,
+                size as u64,
+                max_header_len,
+                &local_progress(&b, &f),
+                None,
+                &c,
+            )
         });
 
-        // Se muestrea el global mientras el escaneo corre y se guarda el máximo PARCIAL visto
-        // (descartando muestras >= al total, que ya podrían ser el valor final): un contador que
-        // solo se escribiera al terminar nunca produciría una muestra intermedia.
-        let mut samples = Vec::new();
-        while rx
-            .recv_timeout(std::time::Duration::from_micros(500))
-            .is_err()
-        {
-            samples.push(scan_progress_files());
+        // Muestras tomadas mientras el segmento se escanea. Un contador que solo se escribiera al
+        // terminar no podría producir NINGUNA muestra estrictamente entre 0 y el total.
+        let mut muestras = Vec::new();
+        while !scan.is_finished() {
+            muestras.push(files.load(Ordering::Relaxed));
+            std::thread::yield_now();
         }
-        let result = scan.join().unwrap().unwrap();
+        let result = scan.join().unwrap();
         let total = result.found_files.len() as u64;
-        let saw_partial = samples.iter().any(|&n| n > 0 && n < total);
 
         assert!(
-            result.found_files.len() as u64 >= written,
-            "deberían encontrarse al menos los {} JPEG escritos, se encontraron {}",
-            written,
-            result.found_files.len()
+            total >= written,
+            "deberían encontrarse al menos los {written} JPEG escritos, se encontraron {total}"
         );
         assert!(
-            saw_partial,
-            "el contador de encontrados nunca mostró un valor intermedio (total {}): no se está \
-             actualizando en vivo",
-            total
+            muestras.iter().any(|&n| n > 0 && n < total),
+            "el contador de encontrados nunca mostró un valor intermedio (total {total}, muestras \
+             distintas vistas: {:?}): no se está actualizando en vivo, sino de una sola vez al final",
+            {
+                let mut u: Vec<u64> = muestras.clone();
+                u.sort_unstable();
+                u.dedup();
+                u
+            }
         );
     }
 

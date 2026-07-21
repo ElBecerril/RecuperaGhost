@@ -76,3 +76,26 @@ o dañado — probá reconectarlo.",
     }
     None
 }
+
+/// Evita que un proceso hijo de consola abra una ventana negra visible.
+///
+/// Hace falta desde que la GUI se compila con `windows_subsystem = "windows"`: un proceso de
+/// subsistema gráfico que lanza un hijo de subsistema consola hace que Windows le asigne una
+/// consola NUEVA y visible. Antes no se notaba porque el `.exe` de consola le prestaba la suya.
+///
+/// Sin esto, al abrir la GUI parpadean dos rectángulos negros (`powershell` para listar discos),
+/// se repiten en cada "Buscar discos de nuevo", y otra vez dentro de `same_device_warning` — o
+/// sea, justo en el instante previo a la advertencia crítica de pérdida de datos. Es exactamente
+/// el efecto que ocultar la consola venía a eliminar.
+///
+/// En Linux y macOS es un no-op.
+pub fn sin_ventana(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` de la API de Windows.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}

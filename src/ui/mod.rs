@@ -1293,7 +1293,7 @@ pub fn show_goodbye() {
 pub(crate) fn open_url(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
+        let _ = crate::util::sin_ventana(&mut std::process::Command::new("cmd"))
             .args(["/C", "start", "", url])
             .spawn();
     }
