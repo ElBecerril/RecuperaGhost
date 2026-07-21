@@ -178,7 +178,12 @@ src/
   clone/mod.rs         -> Clonado de disco a imagen .img tolerante a sectores danados
   recovery/mod.rs      -> Extraccion de archivos a carpetas organizadas
   ui/mod.rs            -> Menus interactivos con seleccion inteligente de origen
+  util.rs              -> Helpers compartidos (tamanos, rutas, errores traducidos)
   updater.rs           -> Aviso de nuevas versiones via GitHub Releases (solo avisa, no descarga)
+  lib.rs               -> El motor como biblioteca, compartida por los dos binarios
+  gui/mod.rs           -> Interfaz grafica (egui/eframe), detras del feature `gui`
+  gui/theme.rs         -> Sistema visual de la GUI (paleta, escala tipografica, tamanos)
+  bin/recupe_ghost_gui.rs -> Binario de la interfaz grafica
 ```
 
 ## Tests
@@ -187,7 +192,7 @@ src/
 cargo test
 ```
 
-49 tests automatizados:
+56 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -216,6 +221,13 @@ cargo test
 - Clonado cancelable: corta y conserva la copia parcial
 - Clonado: EOF del origen no se contabiliza como sectores danados
 - Clasificacion de integridad de resultados (integro / posiblemente danado / no verificable) y orden de presentacion
+- Recuperacion cancelable: corta temprano, conserva lo ya guardado y lo reporta como parcial
+- Un archivo cortado a la mitad se cuenta como truncado, nunca como recuperado
+- Contadores de progreso de la recuperacion (archivos y bytes) reflejan el trabajo real
+- La variante silenciosa de la recuperacion (la que usa la GUI) da el mismo resultado que la del CLI
+- El contador de hallazgos sube en vivo durante el escaneo, no de una sola vez al final
+- Los hallazgos de la zona de solape entre segmentos no se cuentan dos veces
+- bytes_scanned es por escaneo y no se corrompe con escaneos concurrentes
 
 ## Contribuir
 
