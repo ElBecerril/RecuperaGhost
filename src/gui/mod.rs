@@ -14,6 +14,8 @@ use std::thread;
 
 use eframe::egui;
 
+mod theme;
+
 use crate::drives::{self, DriveInfo};
 use crate::recovery::{self, RecoveryResult};
 use crate::scanner::{self, Integrity, ScanResult};
@@ -32,7 +34,12 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "RecupeGhost",
         options,
-        Box::new(|_cc| Ok(Box::new(RecupeGhostApp::new()))),
+        Box::new(|cc| {
+            // Sistema visual (tema claro, escala tipográfica grande, controles anchos). Sin esto
+            // la GUI sale con los defaults de egui, que son de una herramienta de programador.
+            theme::apply(&cc.egui_ctx);
+            Ok(Box::new(RecupeGhostApp::new()))
+        }),
     )
 }
 
@@ -89,7 +96,7 @@ impl RecupeGhostApp {
         // y el caso central de la herramienta es "formateé el USB / la tarjeta de la cámara":
         // arrancar apuntando al disco de la PC invita a escanear el equivocado.
         let selected_drive = drives.iter().position(|d| d.is_removable).unwrap_or(0);
-        Self {
+        let mut app = Self {
             drives,
             selected_drive,
             manual_path: String::new(),
@@ -106,8 +113,34 @@ impl RecupeGhostApp {
             recovery_result: None,
             error_msg: String::new(),
             error_hint: None,
+        };
+        app.apply_demo_state();
+        app
+    }
+
+    /// Abre la GUI directamente en una pantalla concreta, para poder MIRARLA.
+    ///
+    /// Existe porque varias pantallas (sobre todo el diálogo de mismo-disco, que es la última
+    /// barrera antes de una pérdida de datos irreversible) solo aparecen con un disco real en
+    /// determinado estado, y quedaban revisadas por código pero nunca vistas funcionando.
+    ///
+    /// Solo en builds de **debug**: el binario que se distribuye se compila en release, así que
+    /// esto no existe para el usuario final ni agrega superficie. Uso:
+    /// `RECUPEGHOST_GUI_DEMO=same_device cargo run --features gui --bin recupe_ghost_gui`
+    #[cfg(debug_assertions)]
+    fn apply_demo_state(&mut self) {
+        if std::env::var("RECUPEGHOST_GUI_DEMO").as_deref() == Ok("same_device") {
+            self.pending_warning = Some((
+                "Vas a guardar los archivos recuperados en el MISMO disco del que los estás \
+                 recuperando."
+                    .to_string(),
+                PendingAction::Scan,
+            ));
         }
     }
+
+    #[cfg(not(debug_assertions))]
+    fn apply_demo_state(&mut self) {}
 
     fn selected_categories(&self) -> Vec<FileCategory> {
         let mut c = Vec::new();
@@ -376,16 +409,11 @@ impl RecupeGhostApp {
         ui.text_edit_singleline(&mut self.output_dir);
         ui.label(
             egui::RichText::new("⚠ Guardá en un disco DISTINTO al que estás recuperando.")
-                .color(egui::Color32::from_rgb(230, 180, 60)),
+                .color(theme::WARN),
         );
 
         ui.add_space(18.0);
-        if ui
-            .add(egui::Button::new(
-                egui::RichText::new("🔍  Escanear").size(18.0),
-            ))
-            .clicked()
-        {
+        if ui.add(theme::primary_button("🔍  Escanear")).clicked() {
             self.start_scan();
         }
     }
@@ -441,16 +469,20 @@ impl RecupeGhostApp {
         // canceló al 2%, o cuyo disco tenía media superficie ilegible, concluye "mis archivos no
         // están" — y para mucha gente esa es la decisión de abandonar su único intento.
         if cancelled {
-            ui.colored_label(
-                egui::Color32::from_rgb(0xC8, 0x8A, 0x00),
+            theme::notice(
+                ui,
+                theme::WARN,
+                theme::WARN_BG,
                 "⏸ Detuviste la búsqueda antes de que terminara. Esto es lo que se encontró hasta \
                  ahí: lo podés recuperar igual, o volver y buscar de nuevo hasta el final.",
             );
             ui.add_space(4.0);
         }
         if had_errors {
-            ui.colored_label(
-                egui::Color32::from_rgb(0xC8, 0x8A, 0x00),
+            theme::notice(
+                ui,
+                theme::WARN,
+                theme::WARN_BG,
                 "⚠ El disco tiene partes que no se pudieron leer. Se buscó en todo lo que sí se \
                  pudo, así que pueden faltar archivos de las zonas dañadas. Si el disco está \
                  fallando, conviene hacer una copia antes de seguir usándolo.",
@@ -485,9 +517,9 @@ impl RecupeGhostApp {
             .show(ui, |ui| {
                 for (integ, text) in &rows {
                     let color = match integ {
-                        Integrity::Intact => egui::Color32::from_rgb(90, 200, 120),
-                        Integrity::Suspect => egui::Color32::from_rgb(230, 180, 60),
-                        Integrity::Unverifiable => egui::Color32::GRAY,
+                        Integrity::Intact => theme::OK,
+                        Integrity::Suspect => theme::WARN,
+                        Integrity::Unverifiable => theme::NEUTRAL,
                     };
                     ui.colored_label(color, text);
                 }
@@ -499,9 +531,7 @@ impl RecupeGhostApp {
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             if ui
-                .add(egui::Button::new(
-                    egui::RichText::new("💾  Recuperar todo").size(16.0),
-                ))
+                .add(theme::primary_button("💾  Recuperar todo"))
                 .clicked()
             {
                 self.start_recovery();
@@ -588,21 +618,15 @@ impl RecupeGhostApp {
         // "Acceso denegado. (os error 5)" es el final del intento, cuando la solución era abrir el
         // programa como administrador. El texto técnico queda abajo, para quien vaya a pedir ayuda.
         if let Some(hint) = self.error_hint {
-            ui.label(egui::RichText::new(hint.trim()).size(16.0).strong());
+            ui.label(egui::RichText::new(hint.trim()).strong());
             ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("Tus archivos siguen donde estaban: esto no borró nada.")
-                    .size(14.0),
-            );
+            ui.label("Tus archivos siguen donde estaban: esto no borró nada.");
             ui.add_space(10.0);
             ui.collapsing("Detalle técnico (por si pedís ayuda)", |ui| {
-                ui.colored_label(egui::Color32::from_rgb(220, 90, 90), self.error_msg.clone());
+                ui.colored_label(theme::DANGER, self.error_msg.clone());
             });
         } else {
-            ui.colored_label(
-                egui::Color32::from_rgb(220, 90, 90),
-                format!("❌ {}", self.error_msg),
-            );
+            ui.colored_label(theme::DANGER, format!("❌ {}", self.error_msg));
         }
         ui.add_space(12.0);
         if ui.button("↩ Volver").clicked() {
@@ -667,23 +691,18 @@ impl RecupeGhostApp {
             .show(ctx, |ui| {
                 ui.set_max_width(460.0);
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(warning.trim()).size(15.0));
+                ui.label(warning.trim());
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(
-                        "Si guardás en el mismo disco del que estás recuperando, lo que se escriba \
-                         puede tapar para siempre los archivos que estás buscando. No tiene vuelta \
-                         atrás.",
-                    )
-                    .size(15.0),
+                    "Si guardás en el mismo disco del que estás recuperando, lo que se escriba \
+                     puede tapar para siempre los archivos que estás buscando. No tiene vuelta \
+                     atrás.",
                 );
                 ui.add_space(12.0);
+                // La opción segura es la única con peso visual. La riesgosa queda como texto
+                // chico y apagado: sigue estando a un clic, pero hay que ir a buscarla.
                 if ui
-                    .button(
-                        egui::RichText::new("Elegir otra carpeta")
-                            .size(16.0)
-                            .strong(),
-                    )
+                    .add(theme::primary_button("Elegir otra carpeta"))
                     .clicked()
                 {
                     choice = Some(false);
@@ -691,7 +710,9 @@ impl RecupeGhostApp {
                 ui.add_space(4.0);
                 if ui
                     .button(
-                        egui::RichText::new("Entiendo el riesgo y quiero seguir igual").size(13.0),
+                        egui::RichText::new("Entiendo el riesgo y quiero seguir igual")
+                            .size(13.0)
+                            .color(theme::TEXT_WEAK),
                     )
                     .clicked()
                 {
