@@ -144,6 +144,7 @@ impl RecupeGhostApp {
                     truncated: 0,
                     failed: 0,
                     total_bytes: 1_476_395_008,
+                    cancelled: false,
                     output_dir: self.output_path(),
                     errors: Vec::new(),
                 });

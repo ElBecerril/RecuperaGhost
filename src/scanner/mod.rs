@@ -29,8 +29,18 @@ static SCAN_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 // Bytes leídos del origen en el escaneo en curso. Es la MISMA cuenta que alimenta la barra de
 // progreso de la terminal, expuesta como global para que la GUI (que corre el escaneo en un hilo
 // aparte y no tiene la ProgressBar de indicatif) pueda leer el avance y dibujar su propia barra.
-// Un solo escaneo por proceso a la vez, así que un global alcanza (igual que SCAN_IN_PROGRESS).
+//
+// OJO: este global es un ESPEJO de solo lectura para la UI, NO la fuente de verdad. La cuenta
+// real vive en un `Arc<AtomicU64>` por escaneo (ver `ScanProgress`), porque un global se corrompe
+// si dos escaneos corren a la vez en el mismo proceso (pasa en los tests, que corren en paralelo)
+// y `ScanResult::bytes_scanned` tiene que ser el dato de SU escaneo, no el del vecino. Y por la
+// misma razón nada puede depender de este global para TERMINAR (ver el comentario del monitor).
 static SCAN_PROGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+// Archivos encontrados hasta ahora en el escaneo en curso. Mismo rol y mismas advertencias que
+// `SCAN_PROGRESS_BYTES`: espejo para que la GUI muestre "Encontrados hasta ahora: N" en vivo,
+// mientras la cuenta de verdad va por el contador por escaneo.
+static SCAN_PROGRESS_FILES: AtomicU64 = AtomicU64::new(0);
 
 /// True si hay un escaneo corriendo ahora mismo. Lo usa el handler de Ctrl+C para decidir entre
 /// cancelar el escaneo o dejar que el programa termine normalmente.
@@ -42,6 +52,17 @@ pub fn is_scan_in_progress() -> bool {
 /// dibujar su barra de progreso mientras el escaneo corre en un hilo de fondo.
 pub fn scan_progress_bytes() -> u64 {
     SCAN_PROGRESS_BYTES.load(Ordering::Relaxed)
+}
+
+/// Archivos encontrados hasta ahora en el escaneo en curso (0 si no hay ninguno). Lo usa la GUI
+/// para mostrar "Encontrados hasta ahora: N" mientras el escaneo corre en un hilo de fondo, así el
+/// usuario ve que algo está apareciendo y no solo una barra avanzando.
+///
+/// Es un valor EN VIVO y aproximado: cuenta los hallazgos a medida que aparecen, antes del segundo
+/// pase de footers y del dedup final. Al terminar el escaneo queda igualado al total exacto, pero
+/// el número definitivo es `ScanResult::found_files.len()`.
+pub fn scan_progress_files() -> u64 {
+    SCAN_PROGRESS_FILES.load(Ordering::Relaxed)
 }
 
 /// Pide cancelar el escaneo en curso (lo llama el handler de Ctrl+C). El escaneo se detiene en
@@ -411,6 +432,53 @@ struct SegmentResult {
     had_errors: bool,
 }
 
+/// Contadores de avance de UN escaneo, que `scan_segment` va alimentando.
+///
+/// `bytes` y `files` son propios del escaneo (un `Arc<AtomicU64>` que comparten sus workers) y son
+/// la FUENTE DE VERDAD: de ahí sale `ScanResult::bytes_scanned`. `mirror_*` son los globales que
+/// lee la UI, y se actualizan como copia para que la GUI pueda dibujar el avance sin tener acceso
+/// a los contadores internos.
+///
+/// La separación existe porque el global se pisa entre escaneos concurrentes del mismo proceso
+/// (los tests corren en paralelo): leer `bytes_scanned` del global daba un número del escaneo de
+/// al lado. Se pasa por parámetro —igual que el flag de cancelación— para que un test pueda usar
+/// sus propios contadores sin tocar el estado global compartido.
+struct ScanProgress<'a> {
+    bytes: &'a AtomicU64,
+    files: &'a AtomicU64,
+    mirror_bytes: Option<&'a AtomicU64>,
+    mirror_files: Option<&'a AtomicU64>,
+}
+
+impl ScanProgress<'_> {
+    /// Suma bytes leídos y devuelve el total del escaneo (el que va a la barra de progreso).
+    fn add_bytes(&self, n: u64) -> u64 {
+        let total = self.bytes.fetch_add(n, Ordering::Relaxed) + n;
+        if let Some(m) = self.mirror_bytes {
+            m.store(total, Ordering::Relaxed);
+        }
+        total
+    }
+
+    /// Suma archivos recién encontrados (para el contador en vivo de la GUI).
+    fn add_files(&self, n: u64) {
+        let total = self.files.fetch_add(n, Ordering::Relaxed) + n;
+        if let Some(m) = self.mirror_files {
+            m.store(total, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Cuántos de estos hallazgos caen en la zona exclusiva del segmento. Solo esos van a sobrevivir
+/// al filtro final, así que son los únicos que se cuentan en vivo: contar también los de la zona
+/// de overlap haría que el contador de la GUI se pasara del total real y después "bajara".
+fn count_claimed(files: &[FoundFile], segment: &Segment) -> u64 {
+    files
+        .iter()
+        .filter(|f| f.offset >= segment.claim_start && f.offset < segment.claim_end)
+        .count() as u64
+}
+
 /// Escanea un segmento del archivo buscando firmas multimedia.
 /// Cada hilo abre su propio File handle y escanea secuencialmente dentro del segmento.
 /// Solo retiene resultados con offset en [claim_start, claim_end).
@@ -441,7 +509,7 @@ fn scan_segment(
     signatures: &[FileSignature],
     source_size: u64,
     max_header_len: usize,
-    progress_bytes: &AtomicU64,
+    progress: &ScanProgress<'_>,
     inline_pb: Option<&ProgressBar>,
     cancel: &AtomicBool,
 ) -> SegmentResult {
@@ -511,9 +579,9 @@ fn scan_segment(
                 had_errors = true;
                 overlap.clear();
                 let next_position = position + max_to_read as u64;
-                progress_bytes.fetch_add(max_to_read as u64, Ordering::Relaxed);
+                let total = progress.add_bytes(max_to_read as u64);
                 if let Some(pb) = inline_pb {
-                    pb.set_position(progress_bytes.load(Ordering::Relaxed));
+                    pb.set_position(total);
                 }
                 if next_position >= segment.end {
                     break;
@@ -537,7 +605,10 @@ fn scan_segment(
             break;
         }
 
-        // Buscar firmas: con overlap del chunk anterior si existe, o solo el buffer actual
+        // Buscar firmas: con overlap del chunk anterior si existe, o solo el buffer actual.
+        // Se anota cuántos hallazgos había antes para poder sumar al contador en vivo solo los
+        // nuevos (el vector es acumulativo dentro del segmento).
+        let found_before = found_files.len();
         if !overlap.is_empty() {
             let mut combined = overlap.clone();
             combined.extend_from_slice(&buffer[..bytes_read]);
@@ -563,6 +634,11 @@ fn scan_segment(
             );
         }
 
+        let newly_claimed = count_claimed(&found_files[found_before..], segment);
+        if newly_claimed > 0 {
+            progress.add_files(newly_claimed);
+        }
+
         // Guardar overlap para el siguiente chunk (siempre, incluso con reads parciales)
         if bytes_read >= max_header_len {
             overlap = buffer[bytes_read - max_header_len..bytes_read].to_vec();
@@ -571,9 +647,9 @@ fn scan_segment(
         }
 
         position += bytes_read as u64;
-        progress_bytes.fetch_add(bytes_read as u64, Ordering::Relaxed);
+        let total = progress.add_bytes(bytes_read as u64);
         if let Some(pb) = inline_pb {
-            pb.set_position(progress_bytes.load(Ordering::Relaxed));
+            pb.set_position(total);
         }
     }
 
@@ -712,7 +788,13 @@ fn scan_source_impl(
     SCAN_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
     SCAN_IN_PROGRESS.store(true, Ordering::SeqCst);
     SCAN_PROGRESS_BYTES.store(0, Ordering::Relaxed);
+    SCAN_PROGRESS_FILES.store(0, Ordering::Relaxed);
     let _scan_guard = ScanGuard;
+
+    // Contadores propios de ESTE escaneo (fuente de verdad; los globales son solo el espejo que
+    // lee la GUI). Son `Arc` porque en multi-hilo los comparten todos los workers y el monitor.
+    let progress_bytes = Arc::new(AtomicU64::new(0));
+    let progress_files = Arc::new(AtomicU64::new(0));
 
     if !quiet {
         print_scan_preamble(source_path, file_size, num_threads);
@@ -752,7 +834,12 @@ fn scan_source_impl(
             signatures,
             file_size,
             max_header_len,
-            &SCAN_PROGRESS_BYTES,
+            &ScanProgress {
+                bytes: &progress_bytes,
+                files: &progress_files,
+                mirror_bytes: Some(&SCAN_PROGRESS_BYTES),
+                mirror_files: Some(&SCAN_PROGRESS_FILES),
+            },
             Some(&pb),
             &SCAN_CANCEL_REQUESTED,
         );
@@ -762,8 +849,9 @@ fn scan_source_impl(
             );
         }
         // B3: reportar lo realmente leído, no file_size fijo — un EOF prematuro (bytes_read
-        // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo.
-        let scanned = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
+        // == 0 antes de llegar a segment.end) corta el escaneo antes de tiempo. Se lee del
+        // contador PROPIO, no del global, que otro escaneo concurrente puede haber reseteado.
+        let scanned = progress_bytes.load(Ordering::Relaxed);
         (result.found_files, scanned, result.had_errors)
     } else {
         // ── Multi-hilo ──
@@ -782,6 +870,10 @@ fn scan_source_impl(
         // manifestó como el job de macOS del CI colgado 6 h en
         // `test_signature_at_segment_boundary` (los tests corren en paralelo en un mismo proceso).
         // La terminación de un hilo no debe depender de un contador compartido y mutable.
+        // A propósito el monitor sigue LEYENDO el global (solo para dibujar): así el test de
+        // regresión `test_multithread_scan_terminates_despite_concurrent_progress_resets`, que
+        // martilla ese global con escaneos concurrentes, conserva su capacidad de atrapar el bug
+        // si alguien vuelve a atar la salida del loop al contador.
         // El flag va detrás de un guard con `Drop` para que también se levante si este hilo se
         // va por un panic (por ejemplo, si el OS no puede crear un worker). Sin el guard, en la
         // GUI —donde el escaneo corre en un hilo y un panic no mata el proceso— quedaría un hilo
@@ -842,16 +934,23 @@ fn scan_source_impl(
         for segment in segments {
             let path = source_buf.clone();
             let sigs = sigs_arc.clone();
+            // Los contadores propios del escaneo sí hay que clonarlos (Arc) para moverlos al
+            // worker; `&SCAN_CANCEL_REQUESTED` y los espejos globales son referencias 'static.
+            let bytes = progress_bytes.clone();
+            let files = progress_files.clone();
             workers.0.push(std::thread::spawn(move || {
-                // `&SCAN_PROGRESS_BYTES` y `&SCAN_CANCEL_REQUESTED` son referencias 'static
-                // (statics globales), así que se pueden usar en cada worker sin clonar ni Arc.
                 scan_segment(
                     &path,
                     &segment,
                     &sigs,
                     file_size,
                     max_header_len,
-                    &SCAN_PROGRESS_BYTES,
+                    &ScanProgress {
+                        bytes: &bytes,
+                        files: &files,
+                        mirror_bytes: Some(&SCAN_PROGRESS_BYTES),
+                        mirror_files: Some(&SCAN_PROGRESS_FILES),
+                    },
                     None,
                     &SCAN_CANCEL_REQUESTED,
                 )
@@ -891,7 +990,11 @@ fn scan_source_impl(
         }
 
         // B3: reportar lo realmente leído, no `file_size` fijo (un EOF prematuro corta antes).
-        let scanned = SCAN_PROGRESS_BYTES.load(Ordering::Relaxed);
+        // Del contador propio: el global lo pisa cualquier otro escaneo del mismo proceso.
+        // Se acota a `file_size` porque en multi-hilo los segmentos se solapan (overlap para
+        // detectar firmas en la frontera) y esos bytes se leen dos veces: sin el tope, el resumen
+        // le decía al usuario que se escanearon más bytes de los que tiene el origen.
+        let scanned = std::cmp::min(progress_bytes.load(Ordering::Relaxed), file_size);
 
         // Siempre señalar al monitor que termine. Ya no hace falta falsear el contador a
         // `file_size` para lograrlo: el flag es propio de este escaneo y nadie más lo toca.
@@ -919,6 +1022,12 @@ fn scan_source_impl(
     // encontrados (seeks puntuales), no re-lee el origen entero, así que es rápido aun tras
     // cancelar.
     refine_footers(source_path, &mut found_files);
+
+    // Igualar el contador en vivo al total exacto (el conteo de a bloques es previo al dedup del
+    // camino multi-hilo). Así el último "Encontrados: N" que muestra la GUI coincide con la lista
+    // que el usuario ve después, en vez de quedar uno o dos por encima sin explicación.
+    progress_files.store(found_files.len() as u64, Ordering::Relaxed);
+    SCAN_PROGRESS_FILES.store(found_files.len() as u64, Ordering::Relaxed);
 
     if cancelled {
         pb.finish_with_message("⏹️  Escaneo cancelado");
@@ -1304,6 +1413,18 @@ mod tests {
     use super::*;
     use crate::signatures::{all_signatures, signatures_for_categories, FileCategory};
     use std::io::Write;
+
+    /// Contadores de progreso LOCALES al test (sin espejo a los globales), para poder llamar a
+    /// `scan_segment` sin pisar el estado que comparten los tests que corren en paralelo — misma
+    /// razón por la que el flag de cancelación también se pasa por parámetro.
+    fn local_progress<'a>(bytes: &'a AtomicU64, files: &'a AtomicU64) -> ScanProgress<'a> {
+        ScanProgress {
+            bytes,
+            files,
+            mirror_bytes: None,
+            mirror_files: None,
+        }
+    }
 
     fn found_with(sig: crate::signatures::FileSignature, footer_found: bool) -> FoundFile {
         FoundFile {
@@ -2493,6 +2614,7 @@ mod tests {
 
         // Cancelado de entrada → no lee, no encuentra nada.
         let progress = AtomicU64::new(0);
+        let files_found = AtomicU64::new(0);
         let cancel_on = AtomicBool::new(true);
         let cancelled = scan_segment(
             file.path(),
@@ -2500,7 +2622,7 @@ mod tests {
             &sigs,
             4096,
             max_header_len,
-            &progress,
+            &local_progress(&progress, &files_found),
             None,
             &cancel_on,
         );
@@ -2517,6 +2639,7 @@ mod tests {
 
         // Sin cancelar → sí encuentra el JPEG.
         let progress2 = AtomicU64::new(0);
+        let files_found2 = AtomicU64::new(0);
         let cancel_off = AtomicBool::new(false);
         let normal = scan_segment(
             file.path(),
@@ -2524,7 +2647,7 @@ mod tests {
             &sigs,
             4096,
             max_header_len,
-            &progress2,
+            &local_progress(&progress2, &files_found2),
             None,
             &cancel_off,
         );
@@ -2539,5 +2662,229 @@ mod tests {
         println!(
             "\nCancelación cooperativa corta el escaneo antes de leer y conserva el flujo normal."
         );
+    }
+
+    // ═══════════════ Contador en vivo de encontrados + bytes_scanned por escaneo ═══════════
+
+    /// Escribe un JPEG válido (SOI..EOI) de ~2 KB en `data` a partir de `pos`.
+    /// A propósito bien por encima de 512 bytes: `check_signatures_in_buffer` descarta todo lo
+    /// más chico que eso (anti-falsos-positivos) y el "archivo válido" no se detectaría.
+    fn write_jpeg(data: &mut [u8], pos: usize) {
+        data[pos..pos + 3].copy_from_slice(&[0xFF, 0xD8, 0xFF]);
+        for i in 3..2048 {
+            data[pos + i] = ((i * 17) % 256) as u8;
+        }
+        data[pos + 2048..pos + 2050].copy_from_slice(&[0xFF, 0xD9]);
+    }
+
+    /// El contador de "encontrados" se actualiza EN VIVO, bloque a bloque, y cuenta exactamente
+    /// los hallazgos que van a sobrevivir (los de la zona exclusiva del segmento). Se usa
+    /// `scan_segment` directo con contadores locales para que no dependa de timing.
+    #[test]
+    fn test_found_counter_counts_findings_in_segment() {
+        let size = 3 * 1024 * 1024usize;
+        let mut data = vec![0u8; size];
+        // Uno por bloque de 1 MB: obliga a que el conteo pase por varias iteraciones del loop.
+        write_jpeg(&mut data, 4096);
+        write_jpeg(&mut data, 1_500_000);
+        write_jpeg(&mut data, 2_500_000);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let max_header_len = max_signature_reach(&sigs);
+        let cancel = AtomicBool::new(false);
+
+        // Segmento que reclama todo el origen (camino de 1 hilo).
+        let bytes = AtomicU64::new(0);
+        let files = AtomicU64::new(0);
+        let whole = Segment {
+            start: 0,
+            end: size as u64,
+            claim_start: 0,
+            claim_end: size as u64,
+        };
+        let result = scan_segment(
+            file.path(),
+            &whole,
+            &sigs,
+            size as u64,
+            max_header_len,
+            &local_progress(&bytes, &files),
+            None,
+            &cancel,
+        );
+        assert!(
+            result.found_files.len() >= 3,
+            "deberían detectarse los 3 JPEG, se detectaron {}",
+            result.found_files.len()
+        );
+        assert_eq!(
+            files.load(Ordering::Relaxed),
+            result.found_files.len() as u64,
+            "el contador en vivo debe coincidir con lo que el segmento reporta"
+        );
+        assert_eq!(bytes.load(Ordering::Relaxed), size as u64);
+
+        // Segmento que LEE todo pero solo reclama la segunda mitad: el JPEG de 4096 se ve por el
+        // overlap pero no es suyo, así que no debe sumar al contador (si no, la GUI mostraría un
+        // total más alto que la lista final).
+        let bytes2 = AtomicU64::new(0);
+        let files2 = AtomicU64::new(0);
+        let claim_start = 1024 * 1024u64;
+        let partial = Segment {
+            start: 0,
+            end: size as u64,
+            claim_start,
+            claim_end: size as u64,
+        };
+        let result2 = scan_segment(
+            file.path(),
+            &partial,
+            &sigs,
+            size as u64,
+            max_header_len,
+            &local_progress(&bytes2, &files2),
+            None,
+            &cancel,
+        );
+        assert!(
+            result2.found_files.iter().all(|f| f.offset >= claim_start),
+            "el segmento no debería reportar hallazgos fuera de su zona exclusiva"
+        );
+        assert_eq!(
+            files2.load(Ordering::Relaxed),
+            result2.found_files.len() as u64,
+            "el contador en vivo no debe incluir hallazgos de la zona de overlap"
+        );
+    }
+
+    /// El contador global que lee la GUI (`scan_progress_files`) sube MIENTRAS el escaneo corre,
+    /// no solo al final — que es justamente lo que la GUI necesita para mostrar
+    /// "Encontrados hasta ahora: N".
+    #[test]
+    fn test_scan_progress_files_visible_during_scan() {
+        use std::sync::mpsc;
+
+        // Origen grande y con muchos hallazgos: da tiempo a muestrear mientras escanea.
+        let size = 24 * 1024 * 1024usize;
+        let mut data = vec![0u8; size];
+        let mut pos = 4096usize;
+        let mut written = 0u64;
+        while pos + 4096 < size {
+            write_jpeg(&mut data, pos);
+            pos += 64 * 1024;
+            written += 1;
+        }
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let path = file.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        let scan = std::thread::spawn(move || {
+            let r = scan_source_quiet(&path, &sigs);
+            let _ = tx.send(());
+            r
+        });
+
+        // Se muestrea el global mientras el escaneo corre y se guarda el máximo PARCIAL visto
+        // (descartando muestras >= al total, que ya podrían ser el valor final): un contador que
+        // solo se escribiera al terminar nunca produciría una muestra intermedia.
+        let mut samples = Vec::new();
+        while rx
+            .recv_timeout(std::time::Duration::from_micros(500))
+            .is_err()
+        {
+            samples.push(scan_progress_files());
+        }
+        let result = scan.join().unwrap().unwrap();
+        let total = result.found_files.len() as u64;
+        let saw_partial = samples.iter().any(|&n| n > 0 && n < total);
+
+        assert!(
+            result.found_files.len() as u64 >= written,
+            "deberían encontrarse al menos los {} JPEG escritos, se encontraron {}",
+            written,
+            result.found_files.len()
+        );
+        assert!(
+            saw_partial,
+            "el contador de encontrados nunca mostró un valor intermedio (total {}): no se está \
+             actualizando en vivo",
+            total
+        );
+    }
+
+    /// `bytes_scanned` tiene que salir del contador PROPIO del escaneo, no del global que la GUI
+    /// lee: si sale del global, otro escaneo concurrente del mismo proceso (los tests corren en
+    /// paralelo) lo resetea a 0 en medio y el número reportado es el del vecino. Este test martilla
+    /// el global con escaneos de otro tamaño y exige el valor exacto.
+    #[test]
+    fn test_bytes_scanned_is_per_scan_not_global() {
+        // 15 MB: por debajo del umbral de multi-hilo (16 MB), así este escaneo va por el camino de
+        // 1 hilo, y dura lo suficiente como para que varios escaneos ajenos arranquen mientras
+        // corre (cada arranque pone el global en 0).
+        let size = 15 * 1024 * 1024usize;
+        let mut data = vec![0u8; size];
+        write_jpeg(&mut data, 4096);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        // 20 MB: por encima del umbral, para cubrir también el camino multi-hilo.
+        let big_size = 20 * 1024 * 1024usize;
+        let mut big_data = vec![0u8; big_size];
+        write_jpeg(&mut big_data, 4096);
+        let mut big = tempfile::NamedTempFile::new().unwrap();
+        big.write_all(&big_data).unwrap();
+        big.flush().unwrap();
+
+        // Origen de OTRO tamaño para el martilleo: si `bytes_scanned` se contaminara, el valor
+        // observado sería distinto del tamaño real del origen escaneado.
+        let mut other = tempfile::NamedTempFile::new().unwrap();
+        other.write_all(&vec![0u8; 700 * 1024]).unwrap();
+        other.flush().unwrap();
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let hammer_stop = stop.clone();
+        let hammer_path = other.path().to_path_buf();
+        let hammer_sigs = sigs.clone();
+        let hammer = std::thread::spawn(move || {
+            while !hammer_stop.load(Ordering::Relaxed) {
+                let _ = scan_source_quiet(&hammer_path, &hammer_sigs);
+            }
+        });
+
+        let mut observed = Vec::new();
+        for _ in 0..3 {
+            observed.push((
+                scan_source_quiet(file.path(), &sigs).unwrap().bytes_scanned,
+                size as u64,
+            ));
+            observed.push((
+                scan_source_with_threads(big.path(), &sigs, 4)
+                    .unwrap()
+                    .bytes_scanned,
+                big_size as u64,
+            ));
+        }
+
+        // Frenar el martilleo ANTES de los asserts: un panic no debe dejar un hilo girando para
+        // el resto de la suite.
+        stop.store(true, Ordering::Relaxed);
+        hammer.join().unwrap();
+
+        for (got, expected) in observed {
+            assert_eq!(
+                got, expected,
+                "bytes_scanned se corrompió con escaneos concurrentes"
+            );
+        }
     }
 }

@@ -152,6 +152,11 @@ fn main() -> Result<()> {
             scanner::request_cancel();
         } else if clone::is_clone_in_progress() {
             clone::request_cancel();
+        } else if recovery::is_recovery_in_progress() {
+            // Recuperar miles de archivos también puede tardar muchísimo. Sin esto, un Ctrl+C
+            // durante la recuperación mataba el proceso de una: el parcial quedaba en disco pero
+            // sin resumen ni aviso de que estaba incompleto.
+            recovery::request_cancel();
         } else {
             process::exit(130);
         }
@@ -476,26 +481,40 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
             recovery::recover_files(&config.source_path, &result.found_files, &config.output_dir)?;
 
         println!();
+        // El titular tiene que decir la verdad. Ahora que la recuperación se puede cancelar con
+        // Ctrl+C, anunciar "COMPLETADA" a secas después de un corte sería mentir por omisión justo
+        // cuando el usuario decide si sigue intentando o da el tema por cerrado. Es la misma
+        // lección que ya se había aplicado en la pantalla final de la GUI.
+        let (titulo, color_ok) = if recovery_result.cancelled {
+            ("      ⏹️  RECUPERACIÓN INTERRUMPIDA             ", false)
+        } else {
+            ("         ✅ RECUPERACIÓN COMPLETADA              ", true)
+        };
+        let marco = |s: &str| {
+            if color_ok {
+                s.bright_green()
+            } else {
+                s.bright_yellow()
+            }
+        };
         println!(
             "{}",
-            "  ╔══════════════════════════════════════════════╗".bright_green()
+            marco("  ╔══════════════════════════════════════════════╗")
         );
         println!(
             "{}{}{}",
-            "  ║".bright_green(),
-            "         ✅ RECUPERACIÓN COMPLETADA              "
-                .bright_white()
-                .bold(),
-            "║".bright_green()
+            marco("  ║"),
+            titulo.bright_white().bold(),
+            marco("║")
         );
         println!(
             "{}",
-            "  ╠══════════════════════════════════════════════╣".bright_green()
+            marco("  ╠══════════════════════════════════════════════╣")
         );
         println!("{}", recovery_result.summary());
         println!(
             "{}",
-            "  ╚══════════════════════════════════════════════╝".bright_green()
+            marco("  ╚══════════════════════════════════════════════╝")
         );
         println!();
     }
