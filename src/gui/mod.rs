@@ -16,6 +16,7 @@ use eframe::egui;
 
 mod theme;
 
+use crate::clone::{self, CloneResult};
 use crate::drives::{self, DriveInfo};
 use crate::recovery::{self, RecoveryResult};
 use crate::scanner::{self, Integrity, ScanResult};
@@ -90,6 +91,10 @@ enum Phase {
     Results,
     Recovering,
     Done,
+    /// Copiando el disco a un archivo de imagen (para un disco que está fallando).
+    Cloning,
+    /// Terminó la copia: se muestra el resumen y se ofrece escanear la imagen recién creada.
+    CloneDone,
     Error,
 }
 
@@ -98,6 +103,8 @@ enum Phase {
 enum PendingAction {
     Scan,
     Recover,
+    /// Copiar el disco a una imagen. El destino es el `.img`, no la carpeta de recuperación.
+    Clone,
 }
 
 struct RecupeGhostApp {
@@ -109,10 +116,12 @@ struct RecupeGhostApp {
 
     /// Advertencia de "vas a guardar en el mismo disco que estás recuperando" pendiente de
     /// resolver, con la acción que quedó frenada esperándola.
-    /// Se guarda también el ORIGEN exacto que se chequeó: al aceptar el riesgo hay que registrar
-    /// ese mismo par, no recalcularlo. `resolve_source()` devuelve el disco seleccionado AHORA en
-    /// la lista, que puede haber cambiado desde que se lanzó la advertencia.
-    pending_warning: Option<(String, PendingAction, PathBuf)>,
+    /// Se guardan también el ORIGEN y el DESTINO exactos que se chequearon: al aceptar el riesgo
+    /// hay que registrar ese mismo par, no recalcularlo. `resolve_source()` devuelve el disco
+    /// seleccionado AHORA en la lista, y el destino del clonado se elige con un diálogo que no se
+    /// puede reabrir sin volver a molestar al usuario — así que ambos se llevan en la tupla.
+    /// Orden: (mensaje, acción, origen, destino).
+    pending_warning: Option<(String, PendingAction, PathBuf, PathBuf)>,
     /// Combinación (origen, destino) EXACTA para la que el usuario ya aceptó el riesgo de
     /// mismo-disco. No alcanza con un booleano: una aceptación puntual no puede apagar la
     /// protección para discos y carpetas que la persona nunca aprobó. Con la pareja guardada,
@@ -127,6 +136,10 @@ struct RecupeGhostApp {
     scan_result: Option<ScanResult>,
     recovery_rx: Option<Receiver<anyhow::Result<RecoveryResult>>>,
     recovery_result: Option<RecoveryResult>,
+    // Clonado de disco a imagen (para un disco que está fallando).
+    clone_rx: Option<Receiver<anyhow::Result<CloneResult>>>,
+    clone_result: Option<CloneResult>,
+    clone_total: u64,
     error_msg: String,
     /// Traducción amigable del error, cuando el fallo viene de un `io::Error` reconocible.
     error_hint: Option<&'static str>,
@@ -154,6 +167,9 @@ impl RecupeGhostApp {
             scan_result: None,
             recovery_rx: None,
             recovery_result: None,
+            clone_rx: None,
+            clone_result: None,
+            clone_total: 0,
             error_msg: String::new(),
             error_hint: None,
         };
@@ -180,7 +196,45 @@ impl RecupeGhostApp {
                         .to_string(),
                     PendingAction::Scan,
                     PathBuf::from("/dev/demo"),
+                    self.output_path(),
                 ));
+            }
+            // Diálogo de mismo-disco en el flujo de CLONADO: el texto debe hablar de "copia", no
+            // de "escaneo"/"carpeta de salida".
+            Ok("same_device_clone") => {
+                self.pending_warning = Some((
+                    "  ⚠️  Estás guardando la copia en el mismo disco que querés copiar (/dev/sdb).\n\
+                     La copia iría a parar al propio disco que estás rescatando y lo llenaría, \
+                     pisando justo lo que intentás salvar. Elegí guardar la copia en OTRO disco."
+                        .to_string(),
+                    PendingAction::Clone,
+                    PathBuf::from("/dev/sdb"),
+                    PathBuf::from("/dev/sdb/copia.img"),
+                ));
+            }
+            // Copia en curso: barra de progreso del clonado. Si se pasa una imagen de origen por
+            // `RECUPEGHOST_GUI_DEMO_IMG`, se lanza un clon REAL (a un .img temporal) para poder
+            // mirar la barra en movimiento; si no, se queda en "Preparando…".
+            Ok("cloning") => {
+                if let Ok(img) = std::env::var("RECUPEGHOST_GUI_DEMO_IMG") {
+                    let dest = std::env::temp_dir().join("recupeghost_demo_clon.img");
+                    self.spawn_clone(PathBuf::from(img), dest);
+                } else {
+                    self.clone_total = 8_000_000_000;
+                    self.phase = Phase::Cloning;
+                }
+            }
+            // Pantalla tras terminar la copia, con algún sector dañado, ofreciendo escanearla.
+            Ok("clone_done") => {
+                self.clone_result = Some(CloneResult {
+                    total_bytes: 8_000_000_000,
+                    good_bytes: 7_998_000_000,
+                    bad_bytes: 2_000_000,
+                    bad_blocks: 3,
+                    cancelled: false,
+                    output_path: PathBuf::from("/tmp/RecupeGhost_imagen_demo.img"),
+                });
+                self.phase = Phase::CloneDone;
             }
             // Pasos del asistente: para poder mirarlos sin tener que clickear.
             Ok("types") => self.phase = Phase::Setup(Step::Types),
@@ -286,15 +340,31 @@ impl RecupeGhostApp {
     /// Devuelve `true` si hay que frenar y esperar la decisión del usuario. El CLI ya hacía esto
     /// en sus tres flujos; la GUI no lo hacía en ninguno, y su única defensa era un cartel fijo
     /// que no verificaba nada.
-    fn blocked_by_same_device(&mut self, source: &std::path::Path, action: PendingAction) -> bool {
-        let out = self.output_path();
+    /// `dest` es lo que se va a ESCRIBIR: la carpeta de recuperación en escaneo/recuperación, o el
+    /// archivo `.img` en el clonado. En los tres casos el peligro es el mismo — escribir en el
+    /// disco que se está rescatando puede tapar justo lo que se busca.
+    fn blocked_by_same_device(
+        &mut self,
+        source: &std::path::Path,
+        dest: &std::path::Path,
+        action: PendingAction,
+    ) -> bool {
         // La aceptación vale solo para la combinación exacta que se aprobó.
-        if self.same_device_accepted.as_ref() == Some(&(source.to_path_buf(), out.clone())) {
+        if self.same_device_accepted.as_ref() == Some(&(source.to_path_buf(), dest.to_path_buf())) {
             return false;
         }
-        match crate::ui::same_device_warning(source, &out) {
+        // Mismo detector, distinto vocabulario: en el clonado el destino es un archivo `.img`, no
+        // una carpeta de salida, así que se le habla de "copia" en vez de "escaneo".
+        let warning = match action {
+            PendingAction::Clone => crate::ui::same_device_warning_clone(source, dest),
+            PendingAction::Scan | PendingAction::Recover => {
+                crate::ui::same_device_warning(source, dest)
+            }
+        };
+        match warning {
             Some(warning) => {
-                self.pending_warning = Some((warning, action, source.to_path_buf()));
+                self.pending_warning =
+                    Some((warning, action, source.to_path_buf(), dest.to_path_buf()));
                 true
             }
             None => false,
@@ -332,7 +402,7 @@ impl RecupeGhostApp {
         }
         // Y no puede estar en el mismo disco que se está recuperando. Se pregunta acá, donde el
         // error todavía es gratis de corregir.
-        if self.blocked_by_same_device(&source, PendingAction::Scan) {
+        if self.blocked_by_same_device(&source, &out, PendingAction::Scan) {
             return;
         }
 
@@ -375,16 +445,91 @@ impl RecupeGhostApp {
         // Segunda barrera, en el momento en que de verdad se escribe. El escaneo pudo haber
         // durado horas: acá se vuelve a chequear por si el escenario cambió (por ejemplo, se
         // desmontó y remontó un disco entre medio).
-        if self.blocked_by_same_device(&source, PendingAction::Recover) {
+        let out = self.output_path();
+        if self.blocked_by_same_device(&source, &out, PendingAction::Recover) {
             return;
         }
-        let out = self.output_path();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(recovery::recover_files_quiet(&source, &files, &out));
         });
         self.recovery_rx = Some(rx);
         self.phase = Phase::Recovering;
+    }
+
+    /// Inicia el clonado del disco a un archivo de imagen `.img`. Es el camino correcto para un
+    /// disco que está fallando: se saca una copia byte a byte primero (sin estresarlo escaneando
+    /// en vivo) y después se escanea la copia.
+    ///
+    /// Abre un diálogo nativo para elegir dónde guardar el `.img`. Toda la protección de datos del
+    /// escaneo aplica igual: el destino no puede ser un dispositivo, ni caer en el mismo disco que
+    /// se está copiando (eso lo sobrescribiría y destruiría justo lo que se quiere rescatar).
+    fn start_clone(&mut self) {
+        if self.pending_warning.is_some() {
+            return;
+        }
+        let source = match self.resolve_source() {
+            Some(s) => s,
+            None => return self.fail("Elegí el disco que querés copiar."),
+        };
+        // Clonar solo tiene sentido sobre un disco físico. Si el origen ya es un archivo de imagen,
+        // copiarlo es redundante (ya es un archivo escaneable). El botón no se muestra en ese caso,
+        // pero se chequea igual por las dudas.
+        if !util::is_physical_device(&source) {
+            return self.fail(
+                "La copia de seguridad es para discos y memorias. El origen elegido ya es un \
+                 archivo de imagen: podés escanearlo directamente.",
+            );
+        }
+
+        // Destino del .img con un diálogo nativo de "guardar como". Igual que el resto de la GUI,
+        // se usa el diálogo del sistema en vez de pedir que tipeen una ruta.
+        let sugerido = default_image_name();
+        let elegido = rfd::FileDialog::new()
+            .set_title("¿Dónde guardo la copia del disco? (elegí OTRO disco)")
+            .add_filter("Imagen de disco", &["img"])
+            .set_file_name(&sugerido)
+            .save_file();
+        let mut dest = match elegido {
+            Some(p) => p,
+            // El usuario cerró el diálogo sin elegir: no es un error, se queda donde estaba.
+            None => return,
+        };
+        // Asegurar la extensión .img si el diálogo no la puso.
+        if dest.extension().is_none() {
+            dest.set_extension("img");
+        }
+        let dest = util::to_absolute_output(dest);
+
+        // Misma protección crítica que el CLI: el destino JAMÁS puede ser un dispositivo crudo. Con
+        // permisos elevados, crear un archivo sobre `/dev/...` o `\\.\PhysicalDriveN` abriría el
+        // disco en escritura y el clon lo sobrescribiría entero.
+        if util::is_physical_device(&dest) {
+            return self.fail(
+                "El destino no puede ser un disco: tiene que ser un ARCHIVO de imagen (.img) en \
+                 otro disco. Elegí una carpeta normal para guardarlo.",
+            );
+        }
+        // Y no puede caer en el mismo disco que se está copiando.
+        if self.blocked_by_same_device(&source, &dest, PendingAction::Clone) {
+            return;
+        }
+        self.spawn_clone(source, dest);
+    }
+
+    /// Lanza el hilo de clonado ya con origen y destino resueltos y validados. Separado de
+    /// `start_clone` para que, tras aceptar la advertencia de mismo-disco, se pueda arrancar con el
+    /// par exacto que se advirtió SIN reabrir el diálogo de elegir archivo.
+    fn spawn_clone(&mut self, source: PathBuf, dest: PathBuf) {
+        self.clone_total = scanner::device_or_file_size(&source).unwrap_or(0);
+        let (tx, rx) = mpsc::channel();
+        let dest_thread = dest.clone();
+        thread::spawn(move || {
+            let _ = tx.send(clone::clone_to_image_quiet(&source, &dest_thread));
+        });
+        self.clone_rx = Some(rx);
+        self.clone_result = None;
+        self.phase = Phase::Cloning;
     }
 
     /// Revisa los canales de background y avanza de fase cuando llega un resultado.
@@ -427,6 +572,30 @@ impl RecupeGhostApp {
                     Some(Err(TryRecvError::Disconnected)) => {
                         self.recovery_rx = None;
                         self.fail("La recuperación terminó inesperadamente.");
+                    }
+                    None => {}
+                }
+            }
+            Phase::Cloning => {
+                let msg = self.clone_rx.as_ref().map(|rx| rx.try_recv());
+                match msg {
+                    Some(Ok(Ok(r))) => {
+                        self.clone_result = Some(r);
+                        self.clone_rx = None;
+                        self.phase = Phase::CloneDone;
+                    }
+                    Some(Ok(Err(e))) => {
+                        self.clone_rx = None;
+                        // Si la escritura falló a mitad (ej. destino lleno), la imagen parcial que
+                        // ya se escribió sigue siendo válida y escaneable. El mensaje de error del
+                        // motor ya menciona el espacio; acá se traduce a criollo como cualquier
+                        // otro error de I/O.
+                        self.fail_io("No se pudo terminar de copiar el disco", &e);
+                    }
+                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint(),
+                    Some(Err(TryRecvError::Disconnected)) => {
+                        self.clone_rx = None;
+                        self.fail("La copia terminó inesperadamente.");
                     }
                     None => {}
                 }
@@ -812,6 +981,33 @@ impl RecupeGhostApp {
         if self.ui_nav(ui, Step::Summary, "🔍  Empezar la búsqueda", None) {
             self.start_scan();
         }
+
+        // Camino alternativo, explícito: si el disco está fallando, lo correcto es copiarlo a un
+        // archivo ANTES de escanearlo (cada lectura de más puede acelerar su muerte). Se ofrece
+        // solo cuando el origen es un disco físico — sobre un archivo de imagen la copia no tiene
+        // sentido.
+        let source_es_disco = self
+            .resolve_source()
+            .map(|s| util::is_physical_device(&s))
+            .unwrap_or(false);
+        if source_es_disco {
+            ui.add_space(14.0);
+            theme::notice(
+                ui,
+                theme::TEXT_WEAK,
+                theme::GROUND,
+                "¿Tu disco hace ruidos raros, se desconecta solo o va y viene? Entonces está \
+                 fallando: conviene copiarlo a un archivo primero y buscar en la copia, para no \
+                 forzarlo más.",
+            );
+            ui.add_space(6.0);
+            if ui
+                .button("📀  Mi disco falla: copiarlo primero (más seguro)")
+                .clicked()
+            {
+                self.start_clone();
+            }
+        }
     }
 
     fn ui_scanning(&mut self, ui: &mut egui::Ui) {
@@ -933,6 +1129,23 @@ impl RecupeGhostApp {
                  pudo, así que pueden faltar archivos de las zonas dañadas. Si el disco está \
                  fallando, conviene hacer una copia antes de seguir usándolo.",
             );
+            // El escaneo acaba de dar evidencia de que el disco falla. Acá el ofrecimiento de
+            // copiarlo no es teórico: es el momento en que más sirve. Solo si el origen era un
+            // disco físico (sobre una imagen no aplica).
+            let source_es_disco = self
+                .source
+                .as_deref()
+                .map(util::is_physical_device)
+                .unwrap_or(false);
+            if source_es_disco {
+                ui.add_space(4.0);
+                if ui
+                    .button("📀  Copiar el disco a un archivo antes de seguir")
+                    .clicked()
+                {
+                    self.start_clone();
+                }
+            }
             ui.add_space(4.0);
         }
 
@@ -1054,6 +1267,161 @@ impl RecupeGhostApp {
             recovery::request_cancel();
         }
         ui.ctx().request_repaint();
+    }
+
+    fn ui_cloning(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        theme::section_title(ui, "Copiando tu disco…");
+        ui.label(
+            egui::RichText::new(
+                "Estamos haciendo una copia de seguridad antes de buscar nada, para no forzar el \
+                 disco. No lo desconectes.",
+            )
+            .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(14.0);
+
+        // Igual que en escaneo/recuperación: hasta que el hilo no levantó su flag, el contador
+        // global todavía tiene el valor de una copia anterior. Se muestra "Preparando…" y no se
+        // dibuja la barra ni el botón de detener hasta que la copia arrancó de verdad.
+        if !clone::is_clone_in_progress() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Preparando…");
+            });
+            ui.ctx().request_repaint();
+            return;
+        }
+        let done = clone::clone_progress_bytes();
+        let frac = if self.clone_total > 0 {
+            (done as f32 / self.clone_total as f32).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        ui.add(
+            egui::ProgressBar::new(frac)
+                .show_percentage()
+                .desired_height(24.0),
+        );
+        if self.clone_total > 0 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} de {} copiados",
+                    format_size(done.min(self.clone_total)),
+                    format_size(self.clone_total)
+                ))
+                .color(theme::TEXT_WEAK),
+            );
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "Cuando termine, buscamos tus archivos dentro de la copia. Podés usar la \
+                 computadora normalmente mientras tanto.",
+            )
+            .size(13.0)
+            .color(theme::TEXT_WEAK),
+        );
+
+        ui.add_space(18.0);
+        // Se puede detener: la copia parcial que ya se escribió sirve y se puede escanear igual.
+        let deteniendo = clone::cancel_requested();
+        if deteniendo {
+            ui.add_enabled(false, egui::Button::new("Deteniendo…"));
+        } else if ui.button("⏹  Detener y quedarme con lo copiado").clicked() {
+            clone::request_cancel();
+        }
+        ui.ctx().request_repaint();
+    }
+
+    fn ui_clone_done(&mut self, ui: &mut egui::Ui) {
+        // Se leen los campos crudos del resultado, NO `CloneResult::summary()`: ese resumen es del
+        // CLI (lleva emojis con selector de variación U+FE0F que Atkinson no tiene y egui dibuja
+        // como un cuadrito de "glifo faltante", y repite la ruta que acá ya se muestra aparte).
+        let (cancelled, good_bytes, bad_bytes, bad_blocks, total_bytes, image) =
+            match self.clone_result.as_ref() {
+                Some(r) => (
+                    r.cancelled,
+                    r.good_bytes,
+                    r.bad_bytes,
+                    r.bad_blocks,
+                    r.total_bytes,
+                    r.output_path.clone(),
+                ),
+                None => return,
+            };
+
+        ui.add_space(12.0);
+        if cancelled {
+            theme::section_title(ui, "⏹ Detuviste la copia.");
+            ui.label(
+                "Lo que se alcanzó a copiar quedó guardado y se puede revisar igual. Si querés la \
+                 copia completa, volvé a empezar y dejala terminar.",
+            );
+        } else {
+            theme::section_title(ui, "✅ Copia terminada.");
+            ui.label(
+                "Ya tenés una copia de seguridad del disco. Ahora podemos buscar tus archivos \
+                 dentro de la copia, sin volver a tocar el disco original.",
+            );
+        }
+        ui.add_space(8.0);
+
+        ui.label(
+            egui::RichText::new(format!(
+                "Se copiaron {} de {}.",
+                format_size(good_bytes),
+                format_size(total_bytes)
+            ))
+            .color(theme::TEXT),
+        );
+        // Solo si hubo sectores ilegibles: es el escenario del disco que falla, y hay que
+        // tranquilizar (lo copiado está a salvo) sin esconder que algo faltó.
+        if bad_bytes > 0 {
+            ui.add_space(4.0);
+            theme::notice(
+                ui,
+                theme::WARN,
+                theme::WARN_BG,
+                &format!(
+                    "{} no se pudieron leer ({} zona/s dañada/s) y quedaron en blanco en la copia. \
+                     Es normal en un disco que está fallando: lo que sí se pudo leer ya está a \
+                     salvo en la copia.",
+                    format_size(bad_bytes),
+                    bad_blocks
+                ),
+            );
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(format!("Copia guardada en: {}", image.display()))
+                .font(egui::FontId::monospace(13.0))
+                .color(theme::TEXT_WEAK),
+        );
+        ui.add_space(12.0);
+
+        // El siguiente paso natural: escanear la imagen recién creada. Se carga como origen (un
+        // .img no es un dispositivo físico, así que la advertencia de mismo-disco no se cruza) y se
+        // reusan los tipos y la carpeta que el usuario ya eligió.
+        if good_bytes > 0
+            && ui
+                .add(theme::primary_button("🔍  Buscar mis archivos en la copia"))
+                .clicked()
+        {
+            self.manual_path = image.display().to_string();
+            self.scan_result = None;
+            self.recovery_result = None;
+            self.clone_result = None;
+            self.start_scan();
+        }
+        ui.add_space(8.0);
+        if ui.button("↩ Volver al inicio").clicked() {
+            self.manual_path.clear();
+            self.clone_result = None;
+            self.scan_result = None;
+            self.recovery_result = None;
+            self.phase = Phase::Setup(Step::Source);
+        }
     }
 
     fn ui_done(&mut self, ui: &mut egui::Ui) {
@@ -1234,6 +1602,8 @@ impl eframe::App for RecupeGhostApp {
                     Phase::Results => self.ui_results(ui),
                     Phase::Recovering => self.ui_recovering(ui),
                     Phase::Done => self.ui_done(ui),
+                    Phase::Cloning => self.ui_cloning(ui),
+                    Phase::CloneDone => self.ui_clone_done(ui),
                     Phase::Error => self.ui_error(ui),
                 });
         });
@@ -1254,9 +1624,16 @@ impl RecupeGhostApp {
     /// egui 0.29 todavía no tiene `Modal` (llegó en 0.31), así que se arma con una `Window` fija
     /// y no colapsable.
     fn ui_same_device_dialog(&mut self, ctx: &egui::Context) {
-        let Some((warning, action, origen_avisado)) = self.pending_warning.clone() else {
+        let Some((warning, action, origen_avisado, destino_avisado)) = self.pending_warning.clone()
+        else {
             return;
         };
+
+        let es_clon = action == PendingAction::Clone;
+        // El `⚠️` de los mensajes lleva el selector de variación U+FE0F, que Atkinson no tiene y
+        // egui dibuja como un cuadrito de "glifo faltante". Se saca para el display de la GUI (el
+        // mensaje se comparte con el CLI, donde en la terminal sí se ve bien).
+        let warning_gui = warning.replace('\u{fe0f}', "");
 
         let mut choice: Option<bool> = None; // Some(true) = seguir igual, Some(false) = corregir
         egui::Window::new("Un momento — esto es importante")
@@ -1266,20 +1643,25 @@ impl RecupeGhostApp {
             .show(ctx, |ui| {
                 ui.set_max_width(460.0);
                 ui.add_space(4.0);
-                ui.label(warning.trim());
+                ui.label(warning_gui.trim());
                 ui.add_space(6.0);
-                ui.label(
+                ui.label(if es_clon {
+                    "La copia terminaría en el mismo disco que querés rescatar y podría pisar \
+                     justo lo que intentás salvar. No tiene vuelta atrás."
+                } else {
                     "Si guardás en el mismo disco del que estás recuperando, lo que se escriba \
                      puede tapar para siempre los archivos que estás buscando. No tiene vuelta \
-                     atrás.",
-                );
+                     atrás."
+                });
                 ui.add_space(12.0);
                 // La opción segura es la única con peso visual. La riesgosa queda como texto
                 // chico y apagado: sigue estando a un clic, pero hay que ir a buscarla.
-                if ui
-                    .add(theme::primary_button("Elegir otra carpeta"))
-                    .clicked()
-                {
+                let etiqueta_segura = if es_clon {
+                    "Guardar la copia en otro disco"
+                } else {
+                    "Elegir otra carpeta"
+                };
+                if ui.add(theme::primary_button(etiqueta_segura)).clicked() {
                     choice = Some(false);
                 }
                 ui.add_space(4.0);
@@ -1299,25 +1681,37 @@ impl RecupeGhostApp {
         match choice {
             Some(true) => {
                 self.pending_warning = None;
-                // El par que se registra es EXACTAMENTE el que se advirtió. Recalcularlo con
-                // `resolve_source()` tenía dos consecuencias feas cuando el usuario había tocado
-                // la lista de discos entre medio: la recuperación quedaba en un bucle infinito
-                // (se aceptaba un par y se chequeaba otro, así que la advertencia volvía siempre),
-                // y encima quedaba autorizado un par que nunca se le mostró.
-                self.same_device_accepted = Some((origen_avisado, self.output_path()));
+                // El par que se registra es EXACTAMENTE el que se advirtió (origen + destino).
+                // Recalcularlo tenía dos consecuencias feas cuando el usuario había tocado la lista
+                // de discos entre medio: la acción quedaba en un bucle infinito (se aceptaba un par
+                // y se chequeaba otro, así que la advertencia volvía siempre), y encima quedaba
+                // autorizado un par que nunca se le mostró. En el clonado el destino es el `.img`,
+                // que además no se puede recalcular sin reabrir el diálogo de elegir archivo.
+                self.same_device_accepted = Some((origen_avisado.clone(), destino_avisado.clone()));
                 match action {
                     PendingAction::Scan => self.start_scan(),
                     PendingAction::Recover => self.start_recovery(),
+                    // Se arranca con el par exacto ya elegido, sin volver a abrir el diálogo.
+                    PendingAction::Clone => self.spawn_clone(origen_avisado, destino_avisado),
                 }
             }
             Some(false) => {
-                // Volver siempre a donde se elige la carpeta: es el único lugar donde el usuario
-                // puede corregir el destino. La pantalla de resultados no tiene ese campo, así
-                // que dejarlo ahí sería un callejón sin salida con la advertencia ya descartada.
-                // Si venía de recuperar, `scan_result` se conserva y `ui_setup` ofrece volver a
-                // los resultados: corregir la carpeta no cuesta re-escanear.
                 self.pending_warning = None;
-                self.phase = Phase::Setup(Step::Output);
+                match action {
+                    // Volver a donde se elige la carpeta: es el único lugar donde el usuario puede
+                    // corregir el destino de recuperación. La pantalla de resultados no tiene ese
+                    // campo, así que dejarlo ahí sería un callejón sin salida con la advertencia ya
+                    // descartada. Si venía de recuperar, `scan_result` se conserva y el paso ofrece
+                    // volver a los resultados: corregir la carpeta no cuesta re-escanear.
+                    PendingAction::Scan | PendingAction::Recover => {
+                        self.phase = Phase::Setup(Step::Output);
+                    }
+                    // El destino del clonado se elige con el diálogo nativo, no en un paso del
+                    // asistente. Alcanza con descartar la advertencia: el usuario se queda donde
+                    // estaba (resumen o resultados) y puede volver a apretar "copiar", que reabre
+                    // el diálogo para elegir OTRO lugar.
+                    PendingAction::Clone => {}
+                }
             }
             None => {}
         }
@@ -1354,6 +1748,15 @@ fn open_folder(path: &std::path::Path) {
 fn default_output_name() -> String {
     format!(
         "RecupeGhost_{}",
+        chrono::Local::now().format("%Y%m%d_%H%M%S")
+    )
+}
+
+/// Nombre sugerido para el archivo de imagen del clonado. El diálogo nativo lo ofrece como default
+/// y el usuario elige la carpeta.
+fn default_image_name() -> String {
+    format!(
+        "RecupeGhost_imagen_{}.img",
         chrono::Local::now().format("%Y%m%d_%H%M%S")
     )
 }

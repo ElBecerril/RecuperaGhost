@@ -603,10 +603,59 @@ fn normalize_to_whole_disk(path: &str) -> String {
     path.to_string()
 }
 
+/// Riesgo detectado de escribir en el mismo disco físico que se está leyendo. La DETECCIÓN es
+/// común a escaneo, recuperación y clonado; solo cambia cómo se le explica al usuario (escaneo
+/// habla de "carpeta de salida", el clonado de "archivo de imagen"). Por eso el detector devuelve
+/// este enum y cada frente lo formatea con su vocabulario.
+enum SameDeviceRisk {
+    /// Se confirmó que el destino cae en el mismo disco (con el mount/letra que lo delata).
+    Same(String),
+    /// No se pudo confirmar que el destino esté en OTRO disco (origen sin mounts detectados). Se
+    /// advierte igual por las dudas — falso positivo antes que falso negativo. Lleva el origen.
+    Unconfirmed(String),
+}
+
+/// Advertencia de mismo-disco con el vocabulario del ESCANEO/recuperación ("carpeta de salida").
+/// La usan el CLI (scan/recover) y la GUI en esos flujos.
 pub fn same_device_warning(
     source_path: &std::path::Path,
     output_dir: &std::path::Path,
 ) -> Option<String> {
+    same_device_risk(source_path, output_dir).map(|risk| match risk {
+        SameDeviceRisk::Same(mount) => format!(
+            "  ⚠️  La carpeta de salida está en el mismo disco que estás escaneando ({}).\n     Si guardás ahí, podrías perder para siempre justo los archivos que estás tratando de recuperar. Elegí otra carpeta, idealmente en otro disco.",
+            mount
+        ),
+        SameDeviceRisk::Unconfirmed(src) => format!(
+            "  ⚠️  No pudimos confirmar que la carpeta de salida esté en un disco distinto al que estás escaneando ({}).\n     Por las dudas, fijate que la carpeta de salida NO esté en ese mismo disco/USB — si no, podrías perder para siempre justo lo que estás tratando de recuperar.",
+            src
+        ),
+    })
+}
+
+/// Misma detección, pero con el vocabulario del CLONADO: el usuario eligió un ARCHIVO de imagen
+/// (`.img`), no una carpeta de salida, y está COPIANDO, no escaneando. En un diálogo que es la
+/// última barrera antes de una pérdida irreversible, hablarle de "escaneo" y "carpeta" confunde.
+pub fn same_device_warning_clone(
+    source_path: &std::path::Path,
+    image_path: &std::path::Path,
+) -> Option<String> {
+    same_device_risk(source_path, image_path).map(|risk| match risk {
+        SameDeviceRisk::Same(mount) => format!(
+            "  ⚠️  Estás guardando la copia en el mismo disco que querés copiar ({}).\n     La copia iría a parar al propio disco que estás rescatando y lo llenaría, pisando justo lo que intentás salvar. Elegí guardar la copia en OTRO disco.",
+            mount
+        ),
+        SameDeviceRisk::Unconfirmed(src) => format!(
+            "  ⚠️  No pudimos confirmar que estés guardando la copia en un disco distinto al que querés copiar ({}).\n     Por las dudas, fijate que el archivo de la copia NO quede en ese mismo disco/USB — si no, podrías pisar justo lo que estás tratando de salvar.",
+            src
+        ),
+    })
+}
+
+fn same_device_risk(
+    source_path: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Option<SameDeviceRisk> {
     let src_str = source_path.to_string_lossy();
     if !crate::util::is_physical_device(source_path) {
         return None;
@@ -666,10 +715,7 @@ pub fn same_device_warning(
     // falso positivo ocasional a un falso negativo que corrompa la
     // recuperación en curso.
     if mounts.is_empty() {
-        return Some(format!(
-            "  ⚠️  No pudimos confirmar que la carpeta de salida esté en un disco distinto al que estás escaneando ({}).\n     Por las dudas, fijate que la carpeta de salida NO esté en ese mismo disco/USB — si no, podrías perder para siempre justo lo que estás tratando de recuperar.",
-            src_str
-        ));
+        return Some(SameDeviceRisk::Unconfirmed(src_str.to_string()));
     }
 
     for mount in &mounts {
@@ -716,10 +762,7 @@ pub fn same_device_warning(
         }
 
         if same {
-            return Some(format!(
-                "  ⚠️  La carpeta de salida está en el mismo disco que estás escaneando ({}).\n     Si guardás ahí, podrías perder para siempre justo los archivos que estás tratando de recuperar. Elegí otra carpeta, idealmente en otro disco.",
-                mount
-            ));
+            return Some(SameDeviceRisk::Same(mount.clone()));
         }
     }
 
