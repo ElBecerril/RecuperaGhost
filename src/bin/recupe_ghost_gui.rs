@@ -15,9 +15,33 @@
 // tienen que verse. Solo afecta a este binario; el CLI conserva su consola, que es donde vive.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-fn main() -> eframe::Result<()> {
+fn main() {
     instalar_aviso_de_panico();
-    recupe_ghost::gui::run()
+
+    // Si `run()` devuelve `Err` NO hay que dejarlo morir en silencio. Un `Err` de arranque no es
+    // un panic, así que el hook de arriba NO lo atrapa; y como el binario no tiene consola
+    // (`windows_subsystem = "windows"`), el mensaje que el runtime imprimiría por stderr no va a
+    // ningún lado. Resultado sin esto: la persona hace doble clic, y "no pasa nada".
+    //
+    // El caso real que dispara esto es que no se pueda iniciar la parte gráfica: en una Windows
+    // sin drivers de video que soporten aceleración (una VM, escritorio remoto, una PC vieja, o
+    // drivers rotos) egui no consigue el contexto que necesita. Por eso el mensaje apunta a eso y
+    // ofrece la salida concreta — la versión de línea de comandos, que no dibuja nada.
+    if let Err(e) = recupe_ghost::gui::run() {
+        rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title("RecupeGhost no pudo abrir la ventana")
+            .set_description(format!(
+                "No se pudo iniciar la parte gráfica del programa.\n\nCasi siempre es porque este \
+                 equipo no tiene drivers de tarjeta de video actualizados (pasa en máquinas \
+                 virtuales, escritorio remoto o computadoras viejas). Probá actualizar Windows y \
+                 los drivers de video, y volvé a intentar.\n\nMientras tanto podés usar la versión \
+                 de línea de comandos (recupe_ghost.exe), que hace lo mismo sin necesitar video.\n\n\
+                 Detalle técnico (por si pedís ayuda):\n{e}"
+            ))
+            .show();
+        std::process::exit(1);
+    }
 }
 
 /// Muestra los panics en un cartel del sistema en vez de dejarlos desaparecer.
