@@ -5,11 +5,35 @@ on:
     tags:
       - "v*"
 
+# Permiso mínimo por defecto: los jobs de build/checkout solo LEEN el repo. La escritura al
+# release se acota al job `release` (más abajo), para que una dependencia de build comprometida
+# no tenga un token con permiso para escribir en el repo o publicar releases.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  # Corta el release temprano si el tag no coincide con la versión de Cargo.toml. Sin esto, un
+  # `git tag v0.5.2` olvidando bumpear Cargo.toml publicaría binarios que se auto-reportan la
+  # versión vieja: el updater (que compara contra `releases/latest`) ofrecería "actualizar" en
+  # loop a quien ya tiene esa versión, bajando un binario que sigue diciendo lo mismo.
+  validate:
+    name: Validar tag vs Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: El tag debe coincidir con la versión de Cargo.toml
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_ver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "tag=$tag  cargo.toml=$cargo_ver"
+          if [ "$tag" != "$cargo_ver" ]; then
+            echo "::error::El tag ($GITHUB_REF_NAME -> $tag) no coincide con la version de Cargo.toml ($cargo_ver). Bumpeá Cargo.toml ANTES de taggear."
+            exit 1
+          fi
+
   build:
+    needs: validate
     strategy:
       matrix:
         include:
@@ -34,10 +58,10 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Correr tests
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Compilar
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Renombrar binario (Linux)
         if: matrix.os == 'ubuntu-latest'
@@ -75,6 +99,7 @@ jobs:
   # toparse con un .exe que Defender manda a cuarentena. En un tag estable este job se saltea
   # y el release queda igual que siempre (solo CLI).
   build_gui:
+    needs: validate
     if: contains(github.ref_name, 'beta')
     name: Compilar GUI (Windows)
     runs-on: windows-latest
@@ -88,7 +113,7 @@ jobs:
           targets: x86_64-pc-windows-gnu
 
       - name: Compilar la GUI
-        run: cargo build --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
+        run: cargo build --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
 
       - name: Renombrar binario
         shell: bash
@@ -110,6 +135,10 @@ jobs:
 
   release:
     needs: [build, build_gui]
+    # Único job con permiso de escritura: es el que publica el release. El resto del workflow
+    # corre con `contents: read`.
+    permissions:
+      contents: write
     # `build_gui` se saltea en tags estables; sin `always()` un `needs` salteado cancelaría el
     # release entero. Igual se exige que el CLI haya compilado bien y que la GUI, cuando SÍ
     # corre, no haya fallado: un beta a medias (sin el .exe que se viene a probar) sería peor

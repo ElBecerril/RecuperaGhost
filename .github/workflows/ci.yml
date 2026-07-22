@@ -27,7 +27,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (sin warnings)
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --release --locked --all-targets -- -D warnings
 
   test:
     name: Tests (${{ matrix.os }})
@@ -53,7 +53,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Correr tests
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --release --locked --target ${{ matrix.target }}
 
   gui:
     name: Compilar GUI (Windows, artefacto de prueba)
@@ -68,10 +68,10 @@ jobs:
           components: clippy
 
       - name: Clippy de la GUI (sin warnings)
-        run: cargo clippy --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu -- -D warnings
+        run: cargo clippy --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu -- -D warnings
 
       - name: Compilar la GUI
-        run: cargo build --release --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
+        run: cargo build --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
 
       - name: Renombrar binario
         shell: bash
