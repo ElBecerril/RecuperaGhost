@@ -172,6 +172,32 @@ fn clone_to_image_impl(
 
     let mut src = File::open(source_path)
         .with_context(|| format!("No se pudo abrir el origen: {}", source_path.display()))?;
+
+    // PROTECCIÓN DE DATOS: si el destino ya existe y es un SYMLINK o un nodo de DISPOSITIVO
+    // (block/char device), `File::create` escribiría a través de él. Un `copia.img -> /dev/sdb`
+    // preexistente, o un device node puesto directo en el destino (o alcanzado por un directorio
+    // padre symlinkeado), haría que el clon — que corre con permisos elevados — sobrescriba el
+    // disco apuntado, y `is_physical_device` — que solo mira el nombre `copia.img` — no lo detecta.
+    // Se rechaza antes de abrir nada. `symlink_metadata` no sigue el symlink final, así que lo ve
+    // como tal en vez de resolverlo a su objetivo.
+    if let Ok(meta) = std::fs::symlink_metadata(output_path) {
+        let ft = meta.file_type();
+        let es_symlink = ft.is_symlink();
+        #[cfg(unix)]
+        let es_dispositivo = {
+            use std::os::unix::fs::FileTypeExt;
+            ft.is_block_device() || ft.is_char_device()
+        };
+        #[cfg(not(unix))]
+        let es_dispositivo = false;
+        if es_symlink || es_dispositivo {
+            anyhow::bail!(
+                "El destino '{}' es un enlace o un dispositivo, no un archivo normal: podría \
+                 apuntar a un disco y sobrescribirlo. Elegí una ruta de archivo normal para la copia.",
+                output_path.display()
+            );
+        }
+    }
     let mut dst = File::create(output_path)
         .with_context(|| format!("No se pudo crear la imagen: {}", output_path.display()))?;
 
@@ -453,5 +479,36 @@ mod tests {
             "el contador de progreso debe llegar al tamaño total"
         );
         assert_eq!(result.total_bytes, data.len() as u64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_clone_rejects_symlink_destination() {
+        // Regresión (auditoría pre-beta): un destino que es un symlink preexistente (ej.
+        // `copia.img -> /dev/sdb`) haría que `File::create`, con permisos elevados, siga el enlace
+        // y sobrescriba el disco apuntado. Debe rechazarse antes de abrir nada.
+        use std::os::unix::fs::symlink;
+
+        let mut src = tempfile::NamedTempFile::new().unwrap();
+        src.write_all(&[0u8; 2048]).unwrap();
+        src.flush().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("objetivo_real");
+        std::fs::write(&target, b"contenido previo").unwrap();
+        let link = dir.path().join("copia.img");
+        symlink(&target, &link).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let res = clone_to_image_impl(src.path(), &link, &cancel, &progress, false);
+
+        assert!(res.is_err(), "un destino symlink debe rechazarse");
+        // Y el objetivo del symlink no se tocó.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"contenido previo",
+            "no se debe haber escrito a través del symlink"
+        );
     }
 }

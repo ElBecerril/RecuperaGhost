@@ -45,6 +45,12 @@ struct CliArgs {
     /// (útil para scripts/cron; se activa automáticamente sin TTY o en modo batch)
     #[arg(long = "no-update")]
     no_update: bool,
+
+    /// Forzar el escaneo aunque el destino parezca estar en el MISMO disco que se recupera
+    /// (peligroso: podés pisar lo que intentás rescatar). Solo para automatización consciente;
+    /// sin este flag, el modo batch aborta en ese caso en vez de arriesgar tus datos.
+    #[arg(long = "acepto-el-riesgo")]
+    acepto_el_riesgo: bool,
 }
 
 impl CliArgs {
@@ -98,8 +104,12 @@ impl CliArgs {
 
     /// Valida que no se pasen flags sin source.
     fn validate(&self) {
-        let has_flags =
-            self.fotos || self.videos || self.audio || self.documentos || self.output.is_some();
+        let has_flags = self.fotos
+            || self.videos
+            || self.audio
+            || self.documentos
+            || self.output.is_some()
+            || self.acepto_el_riesgo;
         if self.source.is_none() && has_flags {
             eprintln!(
                 "{}",
@@ -181,6 +191,8 @@ fn main() -> Result<()> {
         // ── Modo batch ──
         banner::show_banner();
 
+        // El flag se lee ANTES de consumir `args` en `into_scan_config`.
+        let acepto_el_riesgo = args.acepto_el_riesgo;
         let config = args.into_scan_config(source);
 
         // Validar que la ruta existe (excepto dispositivos raw)
@@ -196,10 +208,35 @@ fn main() -> Result<()> {
             process::exit(1);
         }
 
-        // Advertencia best-effort: no recuperar sobre el mismo disco que se escanea.
+        // PROTECCIÓN DE DATOS: el destino NUNCA puede ser un dispositivo crudo. El flujo
+        // interactivo ya lo rechaza; en batch faltaba, y con permisos elevados un `-o /dev/sdb`
+        // (o `\\.\PhysicalDriveN`) haría que la recuperación escriba sobre el disco entero. Hasta
+        // ahora solo se salvaba de casualidad porque `create_dir_all` sobre un dispositivo falla:
+        // eso es un efecto colateral del SO, no una protección del programa.
+        if util::is_physical_device(&config.output_dir) {
+            eprintln!(
+                "{}",
+                format!(
+                    "  ❌ El destino '{}' es un disco/dispositivo, no una carpeta. Elegí una carpeta normal con -o.",
+                    config.output_dir.display()
+                )
+                .bright_red()
+            );
+            process::exit(1);
+        }
+
+        // Protección de datos: no recuperar sobre el mismo disco que se escanea. En modo batch,
+        // ante la advertencia, se ABORTA (fail-safe) salvo que se pase `--acepto-el-riesgo`. Antes
+        // el camino sin TTY seguía igual (fail-open): un script mal armado recuperaba sobre el
+        // disco de origen sin freno, justo lo contrario del invariante nº1 de la herramienta.
         if let Some(warning) = ui::same_device_warning(&config.source_path, &config.output_dir) {
             eprintln!("{}", warning.bright_yellow());
-            if is_tty {
+            if acepto_el_riesgo {
+                eprintln!(
+                    "{}",
+                    "  ⚠️  Continuando porque pasaste --acepto-el-riesgo.".bright_yellow()
+                );
+            } else if is_tty {
                 let continuar = dialoguer::Confirm::new()
                     .with_prompt("  ¿Continuar de todas formas?")
                     .default(false)
@@ -213,8 +250,15 @@ fn main() -> Result<()> {
             } else {
                 eprintln!(
                     "{}",
-                    "  ⚠️  Continuando en modo no interactivo (sin confirmación).".bright_yellow()
+                    "  ❌ Abortado: el destino está en el mismo disco que estás recuperando, y no hay terminal para confirmar."
+                        .bright_red()
                 );
+                eprintln!(
+                    "{}",
+                    "     Usá otro destino con -o (en otro disco), o pasá --acepto-el-riesgo si de verdad querés forzarlo."
+                        .bright_yellow()
+                );
+                process::exit(1);
             }
         }
 

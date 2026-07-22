@@ -1050,15 +1050,17 @@ fn scan_source_impl(
         (all_files, scanned, multi_had_errors)
     };
 
-    // Capturar si el escaneo fue cancelado por el usuario (Ctrl+C). `found_files` ya contiene
-    // solo lo hallado antes de cortar.
-    let cancelled = is_cancel_requested();
+    // A2: segundo pase de footer, en un solo hilo, para archivos cuyo footer no apareció dentro
+    // del buffer/chunk original — ver `refine_footers`. Es CANCELABLE: en un disco que está
+    // fallando este pase puede releer cientos de MB (hasta `max_size` por cada candidato sin
+    // footer), que es EXACTAMENTE lo que el usuario pidió dejar de hacer al apretar "Detener" /
+    // Ctrl+C. Se le pasa el flag para que corte por candidato y por chunk.
+    refine_footers(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
 
-    // A2: segundo pase de footer, en un solo hilo, para archivos cuyo footer no apareció
-    // dentro del buffer/chunk original — ver `refine_footers`. Solo itera sobre los archivos ya
-    // encontrados (seeks puntuales), no re-lee el origen entero, así que es rápido aun tras
-    // cancelar.
-    refine_footers(source_path, &mut found_files);
+    // Capturar la cancelación DESPUÉS del refinamiento: si el usuario cortó durante ese pase,
+    // `cancelled` debe reflejarlo. `found_files` ya contiene solo lo hallado antes de cortar; el
+    // refinamiento no agrega archivos, solo ajusta el tamaño de los que ya estaban.
+    let cancelled = is_cancel_requested();
 
     // Igualar el contador en vivo al total exacto (el conteo de a bloques es previo al dedup del
     // camino multi-hilo). Así el último "Encontrados: N" que muestra la GUI coincide con la lista
@@ -1346,10 +1348,17 @@ fn scan_nesting(
 /// pequeño (solo los que no encontraron footer). Esto también hace el resultado determinista
 /// entre 1 hilo y N hilos: antes, un archivo cuyo header caía cerca del final de un chunk se
 /// carveaba a max_size de forma distinta según dónde cayeran las fronteras de segmento/chunk.
-fn refine_footers(source_path: &Path, found_files: &mut [FoundFile]) {
+fn refine_footers(source_path: &Path, found_files: &mut [FoundFile], cancel: &AtomicBool) {
     const REFINE_CHUNK: usize = 4 * 1024 * 1024;
 
     for f in found_files.iter_mut() {
+        // Cancelación cooperativa: si el usuario ya pidió parar, no se sigue releyendo el disco
+        // (que puede estar muriendo) para refinar los candidatos que faltan. Se corta acá y se
+        // deja lo que se alcanzó a refinar; los que queden sin footer conservan su tamaño a
+        // `max_size` (marcados como "posiblemente dañado" en la integridad, que es lo correcto).
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
         if f.footer_found {
             continue;
         }
@@ -1369,6 +1378,7 @@ fn refine_footers(source_path: &Path, found_files: &mut [FoundFile]) {
             f.signature.header,
             footer,
             REFINE_CHUNK,
+            cancel,
         ) {
             f.size = new_size;
             f.footer_found = true;
@@ -1383,6 +1393,9 @@ fn refine_footers(source_path: &Path, found_files: &mut [FoundFile]) {
 /// thumbnail embebido (ver A1 fix v2), manteniendo la profundidad entre chunks y evitando
 /// recontar matches ya vistos en el overlap del chunk anterior. Retorna el tamaño del archivo
 /// (relativo a `header_offset`) si lo encuentra.
+// Los 8 parámetros son intencionales (offsets, patrones y flag de cancelación de la búsqueda de
+// footer); agruparlos en un struct no aportaría claridad y sí ruido.
+#[allow(clippy::too_many_arguments)]
 fn find_footer_sequential(
     source_path: &Path,
     header_offset: u64,
@@ -1391,6 +1404,7 @@ fn find_footer_sequential(
     header: &[u8],
     footer: &[u8],
     chunk_size: usize,
+    cancel: &AtomicBool,
 ) -> Option<u64> {
     if search_start >= search_end {
         return None;
@@ -1404,6 +1418,11 @@ fn find_footer_sequential(
     let mut depth: i32 = 1;
 
     while pos < search_end {
+        // Cancelación cooperativa: se chequea una vez por chunk (4 MB) para no seguir leyendo un
+        // disco que está fallando después de que el usuario apretó "Detener".
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
         let to_read = std::cmp::min(chunk_size as u64, search_end - pos) as usize;
         let mut buf = vec![0u8; to_read];
         let bytes_read = file.read(&mut buf).ok()?;
@@ -2226,6 +2245,52 @@ mod tests {
             .unwrap();
         println!("jpeg1 size = {} expected 2002", jpeg1.size);
         assert_eq!(jpeg1.size, 2002, "jpeg1 englobó al segundo archivo");
+    }
+
+    #[test]
+    fn test_find_footer_sequential_is_cancelable() {
+        // Regresión (auditoría pre-beta): el segundo pase de footer debe cortar ante la
+        // cancelación en vez de seguir releyendo un disco que puede estar fallando. Con el flag en
+        // true no devuelve nada aunque el footer esté presente; sin cancelar sí lo encuentra.
+        let mut data = vec![b'A', b'B']; // header
+        data.extend(vec![0x11u8; 4000]);
+        data.extend_from_slice(b"ZZ"); // footer
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&data).unwrap();
+        file.flush().unwrap();
+
+        let end = data.len() as u64;
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            find_footer_sequential(
+                file.path(),
+                0,
+                2,
+                end,
+                b"AB",
+                b"ZZ",
+                4 * 1024 * 1024,
+                &cancelled
+            )
+            .is_none(),
+            "con cancel=true no debe buscar ni encontrar el footer"
+        );
+
+        let not_cancelled = AtomicBool::new(false);
+        assert!(
+            find_footer_sequential(
+                file.path(),
+                0,
+                2,
+                end,
+                b"AB",
+                b"ZZ",
+                4 * 1024 * 1024,
+                &not_cancelled
+            )
+            .is_some(),
+            "sin cancelar debe encontrar el footer presente"
+        );
     }
 
     #[test]

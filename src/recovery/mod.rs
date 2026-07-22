@@ -671,6 +671,10 @@ mod tests {
         assert_eq!(result.recovered, 1);
         assert_eq!(result.total_bytes, 300);
         assert!(!result.cancelled);
-        assert!(!is_recovery_in_progress(), "el guard debe limpiar el flag");
+        // NO se asserta aquí `!is_recovery_in_progress()`: ese flag es un GLOBAL que las entradas
+        // públicas de otros tests (recover_files/_quiet) levantan y bajan, así que con el harness
+        // en paralelo un vecino a mitad de su recuperación lo dejaba en true y este test fallaba en
+        // falso — la misma familia de bug que el falso verde de scan_progress. La limpieza del flag
+        // por el Drop guard queda garantizada por el propio guard (se ejecuta aunque haya un `?`).
     }
 }

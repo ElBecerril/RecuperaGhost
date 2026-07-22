@@ -1499,6 +1499,13 @@ impl RecupeGhostApp {
             self.phase = Phase::Setup(Step::Source);
             self.scan_result = None;
             self.recovery_result = None;
+            // Limpiar tambien `manual_path`: si venimos del flujo de clonado, quedo apuntando al
+            // `.img` de la copia. Sin esto, alguien que vuelve al inicio para revisar OTRA tarjeta
+            // la elige en la lista, da Continuar, y `resolve_source()` re-escanea la copia vieja en
+            // vez del disco nuevo (el aviso ambar en el paso Disco lo delata, pero en Done la
+            // persona cree que "termino" y no lo lee). CloneDone ya hacia esta limpieza.
+            self.manual_path.clear();
+            self.clone_result = None;
         }
 
         self.ui_apoyo(ui);

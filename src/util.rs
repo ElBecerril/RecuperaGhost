@@ -23,9 +23,25 @@ pub fn format_size(bytes: u64) -> String {
 
 /// Determina si una ruta apunta a un dispositivo físico crudo
 /// (ej: `\\.\PhysicalDrive1` en Windows, `/dev/sdb` en Linux/macOS).
+///
+/// Es una barrera de protección de datos: con permisos elevados, un `File::create` sobre una de
+/// estas rutas abriría el disco entero en escritura. Por eso reconoce también las formas
+/// alternativas que Windows acepta para el MISMO objeto de dispositivo — `//./PhysicalDrive0`
+/// (barras normales, que Win32 normaliza a `\\.\`) y el prefijo verbatim `\\?\` — que antes se
+/// colaban por los gates. Ante la duda se prefiere el falso positivo (rechazar una carpeta rara)
+/// al falso negativo (dejar pasar un dispositivo), porque el invariante nº1 es no destruir datos.
 pub fn is_physical_device(path: &std::path::Path) -> bool {
     let s = path.to_string_lossy();
-    s.starts_with("\\\\.\\") || s.starts_with("/dev/")
+    // Linux/macOS: dispositivos crudos bajo /dev/ (con barras normales, sin normalizar).
+    if s.starts_with("/dev/") {
+        return true;
+    }
+    // Windows: el namespace de dispositivos es `\\.\` (device) y `\\?\` (verbatim, que también
+    // alcanza dispositivos). Win32 trata `/` y `\` como equivalentes, así que `//./` y `//?/`
+    // abren lo mismo; se unifican las barras antes de comparar para no dejar pasar la variante
+    // con `/`.
+    let win = s.replace('/', "\\");
+    win.starts_with("\\\\.\\") || win.starts_with("\\\\?\\")
 }
 
 /// Resuelve una carpeta de salida a ruta absoluta (relativa al directorio de trabajo actual)
@@ -98,4 +114,50 @@ pub fn sin_ventana(cmd: &mut std::process::Command) -> &mut std::process::Comman
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_is_physical_device_detects_raw_devices() {
+        // Linux / macOS.
+        assert!(is_physical_device(Path::new("/dev/sda")));
+        assert!(is_physical_device(Path::new("/dev/nvme0n1")));
+        assert!(is_physical_device(Path::new("/dev/disk2")));
+        // Windows, forma canónica.
+        assert!(is_physical_device(Path::new("\\\\.\\PhysicalDrive0")));
+        assert!(is_physical_device(Path::new("\\\\.\\E:")));
+    }
+
+    #[test]
+    fn test_is_physical_device_detects_windows_alt_prefixes() {
+        // Regresión (auditoría pre-beta): Windows abre el MISMO dispositivo con barras normales
+        // (`//./`, que Win32 normaliza a `\\.\`) y con el prefijo verbatim `\\?\`. Antes se
+        // colaban por los gates de "el destino no puede ser un disco".
+        assert!(
+            is_physical_device(Path::new("//./PhysicalDrive0")),
+            "//./ es equivalente a \\\\.\\"
+        );
+        assert!(
+            is_physical_device(Path::new("\\\\?\\PhysicalDrive0")),
+            "el prefijo verbatim también alcanza dispositivos"
+        );
+        assert!(is_physical_device(Path::new("//?/PhysicalDrive0")));
+    }
+
+    #[test]
+    fn test_is_physical_device_false_for_normal_folders() {
+        assert!(!is_physical_device(Path::new("/home/usuario/Recuperados")));
+        assert!(!is_physical_device(Path::new("D:\\Recuperados")));
+        assert!(!is_physical_device(Path::new(
+            "RecupeGhost_20260101_000000"
+        )));
+        assert!(!is_physical_device(Path::new("copia.img")));
+        // No empieza con el prefijo: una carpeta que casualmente contiene "dev" no es un
+        // dispositivo.
+        assert!(!is_physical_device(Path::new("/home/dev/fotos")));
+    }
 }

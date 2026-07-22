@@ -475,8 +475,9 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
 
     // Si la advertencia de mismo-disco disparó, el confirm arranca en NO (fail-safe): para el
     // público no técnico que avanza a ENTER, el default no debe empujar hacia una operación que
-    // puede destruir justo lo que se quiere rescatar.
-    let warning = same_device_warning(&source_path, &output_path);
+    // puede destruir justo lo que se quiere rescatar. Se usa el formateador de CLONADO (habla de
+    // "copia", no de "carpeta de salida"/"escaneo"): acá el destino es un `.img`.
+    let warning = same_device_warning_clone(&source_path, &output_path);
     if let Some(w) = &warning {
         println!("{}", w.bright_yellow());
         println!();
@@ -730,13 +731,30 @@ fn same_device_risk(
         // aplicamos el chequeo de prefijo cuando `mount_prefix` no es vacío;
         // el caso `mount == "/"` sigue cubierto por la igualdad exacta y por
         // la comprobación de device id de más abajo.
+        // Windows trata las rutas como case-insensitive (`E:` y `e:` son la MISMA unidad); Unix
+        // NO (`/mnt/USB` y `/mnt/usb` son carpetas distintas), y ahí ademas el chequeo de
+        // device-id de mas abajo es la red autoritativa. Por eso el match de ruta ignora
+        // mayusculas SOLO en Windows. Sin esto, alguien que escanea `\\.\PhysicalDrive1` (cuyo
+        // mount WMI es `E:`) y guarda la salida en `e:\recuperados` (minuscula, normalisimo) no
+        // recibia NINGUNA advertencia y escribia sobre el mismo disco que estaba rescatando — el
+        // falso negativo exacto que el landmine de same_device pedia evitar.
+        #[cfg(windows)]
+        let path_eq = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+        #[cfg(windows)]
+        let path_starts =
+            |a: &str, b: &str| a.to_ascii_lowercase().starts_with(&b.to_ascii_lowercase());
+        #[cfg(not(windows))]
+        let path_eq = |a: &str, b: &str| a == b;
+        #[cfg(not(windows))]
+        let path_starts = |a: &str, b: &str| a.starts_with(b);
+
         // `mut` porque el bloque `#[cfg(unix)]` de abajo reasigna `same` vía device id; en
         // Windows ese bloque no se compila y `mut` quedaría sin usar (de ahí el allow).
         #[allow(unused_mut)]
-        let mut same = candidate_str == mount_str
-            || candidate_str == mount_prefix
+        let mut same = path_eq(&candidate_str, &mount_str)
+            || path_eq(&candidate_str, mount_prefix)
             || (!mount_prefix.is_empty()
-                && candidate_str.starts_with(&format!("{}/", mount_prefix)));
+                && path_starts(&candidate_str, &format!("{}/", mount_prefix)));
 
         // Comprobación adicional en Unix vía device id (best-effort, si es posible).
         #[cfg(unix)]
