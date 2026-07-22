@@ -192,7 +192,7 @@ src/
 cargo test
 ```
 
-56 tests automatizados:
+57 tests automatizados:
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -220,6 +220,7 @@ cargo test
 - Clonado de disco a imagen: copia byte a byte exacta (ida y vuelta, multi-bloque)
 - Clonado cancelable: corta y conserva la copia parcial
 - Clonado: EOF del origen no se contabiliza como sectores danados
+- Clonado: el contador de progreso (bytes) llega al tamano total del origen (el que lee la GUI)
 - Clasificacion de integridad de resultados (integro / posiblemente danado / no verificable) y orden de presentacion
 - Recuperacion cancelable: corta temprano, conserva lo ya guardado y lo reporta como parcial
 - Un archivo cortado a la mitad se cuenta como truncado, nunca como recuperado
