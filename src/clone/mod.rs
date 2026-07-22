@@ -20,7 +20,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -36,13 +36,33 @@ const SECTOR: usize = 512;
 static CLONE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CLONE_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Bytes ya procesados del origen en el clon en curso. Igual que `scanner`/`recovery`, es el
+/// espejo que la GUI lee para dibujar su propia barra (no tiene la de `indicatif`). Se pasa POR
+/// PARÁMETRO a la implementación para poder testear sin globales, y el punto de entrada público
+/// le pasa este global.
+static CLONE_PROGRESS_BYTES: AtomicU64 = AtomicU64::new(0);
+
 pub fn is_clone_in_progress() -> bool {
     CLONE_IN_PROGRESS.load(Ordering::SeqCst)
 }
 
-/// Lo llama el handler de Ctrl+C para pedir la cancelación cooperativa del clon en curso.
+/// Lo llama el handler de Ctrl+C (o el botón "Detener" de la GUI) para pedir la cancelación
+/// cooperativa del clon en curso.
 pub fn request_cancel() {
     CLONE_CANCEL_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Si ya se pidió cancelar el clon en curso. La GUI la usa para pasar el botón a "Deteniendo…":
+/// la cancelación es cooperativa (se chequea una vez por bloque de 1 MiB), así que sin esta señal
+/// el botón parece no haber hecho nada y se vuelve a apretar.
+pub fn cancel_requested() -> bool {
+    CLONE_CANCEL_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// Bytes ya copiados del origen en el clon en curso. La GUI lo compara contra el tamaño total
+/// (`device_or_file_size`) para dibujar la barra de progreso.
+pub fn clone_progress_bytes() -> u64 {
+    CLONE_PROGRESS_BYTES.load(Ordering::Relaxed)
 }
 
 /// Resultado de un clonado.
@@ -85,9 +105,29 @@ impl CloneResult {
     }
 }
 
-/// Clona `source_path` (disco o archivo) a un archivo de imagen en `output_path`.
-/// Usa el flag global de cancelación (el que setea el handler de Ctrl+C).
+/// Clona `source_path` (disco o archivo) a un archivo de imagen en `output_path` (modo CLI: barra
+/// de progreso `indicatif` por terminal). Usa el flag global de cancelación (el que setea el
+/// handler de Ctrl+C).
 pub fn clone_to_image(source_path: &Path, output_path: &Path) -> Result<CloneResult> {
+    clone_to_image_entry(source_path, output_path, false)
+}
+
+/// Igual que `clone_to_image`, pero SIN salida por terminal (ni barra `indicatif`). Pensada para
+/// la GUI: un binario de subsistema gráfico en Windows no tiene consola, así que la barra de
+/// `indicatif` escribiría a un stdout inexistente. El avance se sigue con `clone_progress_bytes()`
+/// y la cancelación con `request_cancel()`.
+pub fn clone_to_image_quiet(source_path: &Path, output_path: &Path) -> Result<CloneResult> {
+    clone_to_image_entry(source_path, output_path, true)
+}
+
+/// Preparación común de los dos puntos de entrada: arma el estado global (flag de cancelación y
+/// contador de progreso) y garantiza limpiar `CLONE_IN_PROGRESS` con un guard `Drop`, así un `?` a
+/// mitad de camino no lo deja colgado en true (lo que haría que el próximo Ctrl+C no cerrara nada).
+fn clone_to_image_entry(
+    source_path: &Path,
+    output_path: &Path,
+    quiet: bool,
+) -> Result<CloneResult> {
     // Guard `Drop`: garantiza limpiar `CLONE_IN_PROGRESS` pase lo que pase (incluido `?`).
     struct InProgressGuard;
     impl Drop for InProgressGuard {
@@ -95,19 +135,32 @@ pub fn clone_to_image(source_path: &Path, output_path: &Path) -> Result<CloneRes
             CLONE_IN_PROGRESS.store(false, Ordering::SeqCst);
         }
     }
+    // `CLONE_IN_PROGRESS` se levanta AL FINAL, con el resto del estado ya limpio: la GUI usa ese
+    // flag para saber cuándo mostrar el progreso y ofrecer "Detener". Si se levantara antes, un
+    // clic en Detener caído en esa ventana lo pisaría el reset de acá y se perdería en silencio
+    // (misma lección que `recovery` y `scanner`).
     CLONE_CANCEL_REQUESTED.store(false, Ordering::SeqCst);
+    CLONE_PROGRESS_BYTES.store(0, Ordering::Relaxed);
     CLONE_IN_PROGRESS.store(true, Ordering::SeqCst);
     let _guard = InProgressGuard;
 
-    clone_to_image_impl(source_path, output_path, &CLONE_CANCEL_REQUESTED, true)
+    clone_to_image_impl(
+        source_path,
+        output_path,
+        &CLONE_CANCEL_REQUESTED,
+        &CLONE_PROGRESS_BYTES,
+        !quiet,
+    )
 }
 
-/// Núcleo del clonado. `cancel` se recibe por parámetro (no se lee el global) para testeabilidad.
-/// `show_progress` desactiva la barra en los tests.
+/// Núcleo del clonado. `cancel` y `progress` se reciben por parámetro (no se leen los globales)
+/// para testeabilidad sin interferencia entre tests en paralelo. `show_progress` desactiva la
+/// barra `indicatif` (en los tests y en la GUI).
 fn clone_to_image_impl(
     source_path: &Path,
     output_path: &Path,
     cancel: &AtomicBool,
+    progress: &AtomicU64,
     show_progress: bool,
 ) -> Result<CloneResult> {
     let total = crate::scanner::device_or_file_size(source_path).with_context(|| {
@@ -168,6 +221,9 @@ fn clone_to_image_impl(
         }
         pos += this_block as u64;
 
+        // Espejo para la GUI (que no tiene la barra de `indicatif`): se actualiza siempre, con o
+        // sin barra visible.
+        progress.store(pos, Ordering::Relaxed);
         if let Some(pb) = &pb {
             pb.set_position(pos);
         }
@@ -334,8 +390,9 @@ mod tests {
 
         let dst = tempfile::NamedTempFile::new().unwrap();
         let cancel = AtomicBool::new(false);
-        let result =
-            clone_to_image_impl(src.path(), dst.path(), &cancel, false).expect("clonado falló");
+        let progress = AtomicU64::new(0);
+        let result = clone_to_image_impl(src.path(), dst.path(), &cancel, &progress, false)
+            .expect("clonado falló");
 
         assert_eq!(result.total_bytes, data.len() as u64);
         assert_eq!(result.good_bytes, data.len() as u64);
@@ -362,8 +419,9 @@ mod tests {
 
         let dst = tempfile::NamedTempFile::new().unwrap();
         let cancel = AtomicBool::new(true);
-        let result =
-            clone_to_image_impl(src.path(), dst.path(), &cancel, false).expect("clonado falló");
+        let progress = AtomicU64::new(0);
+        let result = clone_to_image_impl(src.path(), dst.path(), &cancel, &progress, false)
+            .expect("clonado falló");
 
         assert!(result.cancelled);
         assert!(
@@ -371,5 +429,29 @@ mod tests {
             "canceló al inicio, no debería haber copiado todo (copió {})",
             result.good_bytes
         );
+    }
+
+    #[test]
+    fn test_clone_progress_counter_reaches_total() {
+        // El contador que lee la GUI debe terminar en el tamaño total del origen. Se usa un
+        // contador LOCAL (no el global `CLONE_PROGRESS_BYTES`) para no interferir con otros tests
+        // en paralelo, igual que se hace con el flag de cancelación.
+        let mut src = tempfile::NamedTempFile::new().unwrap();
+        let data = vec![0x33u8; BLOCK * 2 + 777];
+        src.write_all(&data).unwrap();
+        src.flush().unwrap();
+
+        let dst = tempfile::NamedTempFile::new().unwrap();
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+        let result = clone_to_image_impl(src.path(), dst.path(), &cancel, &progress, false)
+            .expect("clonado falló");
+
+        assert_eq!(
+            progress.load(Ordering::Relaxed),
+            data.len() as u64,
+            "el contador de progreso debe llegar al tamaño total"
+        );
+        assert_eq!(result.total_bytes, data.len() as u64);
     }
 }
