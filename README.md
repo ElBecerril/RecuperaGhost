@@ -192,7 +192,7 @@ src/
 cargo test
 ```
 
-62 tests automatizados:
+73 tests automatizados (86 compilando tambien la GUI, con `--features gui`):
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -200,7 +200,6 @@ cargo test
 - Desambiguacion HEIC/HEIF vs MP4 (misma caja ftyp, distinto major_brand, incluye brands hevm/hevs)
 - Desambiguacion CR2 vs TIFF generico (mismo header, distinto marcador)
 - Desambiguacion 3GP/M4A vs MP4 (misma caja ftyp)
-- Validador BMP (BITMAPFILEHEADER coherente vs datos aleatorios)
 - Deteccion de PDF (header %PDF- y footer %%EOF)
 - Recuperacion truncada vs completa (RecoveryResult distingue ambos casos)
 - Deteccion de footer JPEG (incluye fotos con thumbnail EXIF embebido)
@@ -211,7 +210,12 @@ cargo test
 - Deteccion de firmas en frontera de segmento
 - El escaneo multi-hilo termina aunque otro escaneo del proceso resetee el contador de progreso
 - No-englobing de archivos adyacentes en el mismo buffer
-- Rechazo de falsos positivos MP3/AAC via frame-chaining
+- Rechazo de falsos positivos MP3/AAC exigiendo una cadena real de frames (12 encadenados)
+- Tamano real de MP3/AAC recorriendo su cadena de frames (incluye la etiqueta ID3 inicial), tambien
+  para archivos mas grandes que el buffer de escaneo
+- Los frames internos de un MP3 no salen como archivos sueltos
+- Un audio que ocupa todo el origen no queda marcado como danado
+- Validador BMP estructural (encabezado DIB, planos, bits por pixel, coherencia de tamano)
 - Parseo de versiones y comparacion (aviso de nuevas versiones)
 - Deteccion del disco de sistema (Windows C: / raiz Unix) para avisos de UI
 - Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
