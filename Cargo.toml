@@ -1,6 +1,6 @@
 [package]
 name = "recupe_ghost"
-version = "0.5.2-beta.2"
+version = "0.5.2-beta.3"
 edition = "2021"
 authors = ["El_Becerril"]
 description = "RecupeGhost - El Detective de Archivos Perdidos"
