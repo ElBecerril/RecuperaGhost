@@ -132,7 +132,12 @@ impl FoundFile {
         // esos casos `footer_found` nos dice si dimos con el final real.
         let end_detectable = self.signature.footer.is_some()
             || self.signature.size_from_header.is_some()
-            || signature_is_zip_ooxml(&self.signature);
+            || signature_is_zip_ooxml(&self.signature)
+            // Audio por frames (MP3/AAC): el final sale de recorrer la cadena de frames. Que cuente
+            // como "final detectable" es lo que hace que un candidato cuya cadena NO cerró salga
+            // marcado "posiblemente dañado" (y por lo tanto no se guarde por defecto) en vez de
+            // "no verificable", que sí se guardaba.
+            || self.signature.stream_end().is_some();
         if end_detectable {
             if self.footer_found {
                 Integrity::Intact
@@ -1059,6 +1064,12 @@ fn scan_source_impl(
     // Ctrl+C. Se le pasa el flag para que corte por candidato y por chunk.
     refine_footers(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
 
+    // Mismo problema que el footer, otra familia: el audio por frames (MP3/AAC) casi nunca cierra su
+    // cadena dentro del buffer de 1 MB, porque una canción típica pesa varios MB. Sin este pase, la
+    // música REAL quedaba marcada "posiblemente dañada" y por lo tanto no se guardaba por defecto.
+    // También es cancelable, por el mismo motivo que `refine_footers`.
+    refine_audio_streams(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
+
     // Supresión de solapamiento: quitar los archivos que caen ENTEROS dentro de otro cuyo final se
     // detectó de verdad (footer/EOCD). Son contenido embebido —miniaturas, iconos, imágenes dentro
     // de un PDF o un Word— que el carving ve como archivos sueltos y que, sin esto, llenan la salida
@@ -1260,6 +1271,23 @@ fn check_signatures_in_buffer(
                         Some(sz) if sz as u64 <= max_possible && sz > 0 => (sz as u64, true),
                         _ => (max_possible, false),
                     }
+                } else if let Some(stream_end) = sig.stream_end() {
+                    // Audio por frames (MP3, AAC): no hay footer ni tamaño en el header, así que el
+                    // final sale de recorrer la cadena de frames. Sin esto, TODO candidato —real o
+                    // falso— se carveaba hasta `max_size`: 382 MB de origen daban 13 GB de salida, y
+                    // los audios de verdad quedaban con decenas de MB de relleno pegado atrás.
+                    let limit = i.saturating_add(max_possible as usize).min(buf.len());
+                    // ¿Lo que se le pasa al walker llega hasta el final del origen? Es la diferencia
+                    // entre "el audio termina justo acá" (final limpio) y "se acabó el buffer y el
+                    // archivo quizá sigue". Sin esto, un MP3 que ocupa todo el origen —una tarjeta
+                    // llena de música— quedaba marcado "posiblemente dañado" y no se guardaba.
+                    let at_source_end = base_offset.saturating_add(limit as u64) >= source_size;
+                    match stream_end(&buf[i..limit], at_source_end) {
+                        Some(sz) if sz as u64 <= max_possible && sz > 0 => (sz as u64, true),
+                        // La cadena no cerró dentro de lo disponible: se cae a max_size igual que un
+                        // footer no hallado (footer_found=false → sale "posiblemente dañado").
+                        _ => (max_possible, false),
+                    }
                 } else if let Some((sf_offset, sf_len)) = sig.size_from_header {
                     let sf_start = i + sf_offset;
                     let sf_end = sf_start + sf_len;
@@ -1442,6 +1470,181 @@ fn scan_nesting(
 /// pequeño (solo los que no encontraron footer). Esto también hace el resultado determinista
 /// entre 1 hilo y N hilos: antes, un archivo cuyo header caía cerca del final de un chunk se
 /// carveaba a max_size de forma distinta según dónde cayeran las fronteras de segmento/chunk.
+/// Segundo pase para el audio por frames (MP3/AAC): sigue la cadena de frames LEYENDO DEL DISCO,
+/// para los candidatos cuya cadena no cerró dentro del buffer de 1 MB del escaneo.
+///
+/// Sin esto la corrección de tamaño servía solo para audios chicos: una canción de 4 MB nunca cierra
+/// su cadena en un buffer de 1 MB, así que quedaba marcada "posiblemente dañada" y —desde el recorte
+/// de basura— no se guardaba por defecto. O sea: el arreglo de los falsos positivos se habría
+/// llevado puesta la música de verdad. Se detectó probando con MP3 reales, no con `cargo test`.
+///
+/// Es CANCELABLE por candidato y por chunk, igual que `refine_footers`: en un disco que está
+/// fallando, este pase puede releer bastante y es justo lo que el usuario pidió dejar de hacer al
+/// apretar "Detener".
+fn refine_audio_streams(source_path: &Path, found_files: &mut [FoundFile], cancel: &AtomicBool) {
+    const AUDIO_CHUNK: usize = 1024 * 1024;
+
+    for f in found_files.iter_mut() {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        // Ya tiene tamaño real (la cadena cerró dentro del buffer): nada que hacer.
+        if f.footer_found {
+            continue;
+        }
+        let Some(kind) = f.signature.audio_stream() else {
+            continue;
+        };
+        if let Some(size) = walk_audio_stream_on_disk(
+            source_path,
+            f.offset,
+            f.signature.max_size as u64,
+            kind,
+            AUDIO_CHUNK,
+            cancel,
+        ) {
+            f.size = size;
+            f.footer_found = true;
+        }
+    }
+}
+
+/// Recorre la cadena de frames de un audio leyendo secuencialmente desde `offset`, y devuelve su
+/// tamaño real. `None` si no se puede afirmar dónde termina (cadena demasiado corta, archivo
+/// cortado, error de lectura o cancelación).
+///
+/// Lee de a `chunk_size` bytes y arrastra el recorrido entre chunks: `consumed` marca hasta dónde
+/// llegó la cadena confirmada, y el chunk siguiente se lee desde ahí, así que ningún frame queda
+/// partido entre dos lecturas.
+fn walk_audio_stream_on_disk(
+    source_path: &Path,
+    offset: u64,
+    max_size: u64,
+    kind: crate::signatures::AudioStream,
+    chunk_size: usize,
+    cancel: &AtomicBool,
+) -> Option<u64> {
+    use crate::signatures::{id3v2_tag_size, walk_audio_frames, ChainStop};
+
+    let mut file = File::open(source_path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+
+    let mut buf = vec![0u8; chunk_size];
+    let mut consumed: u64 = 0;
+    let mut frames: usize = 0;
+    let mut sample_rate: Option<u8> = None;
+    // La etiqueta ID3 inicial no es audio: se saltea antes de empezar a encadenar frames.
+    let mut tag: Option<u64> = None;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if consumed >= max_size {
+            // Más largo que lo que esta firma admite: no se puede afirmar un tamaño.
+            return None;
+        }
+
+        file.seek(SeekFrom::Start(offset + consumed)).ok()?;
+        let want = std::cmp::min(chunk_size as u64, max_size - consumed) as usize;
+        let n = read_up_to(&mut file, &mut buf[..want])?;
+        let data = &buf[..n];
+        // Se leyó menos de lo pedido => se llegó al final del origen.
+        let at_source_end = n < want;
+
+        let start = match tag {
+            Some(_) => 0,
+            None => {
+                let t = id3v2_tag_size(data).unwrap_or(0);
+                tag = Some(t as u64);
+                if t >= data.len() {
+                    // La etiqueta sola llena el chunk (raro, pero posible con carátulas grandes):
+                    // saltarla y seguir en la vuelta siguiente.
+                    consumed += t as u64;
+                    continue;
+                }
+                t
+            }
+        };
+
+        let chain = walk_audio_frames(&data[start..], kind, usize::MAX, sample_rate);
+        frames += chain.frames;
+        sample_rate = chain.sample_rate;
+        consumed += (start + chain.bytes) as u64;
+
+        match chain.stop {
+            // La cadena terminó de verdad (lo que sigue no es audio): ese es el tamaño.
+            ChainStop::BadData => {
+                let total = FrameChainTotal {
+                    frames,
+                    bytes: consumed,
+                };
+                return total.size_if_credible();
+            }
+            // Se acabaron los datos del chunk, o el último frame no entraba entero en él. Si esos
+            // datos eran el final del origen, el archivo está cortado de verdad (Truncated) o
+            // termina limpio justo ahí (NoMoreData). Si no, simplemente hay que leer el chunk
+            // siguiente: `consumed` quedó apuntando al inicio del frame que no entró, así que se
+            // retoma exactamente ahí sin partir ningún frame.
+            ChainStop::NoMoreData | ChainStop::Truncated => {
+                if at_source_end {
+                    if chain.stop == ChainStop::Truncated {
+                        // El archivo se corta a la mitad de un frame: no se puede afirmar su tamaño.
+                        return None;
+                    }
+                    let total = FrameChainTotal {
+                        frames,
+                        bytes: consumed,
+                    };
+                    return total.size_if_credible();
+                }
+                if chain.bytes == 0 && start == 0 {
+                    // No se avanzó nada y todavía hay datos por leer: sin esta guarda el bucle no
+                    // terminaría nunca. (Un frame no entra en un chunk de 1 MB solo si algo está
+                    // muy mal: el máximo real son 1441 bytes en MP3 y 8191 en AAC.)
+                    return None;
+                }
+            }
+            // Tope de frames: imposible acá, se recorre con `usize::MAX`.
+            ChainStop::Capped => return None,
+        }
+    }
+}
+
+/// Cadena acumulada a lo largo de varios chunks de lectura.
+struct FrameChainTotal {
+    frames: usize,
+    bytes: u64,
+}
+
+impl FrameChainTotal {
+    /// El tamaño solo se afirma si la cadena fue lo bastante larga para creerle (mismo criterio que
+    /// dentro del buffer): si no, el candidato queda marcado "posiblemente dañado".
+    fn size_if_credible(&self) -> Option<u64> {
+        if self.frames >= crate::signatures::AUDIO_MIN_CHAIN_FRAMES && self.bytes > 0 {
+            Some(self.bytes)
+        } else {
+            None
+        }
+    }
+}
+
+/// Lee hasta llenar `buf`, tolerando lecturas cortas. Devuelve cuántos bytes se leyeron, o `None`
+/// ante un error de lectura (un sector dañado: no se puede afirmar el tamaño, se deja el candidato
+/// como está en vez de inventar uno).
+fn read_up_to(file: &mut File, buf: &mut [u8]) -> Option<usize> {
+    let mut total = 0;
+    while total < buf.len() {
+        match file.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(total)
+}
+
 fn refine_footers(source_path: &Path, found_files: &mut [FoundFile], cancel: &AtomicBool) {
     const REFINE_CHUNK: usize = 4 * 1024 * 1024;
 
@@ -3309,5 +3512,194 @@ mod tests {
                 "bytes_scanned se corrompió con escaneos concurrentes"
             );
         }
+    }
+
+    // ── Carving de audio por cadena de frames (MP3 / AAC) ──
+    //
+    // Contexto: MP3 y AAC se detectan por un syncword de ~12 bits y NO tienen footer. Antes se
+    // encadenaban 2 frames para validar y, sin final detectable, cada candidato se carveaba hasta
+    // `max_size`. Medido sobre 382 MB de binarios del sistema: 286 archivos y 13.5 GB de salida —
+    // y sobre 5 MP3/AAC REALES, 2479 archivos de los que NINGUNO coincidía con los originales.
+
+    /// Un frame MPEG1 Layer III de 417 bytes (128 kbps, 44100 Hz, sin padding), relleno con datos
+    /// que no son un syncword.
+    fn mpeg_frame() -> Vec<u8> {
+        let mut f = vec![0xFF, 0xFB, 0x90, 0x00];
+        f.resize(417, 0x5A);
+        f
+    }
+
+    /// Un frame ADTS (AAC) de 200 bytes: profile 1, sample rate index 4, `frame_length` = 200
+    /// codificado en los 13 bits que reparten los bytes 3-5.
+    fn adts_frame() -> Vec<u8> {
+        let mut f = vec![0xFF, 0xF1, 0x50, 0x00, 200 >> 3, 0x00, 0x00];
+        f.resize(200, 0x5A);
+        f
+    }
+
+    fn repeat(frame: &[u8], n: usize) -> Vec<u8> {
+        frame.repeat(n)
+    }
+
+    fn scan_bytes(data: &[u8], sigs: &[crate::signatures::FileSignature]) -> Vec<FoundFile> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(data).unwrap();
+        file.flush().unwrap();
+        scan_source(file.path(), sigs).unwrap().found_files
+    }
+
+    fn audio_sigs() -> Vec<crate::signatures::FileSignature> {
+        signatures_for_categories(&[FileCategory::Audio])
+    }
+
+    /// Un MP3 real rodeado de datos que no son audio se recupera con su tamaño EXACTO, y no se
+    /// carvea hasta `max_size`. Es lo que hacía que 382 MB de origen produjeran 13.5 GB de salida.
+    #[test]
+    fn test_mp3_se_carvea_con_su_tamano_real_no_hasta_max_size() {
+        let mp3 = repeat(&mpeg_frame(), 40);
+        let mut data = vec![0u8; 4096];
+        let offset = data.len();
+        data.extend_from_slice(&mp3);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let found = scan_bytes(&data, &audio_sigs());
+        let f = found
+            .iter()
+            .find(|f| f.offset == offset as u64)
+            .expect("no se detectó el MP3");
+
+        assert_eq!(f.size, mp3.len() as u64, "el tamaño debe ser el real");
+        assert!(f.footer_found, "el final se detectó de verdad");
+        assert_eq!(f.integrity(), Integrity::Intact);
+    }
+
+    /// Cada frame de un MP3 empieza con el mismo syncword, así que el carving ve un "archivo nuevo"
+    /// en CADA frame: un MP3 de 40 frames daba 40 detecciones. Con el tamaño real, el archivo de
+    /// verdad se vuelve un contenedor confiable y `suppress_contained` se lleva a los de adentro.
+    #[test]
+    fn test_los_frames_internos_de_un_mp3_no_salen_como_archivos_sueltos() {
+        let mp3 = repeat(&mpeg_frame(), 40);
+        let mut data = vec![0u8; 4096];
+        data.extend_from_slice(&mp3);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let mp3s = scan_bytes(&data, &audio_sigs()).len();
+        assert_eq!(
+            mp3s, 1,
+            "debe quedar UN archivo, no uno por frame (dieron {mp3s})"
+        );
+    }
+
+    /// Un AAC real, mismo trato: tamaño exacto y una sola detección.
+    #[test]
+    fn test_aac_se_carvea_con_su_tamano_real() {
+        let aac = repeat(&adts_frame(), 60);
+        let mut data = vec![0u8; 4096];
+        let offset = data.len();
+        data.extend_from_slice(&aac);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let found = scan_bytes(&data, &audio_sigs());
+        assert_eq!(found.len(), 1, "una sola detección, no una por frame");
+        assert_eq!(found[0].offset, offset as u64);
+        assert_eq!(found[0].size, aac.len() as u64);
+        assert_eq!(found[0].integrity(), Integrity::Intact);
+    }
+
+    /// Un syncword suelto en datos que no son audio (el caso que llenaba la salida de basura) ya no
+    /// pasa la validación: encadenar 12 frames exige acertar 12 largos calculados y mantener el
+    /// sample rate, cosa que los datos binarios no hacen.
+    #[test]
+    fn test_un_syncword_suelto_en_datos_binarios_no_es_un_audio() {
+        // Dos frames válidos —lo que la versión vieja daba por bueno— y después basura.
+        let mut data = vec![0u8; 2048];
+        data.extend_from_slice(&repeat(&mpeg_frame(), 2));
+        for i in 0..8192 {
+            data.push(((i * 31 + 7) % 251) as u8);
+        }
+
+        let found = scan_bytes(&data, &audio_sigs());
+        assert!(
+            found.is_empty(),
+            "una cadena de 2 frames no alcanza para declarar un MP3 (se detectaron {})",
+            found.len()
+        );
+    }
+
+    /// Un MP3 que ocupa TODO el origen (una tarjeta llena de música) termina justo donde terminan
+    /// los datos. Ese final es limpio y debe contar como tal: si se tratara como "me quedé sin
+    /// buffer", el archivo saldría marcado "posiblemente dañado" y NO se guardaría por defecto.
+    /// Falla real detectada probando con un MP3 de verdad, no con datos sintéticos.
+    #[test]
+    fn test_un_mp3_que_ocupa_todo_el_origen_no_queda_marcado_danado() {
+        let mp3 = repeat(&mpeg_frame(), 40);
+
+        let found = scan_bytes(&mp3, &audio_sigs());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].offset, 0);
+        assert_eq!(found[0].size, mp3.len() as u64);
+        assert_eq!(
+            found[0].integrity(),
+            Integrity::Intact,
+            "el final del origen ES el final del archivo"
+        );
+    }
+
+    /// Un MP3 más grande que el buffer de escaneo (1 MB) tiene que cerrar su cadena igual: la
+    /// segunda pasada la sigue leyendo del disco. Sin eso, CUALQUIER canción de tamaño normal
+    /// quedaba "posiblemente dañada" — o sea, el arreglo de los falsos positivos se habría llevado
+    /// puesta la música de verdad.
+    #[test]
+    fn test_un_mp3_mas_grande_que_el_buffer_cierra_su_cadena_leyendo_del_disco() {
+        // ~1.25 MB: cruza el buffer de 1 MB del escaneo.
+        let mp3 = repeat(&mpeg_frame(), 3000);
+        assert!(mp3.len() > BUFFER_SIZE, "el test debe cruzar el buffer");
+
+        let mut data = vec![0u8; 8192];
+        let offset = data.len();
+        data.extend_from_slice(&mp3);
+        data.extend_from_slice(&[0x00; 8192]);
+
+        let found = scan_bytes(&data, &audio_sigs());
+        let f = found
+            .iter()
+            .find(|f| f.offset == offset as u64)
+            .expect("no se detectó el MP3 grande");
+        assert_eq!(f.size, mp3.len() as u64, "tamaño exacto cruzando el buffer");
+        assert_eq!(f.integrity(), Integrity::Intact);
+    }
+
+    /// Un MP3 con etiqueta ID3v2 adelante: la etiqueta no es audio, así que el tamaño es
+    /// etiqueta + cadena de frames. (El tamaño de la etiqueta viene "synchsafe": 7 bits por byte.)
+    #[test]
+    fn test_un_mp3_con_etiqueta_id3_incluye_la_etiqueta_en_su_tamano() {
+        let tag_body = 500usize;
+        let mut mp3 = vec![b'I', b'D', b'3', 0x03, 0x00, 0x00];
+        // 500 = 0b111110100 -> synchsafe en 4 bytes de 7 bits
+        mp3.extend_from_slice(&[
+            0,
+            0,
+            ((tag_body >> 7) & 0x7F) as u8,
+            (tag_body & 0x7F) as u8,
+        ]);
+        mp3.resize(mp3.len() + tag_body, 0u8);
+        let audio = repeat(&mpeg_frame(), 30);
+        mp3.extend_from_slice(&audio);
+
+        let mut data = vec![0u8; 4096];
+        let offset = data.len();
+        data.extend_from_slice(&mp3);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let found = scan_bytes(&data, &audio_sigs());
+        let f = found
+            .iter()
+            .find(|f| f.offset == offset as u64)
+            .expect("no se detectó el MP3 con ID3");
+        assert_eq!(
+            f.size,
+            mp3.len() as u64,
+            "el tamaño debe cubrir la etiqueta ID3 más todos los frames"
+        );
     }
 }

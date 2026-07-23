@@ -24,6 +24,13 @@ impl fmt::Display for FileCategory {
 /// `(validador, bytes_necesarios_desde_el_inicio_del_header)`.
 pub type SignatureValidator = (fn(&[u8]) -> bool, usize);
 
+/// Calcula el tamaño real de un stream de audio por frames a partir de sus bytes.
+/// El `bool` dice si esos bytes llegan hasta el final del origen (ver `chain_size`).
+pub type StreamEndFn = fn(&[u8], bool) -> Option<usize>;
+
+/// Devuelve `(largo_del_frame, indice_de_sample_rate)` del frame que empieza en la posición dada.
+type FrameAtFn = fn(&[u8], usize) -> Option<(usize, u8)>;
+
 /// Firma de archivo: magic bytes de cabecera y pie opcional
 #[derive(Debug, Clone)]
 pub struct FileSignature {
@@ -48,6 +55,32 @@ pub struct FileSignature {
     pub size_from_header: Option<(usize, usize)>,
 }
 
+impl FileSignature {
+    /// Función que calcula el tamaño real de un stream de audio basado en frames (MP3, AAC),
+    /// formatos que NO tienen footer ni traen su tamaño en el header.
+    ///
+    /// Va como despacho por nombre —y no como un campo más de la tabla— por el mismo criterio que
+    /// `signature_is_zip_ooxml` en el scanner: son excepciones puntuales de tres firmas, y meter un
+    /// campo obligaría a tocar las 28 entradas para dejarlo en `None` en 25.
+    pub fn stream_end(&self) -> Option<StreamEndFn> {
+        match self.name {
+            "MP3 (ID3)" | "MP3 (Sync)" => Some(mp3_stream_end),
+            "AAC" => Some(aac_stream_end),
+            _ => None,
+        }
+    }
+
+    /// Familia de audio por frames de esta firma, para poder seguir la cadena leyendo del disco
+    /// cuando el archivo no entra en el buffer del escaneo.
+    pub fn audio_stream(&self) -> Option<AudioStream> {
+        match self.name {
+            "MP3 (ID3)" | "MP3 (Sync)" => Some(AudioStream::Mpeg),
+            "AAC" => Some(AudioStream::Adts),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for FileSignature {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (.{})", self.name, self.extension)
@@ -65,48 +98,208 @@ const MP3_BITRATES_KBPS: [u32; 16] = [
 /// (reservado) se marca con 0 y se rechaza antes de usar la tabla.
 const MP3_SAMPLE_RATES_HZ: [u32; 4] = [44100, 48000, 32000, 0];
 
-/// Valida un frame header MPEG Audio (usado tras el sync FF FB de "MP3 (Sync)") para
-/// descartar los falsos positivos masivos que produce ese header de 2 bytes en datos
-/// de alta entropía. Dos niveles de chequeo:
-/// 1. Bits reservados en el 3er byte del header (offset 2): bitrate index (bits 7-4) no debe
-///    ser 0000 (free) ni 1111 (inválido); sampling rate index (bits 3-2) no debe ser 11
-///    (reservado/inválido).
-/// 2. Frame chaining (C2 fix v2): estos chequeos de bits solos solo rechazaban ~35-40% de los
-///    falsos positivos en datos aleatorios de alta entropía (quedaban ~60-65% pasando, y como
-///    esta firma no tiene footer cada uno de esos se carvea entero a max_size). Para
-///    fortalecerlo, se calcula el largo del frame MPEG1 Layer III con la fórmula estándar
-///    (144000 * bitrate_kbps / sample_rate_hz + padding) a partir de bitrate/sample_rate/
-///    padding del propio header, y se verifica que en ese offset exista OTRO syncword válido
-///    (11 bits FF Ex). Esto requiere que aparezcan 2 syncwords consecutivos a la distancia
-///    matemática exacta, no solo 1 header plausible, lo que reduce drásticamente los falsos
-///    positivos. Si no hay suficiente buffer para verificar el segundo syncword (candidato
-///    cerca del final del buffer disponible), se acepta el candidato sin ese chequeo extra en
-///    vez de rechazarlo solo por falta de datos.
-fn validate_mp3_sync(bytes: &[u8]) -> bool {
-    if bytes.len() < 3 {
-        return false;
+/// Cuántos frames consecutivos hay que encadenar para creerle a un syncword de audio.
+///
+/// MP3 y AAC se detectan por un syncword de ~12 bits sin footer, así que en datos binarios de alta
+/// entropía aparecen a montones. Encadenar solo 2 frames (lo que se hacía antes) resultó MUY
+/// insuficiente: medido sobre 382 MB de binarios del sistema, seguían colándose 140 "MP3" y 123
+/// "AAC" que, al no tener footer, se carveaban enteros hasta `max_size` — 13 GB de basura a partir
+/// de 382 MB de origen. Con 12 frames, cada candidato tiene que acertar 12 largos calculados
+/// exactamente y mantener el sample rate constante; la probabilidad de que datos que no son audio
+/// hagan eso es despreciable.
+pub const AUDIO_MIN_CHAIN_FRAMES: usize = 12;
+
+/// Familia de audio basado en frames encadenados, sin footer ni tamaño en el header.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AudioStream {
+    /// MPEG Audio (los MP3): el largo del frame se calcula con la fórmula estándar.
+    Mpeg,
+    /// ADTS (los AAC): el largo viene explícito en el header del frame.
+    Adts,
+}
+
+impl AudioStream {
+    fn frame_at(self) -> FrameAtFn {
+        match self {
+            AudioStream::Mpeg => mpeg_frame_at,
+            AudioStream::Adts => adts_frame_at,
+        }
     }
-    let b2 = bytes[2];
+
+    /// Bytes mínimos para poder leer un header de frame de esta familia.
+    fn header_len(self) -> usize {
+        match self {
+            AudioStream::Mpeg => 3,
+            AudioStream::Adts => 6,
+        }
+    }
+}
+
+/// Por qué se detuvo el recorrido de frames. La diferencia importa: decide si un candidato se
+/// rechaza, y si se puede afirmar dónde termina el archivo.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ChainStop {
+    /// Lo que sigue NO es un frame de audio: el stream terminó ahí. Es el final limpio y el único
+    /// caso en que se puede afirmar el tamaño del archivo con datos de sobra por delante.
+    BadData,
+    /// Se acabaron los datos disponibles justo en un límite de frame. Si esos datos eran todo el
+    /// origen, es un final limpio también; si solo se acabó el buffer, no se puede afirmar nada.
+    NoMoreData,
+    /// El último frame declara más largo del que hay: el archivo está cortado a la mitad.
+    Truncated,
+    /// Se llegó al tope de frames pedidos (solo lo usa la validación, que no necesita recorrer
+    /// todo el archivo para convencerse).
+    Capped,
+}
+
+/// Resultado de recorrer una cadena de frames de audio.
+pub struct FrameChain {
+    /// Cuántos frames válidos se encadenaron.
+    pub frames: usize,
+    /// Cuántos bytes cubren esos frames (el tamaño real del stream si la cadena terminó).
+    pub bytes: usize,
+    pub stop: ChainStop,
+    /// Índice de sample rate visto en la cadena. Se devuelve para poder seguir el recorrido en el
+    /// chunk siguiente sin perder el invariante de "el sample rate no cambia dentro de un stream".
+    pub sample_rate: Option<u8>,
+}
+
+/// Largo del frame MPEG Audio que empieza en `pos`, y su índice de sample rate.
+///
+/// El largo sale de la fórmula estándar de MPEG1 Layer III
+/// (144000 * bitrate_kbps / sample_rate_hz + padding) con los campos del propio header. Devuelve
+/// `None` si ahí no hay un header estructuralmente válido (o si no quedan bytes para leerlo).
+fn mpeg_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u8)> {
+    let h = bytes.get(pos..pos.checked_add(3)?)?;
+    if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
+        return None;
+    }
+    let b2 = h[2];
     let bitrate_index = (b2 >> 4) & 0x0F;
     let sample_rate_index = (b2 >> 2) & 0x03;
     if bitrate_index == 0x00 || bitrate_index == 0x0F || sample_rate_index == 0x03 {
-        return false;
+        return None;
     }
-
     let bitrate_kbps = MP3_BITRATES_KBPS[bitrate_index as usize];
     let sample_rate_hz = MP3_SAMPLE_RATES_HZ[sample_rate_index as usize];
     let padding = ((b2 >> 1) & 0x01) as u32;
-
-    // Ya se descartaron bitrate_index/sample_rate_index inválidos arriba, así que ambos son
-    // > 0 acá; la división es segura.
+    // Ya se descartaron los índices inválidos, así que ambos son > 0: la división es segura.
     let frame_len = ((144_000 * bitrate_kbps) / sample_rate_hz + padding) as usize;
-
-    if bytes.len() < frame_len + 2 {
-        // No hay suficiente buffer para ver el siguiente syncword: aceptar sin chequeo extra.
-        return true;
+    if frame_len == 0 {
+        return None;
     }
+    Some((frame_len, sample_rate_index))
+}
 
-    bytes[frame_len] == 0xFF && (bytes[frame_len + 1] & 0xE0) == 0xE0
+/// Largo del frame ADTS (AAC) que empieza en `pos`, y su índice de sample rate.
+///
+/// A diferencia de MP3, ADTS trae el largo EXPLÍCITO en 13 bits repartidos en los bytes 3-5.
+fn adts_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u8)> {
+    let h = bytes.get(pos..pos.checked_add(6)?)?;
+    if h[0] != 0xFF || (h[1] & 0xF0) != 0xF0 {
+        return None;
+    }
+    let profile = (h[2] >> 6) & 0x03;
+    let sampling_freq_index = (h[2] >> 2) & 0x0F;
+    if profile == 0x03 || sampling_freq_index > 12 {
+        return None;
+    }
+    let frame_length =
+        (((h[3] & 0x03) as usize) << 11) | ((h[4] as usize) << 3) | ((h[5] >> 5) as usize);
+    // El largo incluye el propio header ADTS (mínimo 7 bytes sin CRC): menos que eso es
+    // estructuralmente imposible y además haría que la cadena no avance nunca.
+    if frame_length < 7 {
+        return None;
+    }
+    Some((frame_length, sampling_freq_index))
+}
+
+/// Recorre frames consecutivos desde el inicio de `bytes`, parando en `max_frames`.
+///
+/// Además de que cada frame sea válido, exige que el **sample rate no cambie**: dentro de un stream
+/// de audio real es constante, mientras que en datos que solo aciertan por casualidad varía. El
+/// bitrate SÍ puede cambiar (los MP3 VBR son comunes), así que no se exige.
+pub fn walk_audio_frames(
+    bytes: &[u8],
+    kind: AudioStream,
+    max_frames: usize,
+    expected_sample_rate: Option<u8>,
+) -> FrameChain {
+    let (frame_at, header_len) = (kind.frame_at(), kind.header_len());
+    let mut pos = 0usize;
+    let mut frames = 0usize;
+    let mut sample_rate: Option<u8> = expected_sample_rate;
+    let stop = loop {
+        if frames >= max_frames {
+            break ChainStop::Capped;
+        }
+        if pos.saturating_add(header_len) > bytes.len() {
+            break ChainStop::NoMoreData;
+        }
+        let Some((len, sr)) = frame_at(bytes, pos) else {
+            break ChainStop::BadData;
+        };
+        // El sample rate no cambia dentro de un stream real; si cambia, lo que se estaba siguiendo
+        // no era una cadena de audio.
+        if *sample_rate.get_or_insert(sr) != sr {
+            break ChainStop::BadData;
+        }
+        if pos + len > bytes.len() {
+            // El frame declara más de lo que hay. Se corta ANTES de ese frame, sin contarlo: así
+            // `bytes` queda apuntando justo al inicio del frame incompleto, y quien vaya leyendo
+            // por chunks puede retomar exactamente ahí (si el archivo sigue más allá del chunk) sin
+            // partir un frame al medio.
+            break ChainStop::Truncated;
+        }
+        pos += len;
+        frames += 1;
+    };
+    FrameChain {
+        frames,
+        bytes: pos.min(bytes.len()),
+        stop,
+        sample_rate,
+    }
+}
+
+/// True si una cadena de frames alcanza para creerle al candidato.
+///
+/// Se acepta también la cadena corta que se cortó por falta de datos: rechazar un audio real solo
+/// porque el candidato cayó cerca del final del buffer disponible sería perder un archivo de la
+/// persona, que es el error caro. El de más acá (colar basura) se paga en ruido, no en pérdida.
+fn chain_is_credible(chain: &FrameChain) -> bool {
+    chain.frames >= AUDIO_MIN_CHAIN_FRAMES || chain.stop != ChainStop::BadData
+}
+
+/// Tamaño del stream a partir de una cadena ya recorrida, o `None` si no se puede afirmar dónde
+/// termina.
+///
+/// `at_source_end` dice si los datos que se le pasaron al walker llegan hasta el final del origen.
+/// Es la diferencia entre "el audio termina justo acá" (final limpio, se puede afirmar el tamaño) y
+/// "se me acabó el buffer y el archivo quizá sigue" (no se puede). Sin esta distinción, un MP3 que
+/// ocupa todo el origen —el caso más común al escanear una tarjeta llena de música— se marcaba
+/// "posiblemente dañado" y NO se guardaba: se detectó probando con un archivo real.
+pub fn chain_size(chain: &FrameChain, at_source_end: bool) -> Option<usize> {
+    if chain.frames < AUDIO_MIN_CHAIN_FRAMES {
+        return None;
+    }
+    match chain.stop {
+        ChainStop::BadData => Some(chain.bytes),
+        ChainStop::NoMoreData if at_source_end => Some(chain.bytes),
+        // Cortado a la mitad, o sin datos suficientes para saberlo: que salga marcado como
+        // "posiblemente dañado" en vez de afirmar un tamaño que no se puede sostener.
+        _ => None,
+    }
+}
+
+/// Valida un candidato "MP3 (Sync)" exigiendo una cadena real de frames MPEG (ver
+/// `AUDIO_MIN_CHAIN_FRAMES`), no solo un header plausible.
+fn validate_mp3_sync(bytes: &[u8]) -> bool {
+    if mpeg_frame_at(bytes, 0).is_none() {
+        return false;
+    }
+    let chain = walk_audio_frames(bytes, AudioStream::Mpeg, AUDIO_MIN_CHAIN_FRAMES, None);
+    chain_is_credible(&chain)
 }
 
 /// Valida un header ADTS (AAC) tras el syncword FF F1 de 12 bits. El campo layer (2 bits)
@@ -120,38 +313,62 @@ fn validate_mp3_sync(bytes: &[u8]) -> bool {
 ///    (header_start + frame_length) exista OTRO syncword ADTS válido (12 bits FF Fx). Si no
 ///    hay suficiente buffer para leerlo, se acepta el candidato sin ese chequeo extra.
 fn validate_aac_adts(bytes: &[u8]) -> bool {
+    // Con menos de 3 bytes no se puede ni mirar el byte de profile/sample rate: sin datos, se le da
+    // el beneficio de la duda igual que a una cadena cortada por falta de buffer.
     if bytes.len() < 3 {
-        return false;
+        return true;
     }
     let b2 = bytes[2];
-    let profile = (b2 >> 6) & 0x03;
-    let sampling_freq_index = (b2 >> 2) & 0x0F;
-    if profile == 0x03 || sampling_freq_index > 12 {
+    if (b2 >> 6) & 0x03 == 0x03 || (b2 >> 2) & 0x0F > 12 {
         return false;
     }
+    let chain = walk_audio_frames(bytes, AudioStream::Adts, AUDIO_MIN_CHAIN_FRAMES, None);
+    chain_is_credible(&chain)
+}
 
-    if bytes.len() < 6 {
-        // No hay suficiente buffer para leer frame_length (bytes 3-5): aceptar sin chequeo
-        // extra.
-        return true;
+/// Tamaño de la etiqueta ID3v2 que abre un MP3 (header de 10 bytes + cuerpo, más el footer opcional
+/// de otros 10). El tamaño viene "synchsafe": 4 bytes de los que solo cuentan los 7 bits bajos, para
+/// que nunca se parezca a un syncword de audio.
+pub fn id3v2_tag_size(bytes: &[u8]) -> Option<usize> {
+    let h = bytes.get(..10)?;
+    if &h[..3] != b"ID3" {
+        return None;
     }
-    let b3 = bytes[3];
-    let b4 = bytes[4];
-    let b5 = bytes[5];
-    let frame_length = (((b3 & 0x03) as usize) << 11) | ((b4 as usize) << 3) | ((b5 >> 5) as usize);
-
-    // frame_length incluye el propio header ADTS (mínimo 7 bytes sin CRC); un valor menor es
-    // estructuralmente inválido.
-    if frame_length < 7 {
-        return false;
+    // Un bit alto prendido en el tamaño significa que esto no es un ID3v2 bien formado.
+    if h[6..10].iter().any(|b| b & 0x80 != 0) {
+        return None;
     }
+    let size = h[6..10]
+        .iter()
+        .fold(0usize, |acc, b| (acc << 7) | (*b as usize & 0x7F));
+    let footer = if h[5] & 0x10 != 0 { 10 } else { 0 };
+    Some(10 + size + footer)
+}
 
-    if bytes.len() < frame_length + 2 {
-        // No hay suficiente buffer para ver el siguiente syncword: aceptar sin chequeo extra.
-        return true;
+/// Tamaño real de un MP3 que empieza en el inicio de `bytes`: la etiqueta ID3v2 inicial (si la hay)
+/// más todos los frames MPEG encadenados.
+///
+/// Existe porque MP3 no tiene footer: sin esto, TODO candidato —real o falso— se carveaba hasta
+/// `max_size` (50 MB). Eso inflaba el resultado a lo bestia y, encima, dejaba a los MP3 de verdad
+/// con 50 MB de relleno pegado atrás. Devuelve `None` si la cadena se corta por falta de buffer (no
+/// se puede afirmar dónde termina) o si es demasiado corta para creerle.
+///
+/// La etiqueta ID3v1 del final (128 bytes de metadatos) queda afuera a propósito: no es audio y su
+/// ausencia no afecta la reproducción.
+pub fn mp3_stream_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
+    let tag = id3v2_tag_size(bytes).unwrap_or(0);
+    if tag >= bytes.len() {
+        return None;
     }
+    let chain = walk_audio_frames(&bytes[tag..], AudioStream::Mpeg, usize::MAX, None);
+    Some(tag + chain_size(&chain, at_source_end)?)
+}
 
-    bytes[frame_length] == 0xFF && (bytes[frame_length + 1] & 0xF0) == 0xF0
+/// Tamaño real de un AAC (ADTS) que empieza en el inicio de `bytes`: la suma de los largos que
+/// declaran sus propios frames. Mismo motivo que `mp3_stream_end`.
+pub fn aac_stream_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
+    let chain = walk_audio_frames(bytes, AudioStream::Adts, usize::MAX, None);
+    chain_size(&chain, at_source_end)
 }
 
 /// HEIC/HEIF y MP4 comparten la misma caja contenedora `ftyp` (ISOBMFF): la única forma de
