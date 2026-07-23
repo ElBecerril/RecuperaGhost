@@ -194,7 +194,7 @@ fn clone_to_image_impl(
         if es_symlink || es_dispositivo {
             anyhow::bail!(
                 "El destino '{}' es un enlace o un dispositivo, no un archivo normal: podría \
-                 apuntar a un disco y sobrescribirlo. Elegí una ruta de archivo normal para la copia.",
+                 apuntar a un disco y sobrescribirlo. Elige una ruta de archivo normal para la copia.",
                 output_path.display()
             );
         }

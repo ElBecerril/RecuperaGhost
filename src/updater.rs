@@ -175,7 +175,7 @@ fn show_update_available(new_version: &str, url: &str) {
     println!(
         "{}{}{}",
         "  ║".bright_green(),
-        format!("   Tenés la:        v{:<27}", banner::VERSION).bright_yellow(),
+        format!("   Tienes la:       v{:<27}", banner::VERSION).bright_yellow(),
         "║".bright_green()
     );
     println!(
@@ -190,12 +190,12 @@ fn show_update_available(new_version: &str, url: &str) {
     );
     println!(
         "{}",
-        "  Podés descargar la versión nueva (opcional) desde:".bright_white()
+        "  Puedes descargar la versión nueva (opcional) desde:".bright_white()
     );
     println!("     {}", url.bright_cyan());
     println!(
         "{}",
-        "  Podés seguir usando esta versión sin problema.".bright_black()
+        "  Puedes seguir usando esta versión sin problema.".bright_black()
     );
     println!();
 }

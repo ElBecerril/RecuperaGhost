@@ -203,9 +203,9 @@ impl RecupeGhostApp {
             // de "escaneo"/"carpeta de salida".
             Ok("same_device_clone") => {
                 self.pending_warning = Some((
-                    "  ⚠️  Estás guardando la copia en el mismo disco que querés copiar (/dev/sdb).\n\
+                    "  ⚠️  Estás guardando la copia en el mismo disco que quieres copiar (/dev/sdb).\n\
                      La copia iría a parar al propio disco que estás rescatando y lo llenaría, \
-                     pisando justo lo que intentás salvar. Elegí guardar la copia en OTRO disco."
+                     pisando justo lo que intentas salvar. Elige guardar la copia en OTRO disco."
                         .to_string(),
                     PendingAction::Clone,
                     PathBuf::from("/dev/sdb"),
@@ -381,15 +381,15 @@ impl RecupeGhostApp {
         }
         let source = match self.resolve_source() {
             Some(s) => s,
-            None => return self.fail("Elegí un disco o escribí una ruta de imagen."),
+            None => return self.fail("Elige un disco o escribe una ruta de imagen."),
         };
         let cats = self.selected_categories();
         if cats.is_empty() {
-            return self.fail("Elegí al menos un tipo de archivo para buscar.");
+            return self.fail("Elige al menos un tipo de archivo para buscar.");
         }
         if self.output_dir.trim().is_empty() {
             return self.fail(
-                "Elegí una carpeta donde guardar lo recuperado. Tiene que estar en un disco \
+                "Elige una carpeta donde guardar lo recuperado. Tiene que estar en un disco \
                  distinto del que estás recuperando.",
             );
         }
@@ -397,7 +397,7 @@ impl RecupeGhostApp {
         let out = self.output_path();
         if util::is_physical_device(&out) {
             return self.fail(
-                "La carpeta de salida no puede ser un disco/dispositivo. Elegí una carpeta normal.",
+                "La carpeta de salida no puede ser un disco/dispositivo. Elige una carpeta normal.",
             );
         }
         // Y no puede estar en el mismo disco que se está recuperando. Se pregunta acá, donde el
@@ -433,13 +433,13 @@ impl RecupeGhostApp {
         // copió el programa ahí.
         if self.output_dir.trim().is_empty() {
             return self.fail(
-                "Elegí una carpeta donde guardar lo recuperado. Tiene que estar en un disco \
+                "Elige una carpeta donde guardar lo recuperado. Tiene que estar en un disco \
                  distinto del que estás recuperando.",
             );
         }
         if util::is_physical_device(&self.output_path()) {
             return self.fail(
-                "La carpeta de salida no puede ser un disco/dispositivo. Elegí una carpeta normal.",
+                "La carpeta de salida no puede ser un disco/dispositivo. Elige una carpeta normal.",
             );
         }
         // Segunda barrera, en el momento en que de verdad se escribe. El escaneo pudo haber
@@ -470,7 +470,7 @@ impl RecupeGhostApp {
         }
         let source = match self.resolve_source() {
             Some(s) => s,
-            None => return self.fail("Elegí el disco que querés copiar."),
+            None => return self.fail("Elige el disco que quieres copiar."),
         };
         // Clonar solo tiene sentido sobre un disco físico. Si el origen ya es un archivo de imagen,
         // copiarlo es redundante (ya es un archivo escaneable). El botón no se muestra en ese caso,
@@ -478,7 +478,7 @@ impl RecupeGhostApp {
         if !util::is_physical_device(&source) {
             return self.fail(
                 "La copia de seguridad es para discos y memorias. El origen elegido ya es un \
-                 archivo de imagen: podés escanearlo directamente.",
+                 archivo de imagen: puedes escanearlo directamente.",
             );
         }
 
@@ -486,7 +486,7 @@ impl RecupeGhostApp {
         // se usa el diálogo del sistema en vez de pedir que tipeen una ruta.
         let sugerido = default_image_name();
         let elegido = rfd::FileDialog::new()
-            .set_title("¿Dónde guardo la copia del disco? (elegí OTRO disco)")
+            .set_title("¿Dónde guardo la copia del disco? (elige OTRO disco)")
             .add_filter("Imagen de disco", &["img"])
             .set_file_name(&sugerido)
             .save_file();
@@ -507,7 +507,7 @@ impl RecupeGhostApp {
         if util::is_physical_device(&dest) {
             return self.fail(
                 "El destino no puede ser un disco: tiene que ser un ARCHIVO de imagen (.img) en \
-                 otro disco. Elegí una carpeta normal para guardarlo.",
+                 otro disco. Elige una carpeta normal para guardarlo.",
             );
         }
         // Y no puede caer en el mismo disco que se está copiando.
@@ -716,7 +716,7 @@ impl RecupeGhostApp {
         self.ui_volver_a_resultados(ui);
         theme::section_title(ui, "¿Dónde estaban tus archivos?");
         ui.label(
-            egui::RichText::new("Elegí el disco o la memoria que querés revisar.")
+            egui::RichText::new("Elige el disco o la memoria que quieres revisar.")
                 .color(theme::TEXT_WEAK),
         );
         ui.add_space(10.0);
@@ -727,7 +727,7 @@ impl RecupeGhostApp {
                 theme::WARN,
                 theme::WARN_BG,
                 "No se detectó ningún disco. Si el programa no se abrió como administrador, \
-                 Windows no lo deja verlos. Probá 'Buscar de nuevo', o usá las opciones avanzadas \
+                 Windows no lo deja verlos. Prueba 'Buscar de nuevo', o usa las opciones avanzadas \
                  para abrir un archivo de imagen.",
             );
             ui.add_space(8.0);
@@ -771,7 +771,7 @@ impl RecupeGhostApp {
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Solo si ya tenés una copia del disco en un archivo. Si escribís algo acá, \
+                        "Solo si ya tienes una copia del disco en un archivo. Si escribes algo aquí, \
                          se usa esto en lugar del disco elegido arriba.",
                     )
                     .size(13.0)
@@ -782,7 +782,7 @@ impl RecupeGhostApp {
                     ui.text_edit_singleline(&mut self.manual_path);
                     if ui.button("Buscar archivo…").clicked() {
                         if let Some(f) = rfd::FileDialog::new()
-                            .set_title("Elegí el archivo de imagen del disco")
+                            .set_title("Elige el archivo de imagen del disco")
                             .add_filter("Imagen de disco", &["img", "dd", "raw", "iso"])
                             .pick_file()
                         {
@@ -801,13 +801,13 @@ impl RecupeGhostApp {
                 theme::WARN,
                 theme::WARN_BG,
                 "Se va a revisar el archivo de imagen que escribiste en opciones avanzadas, no el \
-                 disco de la lista. Vaciá ese campo para volver a usar el disco.",
+                 disco de la lista. Vacía ese campo para volver a usar el disco.",
             );
         }
 
         let manual = self.manual_path.trim();
         let bloqueo = if self.resolve_source().is_none() {
-            Some("Elegí un disco o un archivo de imagen")
+            Some("Elige un disco o un archivo de imagen")
         } else if !manual.is_empty() && !std::path::Path::new(manual).exists() {
             // Se avisa acá y no tres pantallas después: un typo en la ruta terminaba en la
             // pantalla de error roja recién al apretar "Empezar la búsqueda".
@@ -821,9 +821,9 @@ impl RecupeGhostApp {
     }
 
     fn ui_step_types(&mut self, ui: &mut egui::Ui) {
-        theme::section_title(ui, "¿Qué querés recuperar?");
+        theme::section_title(ui, "¿Qué quieres recuperar?");
         ui.label(
-            egui::RichText::new("Si no estás seguro, dejá todo marcado.").color(theme::TEXT_WEAK),
+            egui::RichText::new("Si no estás seguro, deja todo marcado.").color(theme::TEXT_WEAK),
         );
         ui.add_space(12.0);
 
@@ -848,7 +848,7 @@ impl RecupeGhostApp {
         }
 
         let bloqueo = if self.selected_categories().is_empty() {
-            Some("Marcá al menos un tipo")
+            Some("Marca al menos un tipo")
         } else {
             None
         };
@@ -861,7 +861,7 @@ impl RecupeGhostApp {
         self.ui_volver_a_resultados(ui);
         theme::section_title(ui, "¿Dónde guardamos lo que encontremos?");
         ui.label(
-            egui::RichText::new("Se va a crear una carpeta nueva acá:").color(theme::TEXT_WEAK),
+            egui::RichText::new("Se va a crear una carpeta nueva aquí:").color(theme::TEXT_WEAK),
         );
         ui.add_space(8.0);
 
@@ -885,7 +885,7 @@ impl RecupeGhostApp {
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("."));
                 if let Some(carpeta) = rfd::FileDialog::new()
-                    .set_title("Elegí dónde guardar los archivos recuperados")
+                    .set_title("Elige dónde guardar los archivos recuperados")
                     .set_directory(inicio)
                     .pick_folder()
                 {
@@ -893,7 +893,7 @@ impl RecupeGhostApp {
                 }
             }
             ui.label(
-                egui::RichText::new("o escribila a mano:")
+                egui::RichText::new("o escríbela a mano:")
                     .size(13.0)
                     .color(theme::TEXT_WEAK),
             );
@@ -905,14 +905,14 @@ impl RecupeGhostApp {
             ui,
             theme::WARN,
             theme::WARN_BG,
-            "Guardá en un disco DISTINTO del que estás revisando. Si guardás en la misma memoria, \
-             podés borrar para siempre lo que estás tratando de recuperar.",
+            "Guarda en un disco DISTINTO del que estás revisando. Si guardas en la misma memoria, \
+             puedes borrar para siempre lo que estás tratando de recuperar.",
         );
 
         let vacio = self.output_dir.trim().is_empty();
         let es_dispositivo = !vacio && util::is_physical_device(&self.output_path());
         let bloqueo = if vacio {
-            Some("Elegí una carpeta")
+            Some("Elige una carpeta")
         } else if es_dispositivo {
             // Misma protección crítica que el CLI: escribir sobre la ruta de un dispositivo con
             // permisos de administrador sobrescribiría el disco entero.
@@ -926,7 +926,7 @@ impl RecupeGhostApp {
     }
 
     fn ui_step_summary(&mut self, ui: &mut egui::Ui) {
-        theme::section_title(ui, "Todo listo. Revisá antes de empezar:");
+        theme::section_title(ui, "Todo listo. Revisa antes de empezar:");
         ui.add_space(10.0);
 
         let origen = match self.resolve_source() {
@@ -973,7 +973,7 @@ impl RecupeGhostApp {
             theme::TEXT_WEAK,
             theme::GROUND,
             "La búsqueda puede tardar desde unos minutos hasta más de una hora, según el tamaño \
-             del disco. Podés dejar la computadora trabajando.\n\nLos archivos recuperados van a \
+             del disco. Puedes dejar la computadora trabajando.\n\nLos archivos recuperados van a \
              tener nombres nuevos (recovered_0001.jpg). El nombre original se pierde cuando un \
              archivo se borra: es normal y no afecta al contenido.",
         );
@@ -1134,7 +1134,7 @@ impl RecupeGhostApp {
                 theme::WARN,
                 theme::WARN_BG,
                 "⏸ Detuviste la búsqueda antes de que terminara. Esto es lo que se encontró hasta \
-                 ahí: lo podés recuperar igual, o volver y buscar de nuevo hasta el final.",
+                 ahí: lo puedes recuperar igual, o volver y buscar de nuevo hasta el final.",
             );
             ui.add_space(4.0);
         }
@@ -1171,7 +1171,7 @@ impl RecupeGhostApp {
         if count == 0 {
             if cancelled {
                 ui.label(
-                    "Detuviste la búsqueda antes de que apareciera nada. Si la dejás correr \
+                    "Detuviste la búsqueda antes de que apareciera nada. Si la dejas correr \
                      completa, es probable que aparezcan archivos.",
                 );
             } else {
@@ -1336,7 +1336,7 @@ impl RecupeGhostApp {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "Cuando termine, buscamos tus archivos dentro de la copia. Podés usar la \
+                "Cuando termine, buscamos tus archivos dentro de la copia. Puedes usar la \
                  computadora normalmente mientras tanto.",
             )
             .size(13.0)
@@ -1377,13 +1377,13 @@ impl RecupeGhostApp {
         if cancelled {
             theme::section_title(ui, "⏹ Detuviste la copia.");
             ui.label(
-                "Lo que se alcanzó a copiar quedó guardado y se puede revisar igual. Si querés la \
-                 copia completa, volvé a empezar y dejala terminar.",
+                "Lo que se alcanzó a copiar quedó guardado y se puede revisar igual. Si quieres la \
+                 copia completa, vuelve a empezar y déjala terminar.",
             );
         } else {
             theme::section_title(ui, "✅ Copia terminada.");
             ui.label(
-                "Ya tenés una copia de seguridad del disco. Ahora podemos buscar tus archivos \
+                "Ya tienes una copia de seguridad del disco. Ahora podemos buscar tus archivos \
                  dentro de la copia, sin volver a tocar el disco original.",
             );
         }
@@ -1474,7 +1474,7 @@ impl RecupeGhostApp {
             );
             ui.label(
                 "Los que se guardaron están completos y se pueden abrir. Los que faltaban NO se \
-                 recuperaron: si querés, volvé y guardá de nuevo, que los vuelve a escribir.",
+                 recuperaron: si quieres, vuelve y guarda de nuevo, que los vuelve a escribir.",
             );
         } else if incomplete > 0 {
             theme::section_title(
@@ -1585,7 +1585,7 @@ impl RecupeGhostApp {
             ui.add_space(8.0);
             ui.label("Tus archivos siguen donde estaban: esto no borró nada.");
             ui.add_space(10.0);
-            ui.collapsing("Detalle técnico (por si pedís ayuda)", |ui| {
+            ui.collapsing("Detalle técnico (por si pides ayuda)", |ui| {
                 ui.colored_label(theme::DANGER, self.error_msg.clone());
             });
         } else {
@@ -1614,7 +1614,7 @@ impl eframe::App for RecupeGhostApp {
             }
             ui.add_space(6.0);
             ui.heading("👻 RecupeGhost");
-            ui.label("Recuperá fotos, videos, audios y documentos borrados.");
+            ui.label("Recupera fotos, videos, audios y documentos borrados.");
             ui.separator();
             // El contenido va dentro de un área con scroll. Sin esto, en una ventana chica (una
             // notebook de 768 px de alto, o alguien que achica la ventana) el contenido se corta
@@ -1682,10 +1682,10 @@ impl RecupeGhostApp {
                 ui.label(warning_gui.trim());
                 ui.add_space(6.0);
                 ui.label(if es_clon {
-                    "La copia terminaría en el mismo disco que querés rescatar y podría pisar \
-                     justo lo que intentás salvar. No tiene vuelta atrás."
+                    "La copia terminaría en el mismo disco que quieres rescatar y podría pisar \
+                     justo lo que intentas salvar. No tiene vuelta atrás."
                 } else {
-                    "Si guardás en el mismo disco del que estás recuperando, lo que se escriba \
+                    "Si guardas en el mismo disco del que estás recuperando, lo que se escriba \
                      puede tapar para siempre los archivos que estás buscando. No tiene vuelta \
                      atrás."
                 });

@@ -221,7 +221,7 @@ impl ScanResult {
         );
         if self.cancelled {
             s.push_str(
-                "\n   ⏹️  Cancelaste el escaneo antes de terminar — abajo está solo lo que se\n       alcanzó a encontrar hasta ese punto. Podés recuperarlo igual.",
+                "\n   ⏹️  Cancelaste el escaneo antes de terminar — abajo está solo lo que se\n       alcanzó a encontrar hasta ese punto. Puedes recuperarlo igual.",
             );
         }
         if self.had_errors {
@@ -790,7 +790,7 @@ fn print_scan_preamble(source_path: &Path, file_size: u64, num_threads: usize) {
     }
     println!(
         "{}",
-        "  ⏹️  Podés cancelar en cualquier momento con Ctrl+C (se guarda lo encontrado hasta ahí)."
+        "  ⏹️  Puedes cancelar en cualquier momento con Ctrl+C (se guarda lo encontrado hasta ahí)."
             .bright_black()
     );
     println!();

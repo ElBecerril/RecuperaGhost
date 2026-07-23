@@ -106,16 +106,16 @@ pub fn friendly_error_hint(e: &anyhow::Error) -> Option<&'static str> {
         if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
             return match io_err.kind() {
                 std::io::ErrorKind::PermissionDenied => Some(
-                    "  🔒 No tenés permisos suficientes para acceder a ese disco o archivo. \
-Si es un disco físico, ejecutá el programa como Administrador (Windows) o con sudo (Linux/macOS).",
+                    "  🔒 No tienes permisos suficientes para acceder a ese disco o archivo. \
+Si es un disco físico, ejecuta el programa como Administrador (Windows) o con sudo (Linux/macOS).",
                 ),
                 std::io::ErrorKind::NotFound => Some(
-                    "  🔍 No se encontró la ruta indicada. Verificá que el disco/USB siga conectado \
+                    "  🔍 No se encontró la ruta indicada. Verifica que el disco/USB siga conectado \
 y que la ruta esté bien escrita.",
                 ),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted => Some(
                     "  ⏱️  El dispositivo tardó demasiado en responder. Puede estar desconectado \
-o dañado — probá reconectarlo.",
+o dañado — prueba reconectarlo.",
                 ),
                 _ => None,
             };

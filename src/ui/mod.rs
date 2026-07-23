@@ -80,7 +80,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
     println!();
     println!(
         "{}",
-        "  En todos los menús: usá las flechas ↑↓ para moverte y ENTER para elegir.".bright_black()
+        "  En todos los menús: usa las flechas ↑↓ para moverte y ENTER para elegir.".bright_black()
     );
     println!();
 
@@ -95,7 +95,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
         None => {
             println!(
                 "{}",
-                "  ¿De dónde querés recuperar archivos?".bright_yellow()
+                "  ¿De dónde quieres recuperar archivos?".bright_yellow()
             );
             println!(
                 "{}",
@@ -109,7 +109,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
             );
             println!(
                 "{}",
-                "  · Archivo de imagen: para un archivo .img/.dd/.raw que ya tenés (uso avanzado)."
+                "  · Archivo de imagen: para un archivo .img/.dd/.raw que ya tienes (uso avanzado)."
                     .bright_black()
             );
             println!();
@@ -215,7 +215,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
     //    que se puede cambiar. Explicamos las tres cosas antes de pedir el dato.
     println!(
         "{}",
-        "  ¿Dónde querés guardar los archivos recuperados?".bright_yellow()
+        "  ¿Dónde quieres guardar los archivos recuperados?".bright_yellow()
     );
     let default_name = format!(
         "RecupeGhost_{}",
@@ -227,19 +227,19 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
     println!(
         "{}",
         format!(
-            "  · Si dejás el nombre sugerido y presionás ENTER, se crea acá:\n      {}",
+            "  · Si dejas el nombre sugerido y presionas ENTER, se crea aquí:\n      {}",
             default_abs.display()
         )
         .bright_black()
     );
     println!(
         "{}",
-        "  · O escribí una ruta completa a otro disco/USB (ej. en Windows: D:\\Recuperados)."
+        "  · O escribe una ruta completa a otro disco/USB (ej. en Windows: D:\\Recuperados)."
             .bright_black()
     );
     println!(
         "{}",
-        "  ⚠️  Guardá en un disco DISTINTO al que estás recuperando, nunca en el mismo."
+        "  ⚠️  Guarda en un disco DISTINTO al que estás recuperando, nunca en el mismo."
             .bright_yellow()
     );
     println!();
@@ -264,7 +264,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
         );
         println!(
             "{}",
-            "     Elegí una carpeta normal (ej. una en otro USB o en tu disco).".bright_yellow()
+            "     Elige una carpeta normal (ej. una en otro USB o en tu disco).".bright_yellow()
         );
         return Ok(None);
     }
@@ -343,7 +343,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
     );
     println!(
         "{}",
-        "  estresás el disco enfermo (cada lectura extra puede acelerar su muerte).".bright_black()
+        "  estresas el disco enfermo (cada lectura extra puede acelerar su muerte).".bright_black()
     );
     println!();
     println!(
@@ -354,7 +354,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
     println!();
 
     // 1. Elegir el disco/origen a clonar (mismo menú inteligente que el escaneo).
-    println!("{}", "  ¿Qué disco querés clonar?".bright_yellow());
+    println!("{}", "  ¿Qué disco quieres clonar?".bright_yellow());
     println!();
     let source_path = match select_source()? {
         Some(path) => path,
@@ -376,12 +376,12 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
         #[cfg(target_os = "windows")]
         println!(
             "{}",
-            "  💡 Cerrá el programa y volvé a abrirlo como Administrador.".bright_cyan()
+            "  💡 Cierra el programa y vuelve a abrirlo como Administrador.".bright_cyan()
         );
         #[cfg(not(target_os = "windows"))]
         println!(
             "{}",
-            "  💡 Ejecutá el programa con: sudo ./recupe_ghost".bright_cyan()
+            "  💡 Ejecuta el programa con: sudo ./recupe_ghost".bright_cyan()
         );
         println!();
         let retry = vec!["🔄 Intentar de todas formas", "↩️  Volver al menú"];
@@ -405,7 +405,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
             );
             println!(
                 "{}",
-                "     Asegurate de tener ese espacio libre en el destino.".bright_black()
+                "     Asegúrate de tener ese espacio libre en el destino.".bright_black()
             );
         }
         Err(_) => {
@@ -416,7 +416,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
             );
             println!(
                 "{}",
-                "     del tamaño completo del disco; asegurate de tener espacio de sobra."
+                "     del tamaño completo del disco; asegúrate de tener espacio de sobra."
                     .bright_black()
             );
         }
@@ -426,7 +426,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
     // 3. Archivo .img de destino.
     println!(
         "{}",
-        "  ¿Dónde guardo la imagen? (elegí un disco DISTINTO al que estás clonando)"
+        "  ¿Dónde guardo la imagen? (elige un disco DISTINTO al que estás clonando)"
             .bright_yellow()
     );
     let default_output = format!(
@@ -458,7 +458,7 @@ pub fn clone_menu() -> Result<Option<CloneConfig>> {
         );
         println!(
             "{}",
-            "     Escribí una ruta de archivo terminada en .img (ej. D:\\copia.img), no un disco."
+            "     Escribe una ruta de archivo terminada en .img (ej. D:\\copia.img), no un disco."
                 .bright_yellow()
         );
         return Ok(None);
@@ -624,11 +624,11 @@ pub fn same_device_warning(
 ) -> Option<String> {
     same_device_risk(source_path, output_dir).map(|risk| match risk {
         SameDeviceRisk::Same(mount) => format!(
-            "  ⚠️  La carpeta de salida está en el mismo disco que estás escaneando ({}).\n     Si guardás ahí, podrías perder para siempre justo los archivos que estás tratando de recuperar. Elegí otra carpeta, idealmente en otro disco.",
+            "  ⚠️  La carpeta de salida está en el mismo disco que estás escaneando ({}).\n     Si guardas ahí, podrías perder para siempre justo los archivos que estás tratando de recuperar. Elige otra carpeta, idealmente en otro disco.",
             mount
         ),
         SameDeviceRisk::Unconfirmed(src) => format!(
-            "  ⚠️  No pudimos confirmar que la carpeta de salida esté en un disco distinto al que estás escaneando ({}).\n     Por las dudas, fijate que la carpeta de salida NO esté en ese mismo disco/USB — si no, podrías perder para siempre justo lo que estás tratando de recuperar.",
+            "  ⚠️  No pudimos confirmar que la carpeta de salida esté en un disco distinto al que estás escaneando ({}).\n     Por las dudas, fíjate que la carpeta de salida NO esté en ese mismo disco/USB — si no, podrías perder para siempre justo lo que estás tratando de recuperar.",
             src
         ),
     })
@@ -643,11 +643,11 @@ pub fn same_device_warning_clone(
 ) -> Option<String> {
     same_device_risk(source_path, image_path).map(|risk| match risk {
         SameDeviceRisk::Same(mount) => format!(
-            "  ⚠️  Estás guardando la copia en el mismo disco que querés copiar ({}).\n     La copia iría a parar al propio disco que estás rescatando y lo llenaría, pisando justo lo que intentás salvar. Elegí guardar la copia en OTRO disco.",
+            "  ⚠️  Estás guardando la copia en el mismo disco que quieres copiar ({}).\n     La copia iría a parar al propio disco que estás rescatando y lo llenaría, pisando justo lo que intentas salvar. Elige guardar la copia en OTRO disco.",
             mount
         ),
         SameDeviceRisk::Unconfirmed(src) => format!(
-            "  ⚠️  No pudimos confirmar que estés guardando la copia en un disco distinto al que querés copiar ({}).\n     Por las dudas, fijate que el archivo de la copia NO quede en ese mismo disco/USB — si no, podrías pisar justo lo que estás tratando de salvar.",
+            "  ⚠️  No pudimos confirmar que estés guardando la copia en un disco distinto al que quieres copiar ({}).\n     Por las dudas, fíjate que el archivo de la copia NO quede en ese mismo disco/USB — si no, podrías pisar justo lo que estás tratando de salvar.",
             src
         ),
     })
@@ -899,12 +899,12 @@ fn select_all_drives() -> Result<Option<PathBuf>> {
     );
     println!(
         "{}",
-        "     Podés recuperar del disco de tu PC sin problema — lo importante es GUARDAR"
+        "     Puedes recuperar del disco de tu PC sin problema — lo importante es GUARDAR"
             .bright_yellow()
     );
     println!(
         "{}",
-        "     los archivos recuperados en OTRO disco o USB, nunca en el mismo que escaneás."
+        "     los archivos recuperados en OTRO disco o USB, nunca en el mismo que escaneas."
             .bright_yellow()
     );
     println!();
@@ -931,7 +931,7 @@ fn show_drive_list(drive_list: &[drives::DriveInfo]) -> Result<Option<PathBuf>> 
         .map(|d| {
             if is_likely_system_disk(d) {
                 format!(
-                    "  {}  💻 (disco de tu PC — guardá lo recuperado en OTRO disco/USB)",
+                    "  {}  💻 (disco de tu PC — guarda lo recuperado en OTRO disco/USB)",
                     d.display_name
                 )
             } else {
@@ -1057,7 +1057,7 @@ fn select_image_file() -> Result<Option<PathBuf>> {
 fn prompt_path_or_cancel(prompt: &str, allow_raw_device: bool) -> Result<Option<PathBuf>> {
     println!(
         "{}",
-        "  (dejá el campo vacío y presioná Enter para volver)".bright_black()
+        "  (deja el campo vacío y presiona Enter para volver)".bright_black()
     );
 
     let source: String = Input::new()
@@ -1170,19 +1170,19 @@ pub fn show_about() {
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  1. Elegí el disco/USB a revisar               ".white(),
+        "  1. Elige el disco/USB a revisar               ".white(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  2. Elegí qué tipo de archivo buscar           ".white(),
+        "  2. Elige qué tipo de archivo buscar           ".white(),
         "║".bright_cyan()
     );
     println!(
         "{}{}{}",
         "  ║".bright_cyan(),
-        "  3. Confirmá, esperá, y recuperalos            ".white(),
+        "  3. Confirma, espera, y recupéralos            ".white(),
         "║".bright_cyan()
     );
     println!(

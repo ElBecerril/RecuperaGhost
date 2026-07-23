@@ -47,7 +47,7 @@ struct CliArgs {
     no_update: bool,
 
     /// Forzar el escaneo aunque el destino parezca estar en el MISMO disco que se recupera
-    /// (peligroso: podés pisar lo que intentás rescatar). Solo para automatización consciente;
+    /// (peligroso: puedes pisar lo que intentas rescatar). Solo para automatización consciente;
     /// sin este flag, el modo batch aborta en ese caso en vez de arriesgar tus datos.
     #[arg(long = "acepto-el-riesgo")]
     acepto_el_riesgo: bool,
@@ -217,7 +217,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "{}",
                 format!(
-                    "  ❌ El destino '{}' es un disco/dispositivo, no una carpeta. Elegí una carpeta normal con -o.",
+                    "  ❌ El destino '{}' es un disco/dispositivo, no una carpeta. Elige una carpeta normal con -o.",
                     config.output_dir.display()
                 )
                 .bright_red()
@@ -255,7 +255,7 @@ fn main() -> Result<()> {
                 );
                 eprintln!(
                     "{}",
-                    "     Usá otro destino con -o (en otro disco), o pasá --acepto-el-riesgo si de verdad querés forzarlo."
+                    "     Usa otro destino con -o (en otro disco), o pasa --acepto-el-riesgo si de verdad quieres forzarlo."
                         .bright_yellow()
                 );
                 process::exit(1);
@@ -442,7 +442,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
             );
             println!(
                 "{}",
-                "     Podés volver a escanear cuando quieras.".bright_black()
+                "     Puedes volver a escanear cuando quieras.".bright_black()
             );
         } else {
             println!(
@@ -490,7 +490,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         println!(
             "{}",
             format!(
-                "  ⚠️  {} archivo(s) podrían estar dañados o incompletos (quedaron sin su final).\n     Igual podés recuperarlos: a veces se abren bien o se reparan aparte.",
+                "  ⚠️  {} archivo(s) podrían estar dañados o incompletos (quedaron sin su final).\n     Igual puedes recuperarlos: a veces se abren bien o se reparan aparte.",
                 suspect_count
             )
             .bright_yellow()
@@ -572,7 +572,7 @@ fn run_clone(config: CloneConfig) -> Result<()> {
     println!("{}", "  📀 Clonando el disco a una imagen...".bright_cyan());
     println!(
         "{}",
-        "  Podés cancelar cuando quieras con Ctrl+C: se guarda todo lo copiado hasta ahí."
+        "  Puedes cancelar cuando quieras con Ctrl+C: se guarda todo lo copiado hasta ahí."
             .bright_black()
     );
     println!();
@@ -590,7 +590,7 @@ fn run_clone(config: CloneConfig) -> Result<()> {
                     println!(
                         "{}",
                         format!(
-                            "  💡 Quedó una imagen PARCIAL de {} en:\n     {}\n     Podés intentar escanearla igual (Menú → Escanear → Archivo de imagen),\n     o borrarla si necesitás liberar ese espacio.",
+                            "  💡 Quedó una imagen PARCIAL de {} en:\n     {}\n     Puedes intentar escanearla igual (Menú → Escanear → Archivo de imagen),\n     o borrarla si necesitas liberar ese espacio.",
                             util::format_size(meta.len()),
                             config.output_path.display()
                         )
@@ -622,7 +622,7 @@ fn run_clone(config: CloneConfig) -> Result<()> {
         println!(
             "{}",
             format!(
-                "  💡 Cuando quieras, escaneá la imagen desde el menú principal → \"Escanear\" →\n     \"Archivo de imagen\", y pegá esta ruta:\n     {}",
+                "  💡 Cuando quieras, escanea la imagen desde el menú principal → \"Escanear\" →\n     \"Archivo de imagen\", y pega esta ruta:\n     {}",
                 config.output_path.display()
             )
             .bright_cyan()
