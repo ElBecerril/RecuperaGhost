@@ -73,6 +73,13 @@ jobs:
       - name: Compilar la GUI
         run: cargo build --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
 
+      # Los tests de la maquina de estados de la GUI viven detras del feature `gui`, y el job
+      # `test` de arriba corre SIN ese feature: sin este paso no se compilarian siquiera. Va aca
+      # (Windows) y no en la matriz porque este job ya tiene el toolchain de la GUI, y Windows es
+      # la plataforma que se distribuye. No abren ventana: prueban transiciones y guardas.
+      - name: Tests de la GUI
+        run: cargo test --release --locked --features gui --target x86_64-pc-windows-gnu
+
       - name: Renombrar binario
         shell: bash
         run: cp target/x86_64-pc-windows-gnu/release/recupe_ghost_gui.exe recupe_ghost_gui.exe

@@ -51,7 +51,7 @@ pub fn run() -> eframe::Result<()> {
 /// llega asustado y con poca confianza. Una pantalla con todo junto obliga a decidir tres cosas a
 /// la vez sin saber cuántas faltan; de a una, cada pantalla hace UNA pregunta en castellano y la
 /// barra de arriba muestra cuánto queda.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
     /// Qué disco o imagen revisar.
     Source,
@@ -163,12 +163,27 @@ struct RecupeGhostApp {
 
 impl RecupeGhostApp {
     fn new(ctx: &egui::Context) -> Self {
-        let drives = drives::list_drives();
+        let mut app =
+            Self::with_drives(drives::list_drives(), Some(spawn_update_check(ctx.clone())));
+        app.apply_demo_state();
+        app
+    }
+
+    /// Estado inicial a partir de una lista de discos ya detectada.
+    ///
+    /// Separado de `new` para poder armar la app en tests sin salir a interrogar los discos reales
+    /// de la máquina (`list_drives` lanza PowerShell/lsblk: lento, y su resultado depende de en qué
+    /// equipo corra). El chequeo de versión también entra por parámetro para que los tests no hagan
+    /// I/O de red.
+    fn with_drives(
+        drives: Vec<DriveInfo>,
+        update_rx: Option<Receiver<Option<UpdateInfo>>>,
+    ) -> Self {
         // Preseleccionar el primer disco EXTRAÍBLE. El índice 0 suele ser el disco del sistema,
         // y el caso central de la herramienta es "formateé el USB / la tarjeta de la cámara":
         // arrancar apuntando al disco de la PC invita a escanear el equivocado.
         let selected_drive = drives.iter().position(|d| d.is_removable).unwrap_or(0);
-        let mut app = Self {
+        Self {
             drives,
             selected_drive,
             manual_path: String::new(),
@@ -190,12 +205,10 @@ impl RecupeGhostApp {
             error_msg: String::new(),
             error_hint: None,
             include_damaged: false,
-            update_rx: Some(spawn_update_check(ctx.clone())),
+            update_rx,
             update_info: None,
             update_dismissed: false,
-        };
-        app.apply_demo_state();
-        app
+        }
     }
 
     /// Abre la GUI directamente en una pantalla concreta, para poder MIRARLA.
@@ -345,6 +358,31 @@ impl RecupeGhostApp {
             .map(|d| PathBuf::from(&d.path))
     }
 
+    /// Vuelve al primer paso dejando el estado como recién abierto el programa.
+    ///
+    /// Limpia `manual_path` a propósito: si se venía del flujo de clonado quedó apuntando al `.img`
+    /// de la copia, y sin esto alguien que vuelve al inicio para revisar OTRA tarjeta la elige en la
+    /// lista, da Continuar, y `resolve_source()` re-escanea la copia vieja en vez del disco nuevo.
+    /// Estaba duplicado en las dos pantallas finales (Done y CloneDone) con el mismo contenido.
+    fn reset_to_start(&mut self) {
+        self.manual_path.clear();
+        self.scan_result = None;
+        self.recovery_result = None;
+        self.clone_result = None;
+        self.phase = Phase::Setup(Step::Source);
+    }
+
+    /// Si el usuario ya aceptó el riesgo de mismo-disco para ESTA pareja exacta origen/destino.
+    ///
+    /// Es a propósito una pareja y no un booleano: una aceptación puntual no puede apagar la
+    /// protección para discos y carpetas que la persona nunca aprobó. Cambiar cualquiera de las dos
+    /// puntas tiene que volver a disparar la advertencia sola.
+    fn already_accepted(&self, source: &std::path::Path, dest: &std::path::Path) -> bool {
+        self.same_device_accepted
+            .as_ref()
+            .is_some_and(|(s, d)| s == source && d == dest)
+    }
+
     fn fail(&mut self, msg: impl Into<String>) {
         self.error_msg = msg.into();
         self.error_hint = None;
@@ -382,7 +420,7 @@ impl RecupeGhostApp {
         action: PendingAction,
     ) -> bool {
         // La aceptación vale solo para la combinación exacta que se aprobó.
-        if self.same_device_accepted.as_ref() == Some(&(source.to_path_buf(), dest.to_path_buf())) {
+        if self.already_accepted(source, dest) {
             return false;
         }
         // Mismo detector, distinto vocabulario: en el clonado el destino es un archivo `.img`, no
@@ -1566,11 +1604,7 @@ impl RecupeGhostApp {
         }
         ui.add_space(8.0);
         if ui.button("↩ Volver al inicio").clicked() {
-            self.manual_path.clear();
-            self.clone_result = None;
-            self.scan_result = None;
-            self.recovery_result = None;
-            self.phase = Phase::Setup(Step::Source);
+            self.reset_to_start();
         }
     }
 
@@ -1646,16 +1680,7 @@ impl RecupeGhostApp {
         );
         ui.add_space(12.0);
         if ui.button("↩ Volver al inicio").clicked() {
-            self.phase = Phase::Setup(Step::Source);
-            self.scan_result = None;
-            self.recovery_result = None;
-            // Limpiar tambien `manual_path`: si venimos del flujo de clonado, quedo apuntando al
-            // `.img` de la copia. Sin esto, alguien que vuelve al inicio para revisar OTRA tarjeta
-            // la elige en la lista, da Continuar, y `resolve_source()` re-escanea la copia vieja en
-            // vez del disco nuevo (el aviso ambar en el paso Disco lo delata, pero en Done la
-            // persona cree que "termino" y no lo lee). CloneDone ya hacia esta limpieza.
-            self.manual_path.clear();
-            self.clone_result = None;
+            self.reset_to_start();
         }
 
         self.ui_apoyo(ui);
@@ -1944,4 +1969,287 @@ fn default_image_name() -> String {
         "RecupeGhost_imagen_{}.img",
         chrono::Local::now().format("%Y%m%d_%H%M%S")
     )
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+/// Tests de la **máquina de estados** de la GUI: transiciones, guardas y las reglas de protección
+/// de datos que viven en este archivo. No dibujan nada ni abren ventana (no hay pantalla en CI),
+/// así que cubren la lógica, no el pintado — los problemas visuales (tofu, textos duplicados) se
+/// siguen cazando mirando capturas.
+///
+/// Se armó porque este era el archivo con más lógica de producto y CERO tests, y encima el que más
+/// veces mordió.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drive(path: &str, removable: bool) -> DriveInfo {
+        DriveInfo {
+            path: path.to_string(),
+            display_name: format!("Disco de prueba {path}"),
+            letter: None,
+            all_mounts: Vec::new(),
+            size_bytes: 1024,
+            is_removable: removable,
+        }
+    }
+
+    /// App de test: sin interrogar los discos reales de la máquina ni salir a la red.
+    fn app_con(drives: Vec<DriveInfo>) -> RecupeGhostApp {
+        RecupeGhostApp::with_drives(drives, None)
+    }
+
+    fn app() -> RecupeGhostApp {
+        app_con(vec![drive("/dev/sda", false), drive("/dev/sdb", true)])
+    }
+
+    /// El caso central de la herramienta es "formateé el USB / la tarjeta de la cámara". Arrancar
+    /// apuntando al disco del sistema (que suele ser el índice 0) invita a escanear el equivocado.
+    #[test]
+    fn test_gui_preselecciona_el_primer_disco_extraible() {
+        let a = app();
+        assert_eq!(a.selected_drive, 1);
+        assert_eq!(a.resolve_source(), Some(PathBuf::from("/dev/sdb")));
+    }
+
+    /// Sin ningún extraíble no hay nada mejor que elegir: cae en el primero, pero NO debe entrar en
+    /// pánico ni dejar el índice fuera de rango (la lista puede venir vacía si Windows no dio
+    /// permisos de administrador).
+    #[test]
+    fn test_gui_sin_extraibles_cae_en_el_primero_y_vacio_no_rompe() {
+        assert_eq!(app_con(vec![drive("/dev/sda", false)]).selected_drive, 0);
+
+        let vacia = app_con(Vec::new());
+        assert_eq!(vacia.selected_drive, 0);
+        assert_eq!(vacia.resolve_source(), None);
+    }
+
+    /// La ruta manual (opciones avanzadas: un archivo `.img`) le gana al disco de la lista, y los
+    /// espacios sueltos no cuentan como "escribió algo": pegar una ruta y borrarla tiene que
+    /// devolver el control a la lista de discos, no dejar el origen en una ruta vacía.
+    #[test]
+    fn test_gui_ruta_manual_le_gana_al_disco_y_respeta_los_espacios() {
+        let mut a = app();
+        a.manual_path = "  /tmp/copia.img  ".to_string();
+        assert_eq!(a.resolve_source(), Some(PathBuf::from("/tmp/copia.img")));
+
+        a.manual_path = "   ".to_string();
+        assert_eq!(
+            a.resolve_source(),
+            Some(PathBuf::from("/dev/sdb")),
+            "una ruta de puros espacios no es una ruta: tiene que volver al disco elegido"
+        );
+    }
+
+    #[test]
+    fn test_gui_categorias_mapean_los_checkboxes_en_orden() {
+        let mut a = app();
+        assert_eq!(
+            a.selected_categories().len(),
+            4,
+            "por defecto van las cuatro"
+        );
+
+        a.cats = [false, false, false, false];
+        assert!(a.selected_categories().is_empty());
+
+        a.cats = [true, false, false, true];
+        assert_eq!(
+            a.selected_categories(),
+            vec![FileCategory::Photo, FileCategory::Document]
+        );
+
+        a.cats = [false, true, true, false];
+        assert_eq!(
+            a.selected_categories(),
+            vec![FileCategory::Video, FileCategory::Audio]
+        );
+    }
+
+    /// La carpeta de salida se resuelve SIEMPRE a ruta absoluta. Si quedara relativa, el archivo
+    /// terminaría donde sea que esté el directorio de trabajo del proceso — que con el `.exe`
+    /// abierto por doble clic no es donde la persona cree.
+    #[test]
+    fn test_gui_carpeta_de_salida_se_resuelve_a_absoluta() {
+        let mut a = app();
+        a.output_dir = "  RecupeGhost_2026  ".to_string();
+        let p = a.output_path();
+        assert!(p.is_absolute(), "quedó relativa: {}", p.display());
+        assert!(p.ends_with("RecupeGhost_2026"));
+    }
+
+    /// Un error NO puede dejar el diálogo de mismo-disco flotando: es una decisión de protección de
+    /// datos sobre una acción que ya murió, y encima `update()` deshabilita todo el panel de atrás
+    /// mientras haya advertencia pendiente — el usuario quedaría con la pantalla de error trabada.
+    #[test]
+    fn test_gui_un_error_limpia_la_advertencia_pendiente() {
+        let mut a = app();
+        a.pending_warning = Some((
+            "aviso".to_string(),
+            PendingAction::Scan,
+            PathBuf::from("/dev/sdb"),
+            PathBuf::from("/tmp/salida"),
+        ));
+
+        a.fail("algo salió mal");
+
+        assert!(matches!(a.phase, Phase::Error));
+        assert!(a.pending_warning.is_none());
+        assert_eq!(a.error_msg, "algo salió mal");
+    }
+
+    /// Guarda de concurrencia: la `Window` de egui flota sobre el panel pero no lo bloquea por sí
+    /// sola. Sin este guard se podía disparar un segundo escaneo desde abajo mientras la
+    /// advertencia seguía en pantalla — dos hilos pisando los mismos globales de progreso y
+    /// cancelación del scanner.
+    #[test]
+    fn test_gui_no_arranca_un_escaneo_con_la_advertencia_en_pantalla() {
+        // Origen y destino DELIBERADAMENTE inofensivos (un archivo de imagen y una carpeta temporal,
+        // nada de `/dev/...`): así el detector de mismo-disco no tiene nada que objetar y lo único
+        // que puede frenar el escaneo es la guarda que se está probando. Con un disco físico de
+        // origen, este test pasaba incluso con la guarda borrada — el escaneo no arrancaba por otro
+        // motivo, y el test daba una sensación de cobertura que no existía (verificado mutando).
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("copia.img");
+        std::fs::write(&img, vec![0u8; 1024]).unwrap();
+
+        let mut a = app_con(Vec::new());
+        a.manual_path = img.display().to_string();
+        a.output_dir = dir.path().join("salida").display().to_string();
+        a.pending_warning = Some((
+            "aviso".to_string(),
+            PendingAction::Scan,
+            img.clone(),
+            dir.path().to_path_buf(),
+        ));
+
+        a.start_scan();
+
+        assert!(
+            matches!(a.phase, Phase::Setup(Step::Source)),
+            "no debe cambiar de pantalla"
+        );
+        assert!(a.scan_rx.is_none(), "no debe haber arrancado un hilo");
+        assert_eq!(
+            a.pending_warning.as_ref().map(|(m, ..)| m.as_str()),
+            Some("aviso"),
+            "la decisión sigue pendiente, sin pisarse"
+        );
+    }
+
+    /// Sin disco ni ruta manual no hay nada que escanear: tiene que avisar, no arrancar en vacío.
+    #[test]
+    fn test_gui_escanear_sin_origen_avisa_en_vez_de_arrancar() {
+        let mut a = app_con(Vec::new());
+
+        a.start_scan();
+
+        assert!(matches!(a.phase, Phase::Error));
+        assert!(a.scan_rx.is_none());
+        assert!(!a.error_msg.is_empty());
+    }
+
+    /// PROTECCIÓN DE DATOS: aceptar el riesgo de mismo-disco vale para la pareja origen/destino
+    /// EXACTA que se advirtió, no para siempre. Con un booleano, alguien que acepta una vez quedaba
+    /// sin protección para discos y carpetas que nunca aprobó.
+    #[test]
+    fn test_gui_aceptar_el_mismo_disco_vale_solo_para_esa_pareja() {
+        let mut a = app();
+        let origen = PathBuf::from("/dev/sdb");
+        let destino = PathBuf::from("/mnt/usb/salida");
+        a.same_device_accepted = Some((origen.clone(), destino.clone()));
+
+        assert!(a.already_accepted(&origen, &destino));
+        assert!(
+            !a.already_accepted(&origen, &PathBuf::from("/mnt/usb/otra")),
+            "cambiar el destino tiene que volver a advertir"
+        );
+        assert!(
+            !a.already_accepted(&PathBuf::from("/dev/sdc"), &destino),
+            "cambiar el disco de origen tiene que volver a advertir"
+        );
+        assert!(
+            !app().already_accepted(&origen, &destino),
+            "sin aceptar, nada pasa"
+        );
+    }
+
+    /// Volver al inicio tiene que limpiar `manual_path`: si se venía del flujo de clonado quedó
+    /// apuntando al `.img` de la copia, y sin esto alguien que vuelve para revisar OTRA tarjeta la
+    /// elige en la lista, da Continuar, y se re-escanea la copia vieja en vez del disco nuevo.
+    #[test]
+    fn test_gui_volver_al_inicio_deja_de_apuntar_a_la_copia() {
+        let mut a = app();
+        a.manual_path = "/tmp/RecupeGhost_imagen.img".to_string();
+        a.phase = Phase::Done;
+
+        a.reset_to_start();
+
+        assert!(a.manual_path.is_empty());
+        assert!(matches!(a.phase, Phase::Setup(Step::Source)));
+        assert!(a.scan_result.is_none() && a.recovery_result.is_none() && a.clone_result.is_none());
+        assert_eq!(
+            a.resolve_source(),
+            Some(PathBuf::from("/dev/sdb")),
+            "el origen vuelve a ser el disco elegido en la lista"
+        );
+    }
+
+    /// El aviso de versión nueva llega por un canal desde un hilo de fondo. Mientras no conteste,
+    /// nada cambia; cuando contesta, se guarda y se suelta el canal.
+    #[test]
+    fn test_gui_el_aviso_de_version_llega_por_el_canal() {
+        let (tx, rx) = mpsc::channel();
+        let mut a = RecupeGhostApp::with_drives(Vec::new(), Some(rx));
+
+        a.poll_update_check();
+        assert!(a.update_info.is_none(), "todavía no contestó");
+        assert!(a.update_rx.is_some(), "sigue esperando");
+
+        tx.send(Some(UpdateInfo {
+            version: "v9.9.9".to_string(),
+            url: "https://example.invalid/release".to_string(),
+        }))
+        .unwrap();
+        a.poll_update_check();
+
+        assert_eq!(a.update_info.as_ref().unwrap().version, "v9.9.9");
+        assert!(a.update_rx.is_none(), "se suelta el canal ya consumido");
+    }
+
+    /// Sin internet (o con el hilo muerto) NO hay aviso y NO hay error: no enterarse de una
+    /// actualización jamás debe romperle el programa a quien vino a rescatar sus archivos.
+    #[test]
+    fn test_gui_sin_internet_no_hay_aviso_ni_error() {
+        let (tx, rx) = mpsc::channel::<Option<UpdateInfo>>();
+        let mut a = RecupeGhostApp::with_drives(Vec::new(), Some(rx));
+
+        drop(tx); // el hilo murió sin contestar
+        a.poll_update_check();
+
+        assert!(a.update_info.is_none());
+        assert!(
+            a.update_rx.is_none(),
+            "no se queda consultando un canal muerto"
+        );
+        assert!(matches!(a.phase, Phase::Setup(Step::Source)));
+        assert!(a.error_msg.is_empty(), "no es un error que valga molestar");
+    }
+
+    /// Los pasos del asistente van en orden y el primero no tiene "anterior" (el botón Volver no
+    /// puede dejar al usuario en una pantalla que no existe).
+    #[test]
+    fn test_gui_los_pasos_del_asistente_van_en_orden() {
+        assert_eq!(Step::Source.index(), 0);
+        assert_eq!(Step::Summary.index(), Step::ALL.len() - 1);
+        assert_eq!(Step::Source.prev(), None);
+        assert_eq!(Step::Types.prev(), Some(Step::Source));
+        assert_eq!(Step::Summary.prev(), Some(Step::Output));
+
+        for (i, s) in Step::ALL.iter().enumerate() {
+            assert_eq!(s.index(), i);
+            assert!(!s.label().is_empty());
+        }
+    }
 }
