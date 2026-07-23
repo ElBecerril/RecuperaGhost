@@ -548,7 +548,7 @@ impl RecupeGhostApp {
                         self.scan_rx = None;
                         self.fail_io("No se pudo escanear", &e);
                     }
-                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint(),
+                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Self::WAIT_REPAINT),
                     Some(Err(TryRecvError::Disconnected)) => {
                         self.scan_rx = None;
                         self.fail("El escaneo terminó inesperadamente.");
@@ -568,7 +568,7 @@ impl RecupeGhostApp {
                         self.recovery_rx = None;
                         self.fail_io("No se pudo recuperar", &e);
                     }
-                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint(),
+                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Self::WAIT_REPAINT),
                     Some(Err(TryRecvError::Disconnected)) => {
                         self.recovery_rx = None;
                         self.fail("La recuperación terminó inesperadamente.");
@@ -592,7 +592,7 @@ impl RecupeGhostApp {
                         // otro error de I/O.
                         self.fail_io("No se pudo terminar de copiar el disco", &e);
                     }
-                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint(),
+                    Some(Err(TryRecvError::Empty)) => ctx.request_repaint_after(Self::WAIT_REPAINT),
                     Some(Err(TryRecvError::Disconnected)) => {
                         self.clone_rx = None;
                         self.fail("La copia terminó inesperadamente.");
@@ -1010,6 +1010,28 @@ impl RecupeGhostApp {
         }
     }
 
+    /// Cadencia de repintado durante las esperas (escaneo/recuperación/clonado). Repintar a la
+    /// máxima velocidad posible martillaba el driver de video: en una PC con Intel integrada y
+    /// drivers viejos, el ICD de OpenGL (`ig9icd64.dll`) reventó con access violation (0xc0000005)
+    /// a mitad de un escaneo. 200 ms (~5 fps) alcanza de sobra para la barra, el contador vivo y el
+    /// mensaje rotativo, y baja muchísimo la presión sobre el driver. Las interacciones del usuario
+    /// (clics, hover) repintan igual al instante; esto solo limita el bucle de animación en reposo.
+    const WAIT_REPAINT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Mensaje rotativo con personalidad para las pantallas de espera larga (escaneo, recuperación,
+    /// clonado). Rota solo porque esas pantallas piden repintado periódico para el progreso vivo;
+    /// usa el reloj de egui como fuente de tiempo. El pool y la cadencia viven en
+    /// `util::wait_message_at`, compartido con el CLI.
+    fn wait_message(ui: &mut egui::Ui) {
+        let secs = ui.input(|i| i.time);
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(crate::util::wait_message_at(secs))
+                .italics()
+                .color(theme::TEXT_WEAK),
+        );
+    }
+
     fn ui_scanning(&mut self, ui: &mut egui::Ui) {
         ui.add_space(20.0);
         theme::section_title(ui, "Buscando tus archivos…");
@@ -1028,7 +1050,7 @@ impl RecupeGhostApp {
                 ui.spinner();
                 ui.label("Preparando…");
             });
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
             return;
         }
         let done = scanner::scan_progress_bytes();
@@ -1067,11 +1089,7 @@ impl RecupeGhostApp {
                     theme::TEXT
                 }),
         );
-        ui.label(
-            egui::RichText::new("Podés usar la computadora normalmente mientras tanto.")
-                .size(13.0)
-                .color(theme::TEXT_WEAK),
-        );
+        Self::wait_message(ui);
 
         ui.add_space(18.0);
         // "Detener y ver lo encontrado", no "Cancelar". Para alguien asustado "cancelar" suena a
@@ -1085,7 +1103,7 @@ impl RecupeGhostApp {
         } else if ui.button("⏹  Detener y ver lo encontrado").clicked() {
             scanner::request_cancel();
         }
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
     }
 
     fn ui_results(&mut self, ui: &mut egui::Ui) {
@@ -1226,7 +1244,7 @@ impl RecupeGhostApp {
                 ui.spinner();
                 ui.label("Preparando…");
             });
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
             return;
         }
         let total = self
@@ -1257,6 +1275,8 @@ impl RecupeGhostApp {
             );
         }
 
+        Self::wait_message(ui);
+
         ui.add_space(18.0);
         // Se puede detener, y lo ya guardado sirve: son archivos completos en disco, no un estado
         // a medias que haya que descartar.
@@ -1266,7 +1286,7 @@ impl RecupeGhostApp {
         } else if ui.button("⏹  Detener y quedarme con lo guardado").clicked() {
             recovery::request_cancel();
         }
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
     }
 
     fn ui_cloning(&mut self, ui: &mut egui::Ui) {
@@ -1289,7 +1309,7 @@ impl RecupeGhostApp {
                 ui.spinner();
                 ui.label("Preparando…");
             });
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
             return;
         }
         let done = clone::clone_progress_bytes();
@@ -1323,6 +1343,8 @@ impl RecupeGhostApp {
             .color(theme::TEXT_WEAK),
         );
 
+        Self::wait_message(ui);
+
         ui.add_space(18.0);
         // Se puede detener: la copia parcial que ya se escribió sirve y se puede escanear igual.
         let deteniendo = clone::cancel_requested();
@@ -1331,7 +1353,7 @@ impl RecupeGhostApp {
         } else if ui.button("⏹  Detener y quedarme con lo copiado").clicked() {
             clone::request_cancel();
         }
-        ui.ctx().request_repaint();
+        ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
     }
 
     fn ui_clone_done(&mut self, ui: &mut egui::Ui) {
@@ -1544,6 +1566,13 @@ impl RecupeGhostApp {
                 crate::ui::open_url("https://www.facebook.com/ElBecerril");
             }
         });
+        // Despedida cálida al pie, como la de `ui::show_goodbye()` del CLI. El 👻 (sin selector de
+        // variación U+FE0F) sí lo dibujan las fuentes de respaldo de egui, así que no sale tofu.
+        ui.add_space(14.0);
+        ui.label(
+            egui::RichText::new("👻 ¡Hasta la próxima! RecupeGhost siempre estará aquí")
+                .color(theme::BRAND),
+        );
     }
 
     fn ui_error(&mut self, ui: &mut egui::Ui) {

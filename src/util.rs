@@ -1,5 +1,36 @@
 //! Utilidades compartidas entre módulos (formateo, detección de dispositivos, etc.)
 
+/// Mensajes con personalidad para las esperas largas (escaneo, recuperación, clonado). Voz del
+/// fantasma detective de RecupeGhost, en español mexicano. La GUI los rota en vivo (ver
+/// [`wait_message_at`]) y el CLI los usa en los preámbulos. El primero es el mensaje ancla del
+/// café que venía del CLI.
+///
+/// OJO (landmine de emojis): solo emojis BASE (☕ 👻 💤), sin selector de variación U+FE0F. La
+/// fuente de la GUI (Atkinson) no trae FE0F y egui dibujaría un cuadrito de "glifo faltante". Los
+/// que sí lo llevan (⚠️, ⏹️) NO van acá.
+pub const WAIT_MESSAGES: &[&str] = &[
+    "☕ Estos escaneos son bastante tardados, así que te recomendamos ir por un café o echarte un sueñito en lo que nosotros chambeamos. 👻💤",
+    "Voy revisando pedacito por pedacito. Tranquilo, no me apuro con tus recuerdos. 👻",
+    "Mientras más grande el disco, más me tardo. Aprovecha y estira las piernas.",
+    "Puedes usar la compu normalmente, yo sigo trabajando aquí atrás.",
+    "No apagues ni desconectes la memoria mientras trabajo, porfa. 👻",
+    "Buscando entre lo que creías perdido… para esto nací. Bueno, morí. 👻",
+];
+
+/// Mensaje de espera para `secs` segundos transcurridos, rotando cada 8 s. Determinista, sin RNG:
+/// la GUI lo llama cada frame con su reloj y el texto avanza solo. Seguro: `WAIT_MESSAGES` nunca
+/// está vacío, así que el módulo siempre devuelve un índice válido.
+pub fn wait_message_at(secs: f64) -> &'static str {
+    const ROTATE_SECS: f64 = 8.0;
+    let secs = if secs.is_finite() && secs >= 0.0 {
+        secs
+    } else {
+        0.0
+    };
+    let idx = ((secs / ROTATE_SECS) as usize) % WAIT_MESSAGES.len();
+    WAIT_MESSAGES[idx]
+}
+
 /// Formatea un tamaño en bytes de forma legible (ej: `14.5 GB`, `488.3 KB`, `120 B`).
 pub fn format_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;

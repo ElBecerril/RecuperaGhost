@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Bloque del camino rápido: 1 MiB, múltiplo de 512 (alineación a sector).
@@ -201,6 +202,14 @@ fn clone_to_image_impl(
     let mut dst = File::create(output_path)
         .with_context(|| format!("No se pudo crear la imagen: {}", output_path.display()))?;
 
+    if show_progress {
+        println!(
+            "{}",
+            "  ☕ Copiar el disco completo tarda un rato. Ve por un café; yo cuido tus datos \
+             mientras tanto. 👻"
+                .bright_yellow()
+        );
+    }
     let pb = if show_progress {
         let pb = ProgressBar::new(total);
         pb.set_style(

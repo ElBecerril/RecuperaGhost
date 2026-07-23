@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::scanner::FoundFile;
@@ -152,6 +153,12 @@ fn recover_files_impl(
 
     if !quiet {
         println!("  📂 Guardando en: {}", output_dir.display());
+        println!(
+            "{}",
+            "  ☕ Guardar todo puede tardar. Puedes usar la compu normalmente, yo sigo aquí \
+             trabajando. 👻"
+                .bright_yellow()
+        );
         println!();
     }
 
