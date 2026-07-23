@@ -1070,6 +1070,11 @@ fn scan_source_impl(
     // También es cancelable, por el mismo motivo que `refine_footers`.
     refine_audio_streams(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
 
+    // Misma idea para los contenedores ISOBMFF (MP4/HEIC/3GP/M4A): sus cajas traen el largo, así que
+    // el tamaño real se resuelve saltando de caja en caja. Sin esto, un `ftyp` que aparece por
+    // casualidad en datos binarios se carveaba hasta max_size — 2 GB por candidato en MP4.
+    refine_isobmff_sizes(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
+
     // Supresión de solapamiento: quitar los archivos que caen ENTEROS dentro de otro cuyo final se
     // detectó de verdad (footer/EOCD). Son contenido embebido —miniaturas, iconos, imágenes dentro
     // de un PDF o un Word— que el carving ve como archivos sueltos y que, sin esto, llenan la salida
@@ -1506,6 +1511,89 @@ fn refine_audio_streams(source_path: &Path, found_files: &mut [FoundFile], cance
             f.size = size;
             f.footer_found = true;
         }
+    }
+}
+
+/// Segundo pase para los contenedores ISOBMFF (MP4, HEIC, 3GP, M4A): recorre las cajas del archivo
+/// LEYENDO DEL DISCO, para los que no cerraron dentro del buffer de 1 MB del escaneo.
+///
+/// Es mucho más barato que el pase de audio: las cajas traen su largo, así que se salta de una a la
+/// siguiente con `seek` en vez de leer el contenido. Un video de 1 GB se resuelve con un puñado de
+/// lecturas de 16 bytes.
+fn refine_isobmff_sizes(source_path: &Path, found_files: &mut [FoundFile], cancel: &AtomicBool) {
+    let source_size = {
+        let Ok(mut file) = File::open(source_path) else {
+            return;
+        };
+        match get_source_size(&mut file, source_path) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+
+    for f in found_files.iter_mut() {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        if f.footer_found || !f.signature.is_isobmff() {
+            continue;
+        }
+        if let Some(size) = walk_isobmff_on_disk(
+            source_path,
+            f.offset,
+            f.signature.max_size as u64,
+            source_size,
+            cancel,
+        ) {
+            f.size = size;
+            f.footer_found = true;
+        }
+    }
+}
+
+/// Recorre las cajas de un ISOBMFF saltando de una a la siguiente, y devuelve el tamaño real del
+/// archivo. `None` si no se puede afirmar dónde termina.
+fn walk_isobmff_on_disk(
+    source_path: &Path,
+    offset: u64,
+    max_size: u64,
+    source_size: u64,
+    cancel: &AtomicBool,
+) -> Option<u64> {
+    use crate::signatures::{isobmff_box_len_at, ISOBMFF_MIN_BOXES};
+
+    let mut file = File::open(source_path).ok()?;
+    let mut header = [0u8; 16];
+    let mut pos: u64 = 0;
+    let mut boxes: usize = 0;
+
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        if pos > max_size {
+            // Más grande de lo que esta firma admite: no se afirma un tamaño.
+            return None;
+        }
+        let absolute = offset.checked_add(pos)?;
+        if absolute >= source_size {
+            // Las cajas llegan justo hasta el final del origen: final limpio.
+            return (boxes >= ISOBMFF_MIN_BOXES && absolute == source_size).then_some(pos);
+        }
+
+        file.seek(SeekFrom::Start(absolute)).ok()?;
+        let n = read_up_to(&mut file, &mut header)?;
+        let Some(len) = isobmff_box_len_at(&header[..n]) else {
+            // Lo que sigue no es una caja: ahí termina el archivo.
+            return (boxes >= ISOBMFF_MIN_BOXES).then_some(pos);
+        };
+        let next = pos.checked_add(len)?;
+        if offset.checked_add(next)? > source_size {
+            // La última caja declara más de lo que hay en el origen: archivo cortado.
+            return None;
+        }
+        pos = next;
+        boxes += 1;
     }
 }
 
@@ -3083,6 +3171,26 @@ mod tests {
         println!("\nBrands hevm/hevs detectados correctamente como HEIC, no MP4.");
     }
 
+    /// Arma un BMP estructuralmente valido (BITMAPFILEHEADER + BITMAPINFOHEADER de 40 bytes,
+    /// sin comprimir) del tamano que indican las dimensiones.
+    fn make_bmp(width: i32, height: i32, bpp: u16) -> Vec<u8> {
+        let row = (((width as i64 * bpp as i64 + 31) / 32) * 4) as usize;
+        let pixel_offset = 54u32;
+        let file_size = pixel_offset as usize + row * height as usize;
+        let mut b = vec![0u8; file_size];
+        b[0..2].copy_from_slice(b"BM");
+        b[2..6].copy_from_slice(&(file_size as u32).to_le_bytes());
+        // 6..10 = reservados, en cero
+        b[10..14].copy_from_slice(&pixel_offset.to_le_bytes());
+        b[14..18].copy_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        b[18..22].copy_from_slice(&width.to_le_bytes());
+        b[22..26].copy_from_slice(&height.to_le_bytes());
+        b[26..28].copy_from_slice(&1u16.to_le_bytes()); // planos: siempre 1
+        b[28..30].copy_from_slice(&bpp.to_le_bytes());
+        // 30..34 = compresion 0 (sin comprimir)
+        b
+    }
+
     #[test]
     fn test_bmp_header_validator() {
         // BMP tenia header de solo 2 bytes ("BM") sin validador, y ademas usa
@@ -3094,14 +3202,11 @@ mod tests {
         let bmp_sig = sigs.iter().find(|s| s.name == "BMP").unwrap();
         let (validator_fn, _needed) = bmp_sig.validator.expect("BMP deberia tener validator");
 
-        // Caso valido: bfSize = 100, reservado1/2 = 0, bfOffBits = 54 (valor tipico BMP: 14
-        // bytes de BITMAPFILEHEADER + 40 bytes de BITMAPINFOHEADER estandar).
-        let mut valid = vec![0u8; 100];
-        valid[0] = 0x42;
-        valid[1] = 0x4D;
-        valid[2..6].copy_from_slice(&100u32.to_le_bytes());
-        valid[6..10].copy_from_slice(&[0, 0, 0, 0]);
-        valid[10..14].copy_from_slice(&54u32.to_le_bytes());
+        // Caso valido: un BMP de 10x10 a 24 bits, con BITMAPFILEHEADER + BITMAPINFOHEADER
+        // completos. El fixture viejo era solo el BITMAPFILEHEADER con el encabezado DIB en CEROS
+        // —algo que ningun BMP real es— y pasaba porque el validador no miraba mas alla de los
+        // primeros 14 bytes.
+        let valid = make_bmp(10, 10, 24);
         assert!(
             validator_fn(&valid),
             "BMP valido deberia pasar el validador"
@@ -3137,10 +3242,10 @@ mod tests {
         // por esa heuristica no relacionada, no por el validador BMP en si.
         let mut data = vec![0u8; 4096];
         let bmp_pos = 512usize;
-        data[bmp_pos] = 0x42;
-        data[bmp_pos + 1] = 0x4D;
-        data[bmp_pos + 2..bmp_pos + 6].copy_from_slice(&1000u32.to_le_bytes());
-        data[bmp_pos + 10..bmp_pos + 14].copy_from_slice(&54u32.to_le_bytes());
+        // 20x20 a 24 bits = 1254 bytes: por encima del umbral de 512.
+        let bmp = make_bmp(20, 20, 24);
+        assert!(bmp.len() > 512, "el fixture debe superar el umbral de 512");
+        data[bmp_pos..bmp_pos + bmp.len()].copy_from_slice(&bmp);
 
         // xorshift64 simple, determinístico, solo para este test (mismo patron que
         // test_mp3_aac_frame_chaining_rejects_most_random_data).
@@ -3187,6 +3292,51 @@ mod tests {
         );
 
         println!("\nValidador BMP acepta headers coherentes y rechaza campos incoherentes.");
+
+        // Casos que la version vieja daba por buenos (y que llenaban la salida de basura: 6 BMP
+        // falsos, 148 MB, medidos sobre binarios del sistema).
+        let mut dib_basura = make_bmp(10, 10, 24);
+        dib_basura[14..18].copy_from_slice(&37u32.to_le_bytes());
+        assert!(
+            !validator_fn(&dib_basura),
+            "el encabezado DIB solo mide unos pocos valores definidos, 37 no es uno"
+        );
+
+        let mut planos_raros = make_bmp(10, 10, 24);
+        planos_raros[26..28].copy_from_slice(&7u16.to_le_bytes());
+        assert!(
+            !validator_fn(&planos_raros),
+            "los planos son SIEMPRE 1 en BMP"
+        );
+
+        let mut bpp_raro = make_bmp(10, 10, 24);
+        bpp_raro[28..30].copy_from_slice(&13u16.to_le_bytes());
+        assert!(!validator_fn(&bpp_raro), "13 bits por pixel no existe");
+
+        let mut reservados = make_bmp(10, 10, 24);
+        reservados[6..10].copy_from_slice(&12345u32.to_le_bytes());
+        assert!(
+            !validator_fn(&reservados),
+            "los campos reservados valen 0 en cualquier BMP real"
+        );
+
+        // Tamano declarado que no alcanza para los pixeles que dicen las dimensiones: un BMP de
+        // 1000x1000 a 24 bits necesita 3 MB, no 400 bytes.
+        let mut incoherente = make_bmp(10, 10, 24);
+        incoherente[18..22].copy_from_slice(&1000i32.to_le_bytes());
+        incoherente[22..26].copy_from_slice(&1000i32.to_le_bytes());
+        assert!(
+            !validator_fn(&incoherente),
+            "el tamano declarado tiene que alcanzar para los pixeles"
+        );
+
+        // Y el alto negativo (fila superior primero) es LEGAL: no se puede rechazar.
+        let mut arriba_abajo = make_bmp(10, 10, 24);
+        arriba_abajo[22..26].copy_from_slice(&(-10i32).to_le_bytes());
+        assert!(
+            validator_fn(&arriba_abajo),
+            "un BMP con alto negativo es valido (fila superior primero)"
+        );
     }
 
     #[test]

@@ -66,8 +66,15 @@ impl FileSignature {
         match self.name {
             "MP3 (ID3)" | "MP3 (Sync)" => Some(mp3_stream_end),
             "AAC" => Some(aac_stream_end),
+            _ if self.is_isobmff() => Some(isobmff_end),
             _ => None,
         }
+    }
+
+    /// True si la firma es un contenedor ISOBMFF (cajas `ftyp`/`moov`/`mdat`…): MP4, HEIC, 3GP y
+    /// M4A. Su tamaño real sale de recorrer las cajas, ver `isobmff_end`.
+    pub fn is_isobmff(&self) -> bool {
+        matches!(self.name, "MP4/M4V" | "HEIC/HEIF" | "3GP" | "M4A")
     }
 
     /// Familia de audio por frames de esta firma, para poder seguir la cadena leyendo del disco
@@ -371,6 +378,113 @@ pub fn aac_stream_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
     chain_size(&chain, at_source_end)
 }
 
+// ─── ISOBMFF (MP4, HEIC, 3GP, M4A): recorrido de cajas ──────────────────────
+//
+// Un archivo ISOBMFF es una secuencia de "cajas": [tamaño: 4 bytes big-endian][tipo: 4 chars] y el
+// contenido. Recorrerlas da el tamaño EXACTO del archivo, igual que la cadena de frames en el
+// audio. Sin esto, un "ftyp" que aparece por casualidad en datos binarios se carveaba hasta
+// `max_size` — que en MP4 son 2 GB por candidato (701 MB de basura sobre 382 MB de origen medidos).
+
+/// Bytes mínimos para leer el header de una caja (tamaño de 32 bits + tipo).
+const ISOBMFF_BOX_HEADER: usize = 8;
+/// Header de una caja con tamaño extendido de 64 bits (`size == 1`).
+const ISOBMFF_BOX_HEADER_LARGE: usize = 16;
+/// Cuántas cajas encadenadas alcanzan para creerle a un `ftyp`. Con 2 ya hace falta que el tamaño
+/// declarado por la primera caiga justo sobre otro header de caja válido.
+pub const ISOBMFF_MIN_BOXES: usize = 2;
+
+/// Un tipo de caja son 4 caracteres imprimibles, empezando por letra o dígito (`ftyp`, `moov`,
+/// `mdat`, `free`…). No se usa una lista cerrada a propósito: rechazar un tipo legítimo pero poco
+/// común sería perderle un video a alguien, y el encadenado de tamaños ya es el filtro fuerte.
+fn is_isobmff_box_type(t: &[u8]) -> bool {
+    t.len() == 4
+        && t[0].is_ascii_alphanumeric()
+        && t.iter().all(|c| c.is_ascii_graphic() || *c == b' ')
+}
+
+/// Largo de la caja que empieza al inicio de `bytes`, para quien lee de a un header por vez del
+/// disco. `None` si ahí no hay un header de caja válido (o si no alcanzan los bytes para saberlo).
+pub fn isobmff_box_len_at(bytes: &[u8]) -> Option<u64> {
+    isobmff_box_len(bytes, 0)
+}
+
+/// Largo de la caja que empieza en `pos`. `None` si ahí no hay un header de caja válido.
+///
+/// Devuelve también cuántos bytes de header hacían falta, para poder distinguir "no hay caja" de
+/// "no alcanzan los bytes para saberlo".
+fn isobmff_box_len(bytes: &[u8], pos: usize) -> Option<u64> {
+    let h = bytes.get(pos..pos.checked_add(ISOBMFF_BOX_HEADER)?)?;
+    if !is_isobmff_box_type(&h[4..8]) {
+        return None;
+    }
+    let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64;
+    match size {
+        // `1` = el tamaño real viene en 64 bits justo después del tipo.
+        1 => {
+            let h = bytes.get(pos..pos.checked_add(ISOBMFF_BOX_HEADER_LARGE)?)?;
+            let big = u64::from_be_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+            (big >= ISOBMFF_BOX_HEADER_LARGE as u64).then_some(big)
+        }
+        // `0` = la caja llega hasta el final del archivo. Es válido, pero no dice dónde termina:
+        // se trata como "no se puede afirmar el tamaño".
+        0 => None,
+        // Una caja no puede medir menos que su propio header.
+        s if s < ISOBMFF_BOX_HEADER as u64 => None,
+        s => Some(s),
+    }
+}
+
+/// Recorre cajas ISOBMFF desde el inicio de `bytes` y devuelve cuántas encadenó, hasta dónde
+/// llegó, y por qué paró (mismo criterio que la cadena de frames de audio).
+pub fn walk_isobmff_boxes(bytes: &[u8], max_boxes: usize) -> FrameChain {
+    let mut pos = 0usize;
+    let mut boxes = 0usize;
+    let stop = loop {
+        if boxes >= max_boxes {
+            break ChainStop::Capped;
+        }
+        if pos.saturating_add(ISOBMFF_BOX_HEADER) > bytes.len() {
+            break ChainStop::NoMoreData;
+        }
+        let Some(len) = isobmff_box_len(bytes, pos) else {
+            // Puede ser que falten bytes para leer un header extendido de 64 bits, y no que la caja
+            // sea inválida: se distingue para no declarar "basura" lo que es falta de datos.
+            if pos.saturating_add(ISOBMFF_BOX_HEADER_LARGE) > bytes.len() {
+                break ChainStop::NoMoreData;
+            }
+            break ChainStop::BadData;
+        };
+        let Some(next) = (pos as u64).checked_add(len) else {
+            break ChainStop::BadData;
+        };
+        if next > bytes.len() as u64 {
+            // La caja declara más de lo que hay acá: puede seguir más allá del buffer.
+            break ChainStop::Truncated;
+        }
+        pos = next as usize;
+        boxes += 1;
+    };
+    FrameChain {
+        frames: boxes,
+        bytes: pos.min(bytes.len()),
+        stop,
+        sample_rate: None,
+    }
+}
+
+/// Tamaño real de un archivo ISOBMFF (MP4/HEIC/3GP/M4A) que empieza en el inicio de `bytes`.
+pub fn isobmff_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
+    let chain = walk_isobmff_boxes(bytes, usize::MAX);
+    if chain.frames < ISOBMFF_MIN_BOXES {
+        return None;
+    }
+    match chain.stop {
+        ChainStop::BadData => Some(chain.bytes),
+        ChainStop::NoMoreData if at_source_end => Some(chain.bytes),
+        _ => None,
+    }
+}
+
 /// HEIC/HEIF y MP4 comparten la misma caja contenedora `ftyp` (ISOBMFF): la única forma de
 /// distinguirlos es leer el `major_brand` de 4 bytes que sigue inmediatamente a "ftyp".
 const HEIC_BRANDS: [&[u8; 4]; 10] = [
@@ -445,6 +559,84 @@ fn validate_bmp_header(bytes: &[u8], max_bmp_size: usize) -> bool {
     if pixel_offset <= 14 || pixel_offset > file_size {
         return false;
     }
+
+    // Los dos campos reservados del BITMAPFILEHEADER valen 0 en cualquier BMP real. Son 4 bytes que
+    // los datos binarios casi nunca tienen en cero justo acá.
+    if u32::from_le_bytes(bytes[6..10].try_into().unwrap()) != 0 {
+        return false;
+    }
+
+    // Sin el encabezado DIB no se puede seguir validando: se acepta con lo mirado hasta acá en vez
+    // de rechazar un BMP real solo porque el candidato cayó al final del buffer.
+    if bytes.len() < 26 {
+        return true;
+    }
+
+    // Tamaño del encabezado DIB: son los pocos valores que definió Microsoft, no un número
+    // cualquiera. (12 = BITMAPCOREHEADER, 40 = el clásico BITMAPINFOHEADER, 108/124 = V4/V5.)
+    let dib_size = u32::from_le_bytes(bytes[14..18].try_into().unwrap());
+    if !matches!(dib_size, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124) {
+        return false;
+    }
+    // El área de píxeles no puede empezar antes de que termine el encabezado.
+    if (pixel_offset as u32) < 14 + dib_size {
+        return false;
+    }
+
+    // Ancho y alto: positivos y no absurdos. El alto puede ser negativo (fila superior primero),
+    // así que se mira su valor absoluto.
+    let (width, height) = if dib_size == 12 {
+        (
+            u16::from_le_bytes(bytes[18..20].try_into().unwrap()) as i64,
+            (u16::from_le_bytes(bytes[20..22].try_into().unwrap()) as i64).abs(),
+        )
+    } else {
+        (
+            i32::from_le_bytes(bytes[18..22].try_into().unwrap()) as i64,
+            (i32::from_le_bytes(bytes[22..26].try_into().unwrap()) as i64).unsigned_abs() as i64,
+        )
+    };
+    // 65535 px de lado ya es enorme para una foto y deja afuera los valores disparatados que salen
+    // de leer datos binarios como si fueran dimensiones.
+    if width <= 0 || height <= 0 || width > 65_535 || height > 65_535 {
+        return false;
+    }
+
+    if bytes.len() < 30 {
+        return true;
+    }
+    // Planos: SIEMPRE 1 en BMP. Bits por píxel: solo los valores definidos.
+    let (planes, bpp) = if dib_size == 12 {
+        (
+            u16::from_le_bytes(bytes[22..24].try_into().unwrap()),
+            u16::from_le_bytes(bytes[24..26].try_into().unwrap()),
+        )
+    } else {
+        (
+            u16::from_le_bytes(bytes[26..28].try_into().unwrap()),
+            u16::from_le_bytes(bytes[28..30].try_into().unwrap()),
+        )
+    };
+    if planes != 1 || !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) {
+        return false;
+    }
+
+    // Coherencia final: el tamaño declarado tiene que alcanzar para los píxeles que dicen las
+    // dimensiones. Solo se exige en BMP sin comprimir (lo normal), donde el cálculo es exacto: las
+    // filas se alinean a múltiplos de 4 bytes.
+    let compression = if dib_size >= 40 && bytes.len() >= 34 {
+        u32::from_le_bytes(bytes[30..34].try_into().unwrap())
+    } else {
+        0
+    };
+    if compression == 0 {
+        let row = ((width * bpp as i64 + 31) / 32) * 4;
+        let needed = pixel_offset as i64 + row * height;
+        if (file_size as i64) < needed {
+            return false;
+        }
+    }
+
     true
 }
 
