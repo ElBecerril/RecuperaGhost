@@ -30,6 +30,13 @@ pub fn run() -> eframe::Result<()> {
             .with_inner_size([760.0, 640.0])
             .with_min_inner_size([560.0, 480.0])
             .with_title("RecupeGhost"),
+        // Render por wgpu (DirectX 12 en Windows) en vez de glow (OpenGL). El ICD de OpenGL de
+        // Intel (`ig9icd64.dll`) reventaba con access violation a mitad del escaneo; los drivers
+        // DirectX son mucho más estables. En una máquina sin GPU utilizable, `run()` devuelve `Err`
+        // igual que con glow, así que el cartel del Fix 1 (que apunta al CLI) sigue cubriendo ese
+        // caso — sin regresión. (Mejora futura: configurar el adaptador de respaldo WARP para abrir
+        // la GUI por software también ahí.)
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
