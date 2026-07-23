@@ -136,6 +136,9 @@ struct RecupeGhostApp {
     scan_result: Option<ScanResult>,
     recovery_rx: Option<Receiver<anyhow::Result<RecoveryResult>>>,
     recovery_result: Option<RecoveryResult>,
+    /// Cantidad de archivos que se van a recuperar de verdad (después de filtrar los posiblemente
+    /// dañados): es el total de la barra de progreso, no `found_files.len()`.
+    recovery_total: u64,
     // Clonado de disco a imagen (para un disco que está fallando).
     clone_rx: Option<Receiver<anyhow::Result<CloneResult>>>,
     clone_result: Option<CloneResult>,
@@ -143,6 +146,9 @@ struct RecupeGhostApp {
     error_msg: String,
     /// Traducción amigable del error, cuando el fallo viene de un `io::Error` reconocible.
     error_hint: Option<&'static str>,
+    /// Si incluir los "posiblemente dañados" (Suspect) al recuperar. Default: NO (son la principal
+    /// fuente de basura y de tamaño inflado). El usuario lo activa con un checkbox en resultados.
+    include_damaged: bool,
 }
 
 impl RecupeGhostApp {
@@ -167,11 +173,13 @@ impl RecupeGhostApp {
             scan_result: None,
             recovery_rx: None,
             recovery_result: None,
+            recovery_total: 0,
             clone_rx: None,
             clone_result: None,
             clone_total: 0,
             error_msg: String::new(),
             error_hint: None,
+            include_damaged: false,
         };
         app.apply_demo_state();
         app
@@ -422,8 +430,18 @@ impl RecupeGhostApp {
         if self.pending_warning.is_some() {
             return;
         }
+        // Por defecto NO se recuperan los "posiblemente dañados" (Suspect): son la principal fuente
+        // de basura y de tamaño inflado. El usuario puede incluirlos con el checkbox de resultados.
         let (source, files) = match (&self.source, &self.scan_result) {
-            (Some(s), Some(r)) => (s.clone(), r.found_files.clone()),
+            (Some(s), Some(r)) => {
+                let files: Vec<_> = r
+                    .found_files
+                    .iter()
+                    .filter(|f| self.include_damaged || f.integrity() != Integrity::Suspect)
+                    .cloned()
+                    .collect();
+                (s.clone(), files)
+            }
             _ => return,
         };
         // Estas dos validaciones estaban solo en `start_scan`, pero el que ESCRIBE es este. Se
@@ -449,6 +467,7 @@ impl RecupeGhostApp {
         if self.blocked_by_same_device(&source, &out, PendingAction::Recover) {
             return;
         }
+        self.recovery_total = files.len() as u64;
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(recovery::recover_files_quiet(&source, &files, &out));
@@ -1108,20 +1127,30 @@ impl RecupeGhostApp {
 
     fn ui_results(&mut self, ui: &mut egui::Ui) {
         // Extraer lo mostrable sin retener el borrow de `self.scan_result`.
-        let (count, cancelled, had_errors, rows): (usize, bool, bool, Vec<(Integrity, String)>) =
-            match &self.scan_result {
-                Some(res) => (
-                    res.found_files.len(),
-                    res.cancelled,
-                    res.had_errors,
-                    res.found_files
-                        .iter()
-                        .take(500)
-                        .map(|f| (f.integrity(), f.friendly_summary()))
-                        .collect(),
-                ),
-                None => return,
-            };
+        #[allow(clippy::type_complexity)]
+        let (count, suspect_count, cancelled, had_errors, rows): (
+            usize,
+            usize,
+            bool,
+            bool,
+            Vec<(Integrity, String)>,
+        ) = match &self.scan_result {
+            Some(res) => (
+                res.found_files.len(),
+                res.found_files
+                    .iter()
+                    .filter(|f| f.integrity() == Integrity::Suspect)
+                    .count(),
+                res.cancelled,
+                res.had_errors,
+                res.found_files
+                    .iter()
+                    .take(500)
+                    .map(|f| (f.integrity(), f.friendly_summary()))
+                    .collect(),
+            ),
+            None => return,
+        };
 
         ui.add_space(6.0);
 
@@ -1205,12 +1234,21 @@ impl RecupeGhostApp {
                 }
             });
 
+        // Los "posiblemente dañados" (⚠) no se guardan por defecto: son la principal fuente de
+        // basura (miniaturas, pedazos, falsos positivos) y de tamaño inflado. Se pueden incluir.
+        if suspect_count > 0 {
+            ui.add_space(8.0);
+            ui.checkbox(
+                &mut self.include_damaged,
+                format!(
+                    "Incluir {suspect_count} archivo(s) posiblemente dañados (⚠) — suelen estar incompletos o ser basura"
+                ),
+            );
+        }
+
         ui.add_space(12.0);
         ui.horizontal(|ui| {
-            if ui
-                .add(theme::primary_button("💾  Recuperar todo"))
-                .clicked()
-            {
+            if ui.add(theme::primary_button("💾  Recuperar")).clicked() {
                 self.start_recovery();
             }
             if ui.button("↩ Volver").clicked() {
@@ -1247,11 +1285,7 @@ impl RecupeGhostApp {
             ui.ctx().request_repaint_after(Self::WAIT_REPAINT);
             return;
         }
-        let total = self
-            .scan_result
-            .as_ref()
-            .map(|r| r.found_files.len() as u64)
-            .unwrap_or(0);
+        let total = self.recovery_total;
         let hechos = recovery::recovery_progress_files();
         let frac = if total > 0 {
             (hechos as f32 / total as f32).clamp(0.0, 1.0)

@@ -1059,6 +1059,13 @@ fn scan_source_impl(
     // Ctrl+C. Se le pasa el flag para que corte por candidato y por chunk.
     refine_footers(source_path, &mut found_files, &SCAN_CANCEL_REQUESTED);
 
+    // Supresión de solapamiento: quitar los archivos que caen ENTEROS dentro de otro cuyo final se
+    // detectó de verdad (footer/EOCD). Son contenido embebido —miniaturas, iconos, imágenes dentro
+    // de un PDF o un Word— que el carving ve como archivos sueltos y que, sin esto, llenan la salida
+    // de basura y hacen que la suma de tamaños supere de lejos al disco. Va DESPUÉS de refine_footers
+    // para que los tamaños de los contenedores ya estén afinados.
+    suppress_contained(&mut found_files);
+
     // Capturar la cancelación DESPUÉS del refinamiento: si el usuario cortó durante ese pase,
     // `cancelled` debe reflejarlo. `found_files` ya contiene solo lo hallado antes de cortar; el
     // refinamiento no agrega archivos, solo ajusta el tamaño de los que ya estaban.
@@ -1131,6 +1138,55 @@ fn zip_ooxml_size(buf: &[u8], start: usize, search_limit: usize) -> Option<usize
         return None;
     }
     crate::signatures::zip_local_file_end(&buf[start..end_scan])
+}
+
+/// Elimina de `found_files` los archivos que caen ENTERAMENTE dentro de otro cuyo final se detectó
+/// de verdad (footer o EOCD hallado → `footer_found`). Son contenido embebido —una miniatura JPEG
+/// dentro de una foto, una imagen dentro de un PDF o un Word, un icono dentro de otro archivo— que
+/// el carving detecta como archivo suelto y que, sin esto, llena la salida de "basura" y hace que la
+/// suma de tamaños supere de lejos al tamaño del disco (varios carves pisándose entre sí).
+///
+/// Clave de seguridad: solo se suprime lo contenido en un contenedor CONFIABLE (`footer_found`). Un
+/// falso positivo carveado a `max_size` (que englobaría archivos reales que vengan después) tiene
+/// `footer_found=false`, así que NO cuenta como contenedor y NUNCA borra a los reales de adentro
+/// —esos los filtra después el criterio de integridad al recuperar—.
+fn suppress_contained(found_files: &mut Vec<FoundFile>) {
+    if found_files.len() < 2 {
+        return;
+    }
+    // Índices ordenados por offset asc y, a igual offset, tamaño desc (el contenedor antes que lo
+    // contenido). No se reordena `found_files` en sí para no cambiar el orden que ve el resto.
+    let mut order: Vec<usize> = (0..found_files.len()).collect();
+    order.sort_by(|&a, &b| {
+        found_files[a]
+            .offset
+            .cmp(&found_files[b].offset)
+            .then(found_files[b].size.cmp(&found_files[a].size))
+    });
+
+    let mut drop_flags = vec![false; found_files.len()];
+    // `container_end` = fin máximo de un contenedor confiable visto hasta ahora. Por el orden, ese
+    // contenedor arranca en o antes del archivo actual; si además su fin llega hasta el fin del
+    // actual, el actual está enteramente contenido → se descarta.
+    let mut container_end: u64 = 0;
+    for &i in &order {
+        let f = &found_files[i];
+        let f_end = f.offset.saturating_add(f.size);
+        if f_end <= container_end {
+            drop_flags[i] = true;
+            continue;
+        }
+        if f.footer_found {
+            container_end = container_end.max(f_end);
+        }
+    }
+
+    let mut i = 0;
+    found_files.retain(|_| {
+        let keep = !drop_flags[i];
+        i += 1;
+        keep
+    });
 }
 
 /// Busca firmas dentro de un buffer.
@@ -1530,6 +1586,49 @@ mod tests {
             index: 1,
             footer_found,
         }
+    }
+
+    #[test]
+    fn test_suppress_contained_drops_embedded_but_not_inside_false_positive() {
+        let sig = all_signatures()
+            .into_iter()
+            .find(|s| s.extension == "jpg")
+            .unwrap();
+        let ff = |offset: u64, size: u64, footer_found: bool, index: usize| FoundFile {
+            signature: sig.clone(),
+            offset,
+            size,
+            index,
+            footer_found,
+        };
+
+        // Dentro de un contenedor CONFIABLE (footer hallado) → se suprime lo de adentro; lo de
+        // afuera se conserva.
+        let mut v = vec![
+            ff(0, 1000, true, 1),   // contenedor intacto
+            ff(100, 200, true, 2),  // miniatura embebida (dentro)
+            ff(5000, 300, true, 3), // archivo aparte (no contenido)
+        ];
+        suppress_contained(&mut v);
+        let offsets: Vec<u64> = v.iter().map(|f| f.offset).collect();
+        assert_eq!(
+            offsets,
+            vec![0, 5000],
+            "solo la miniatura embebida debe irse"
+        );
+
+        // Dentro de un FALSO POSITIVO carveado a max_size (footer_found=false) → NO se suprime al
+        // archivo real de adentro (si no, un carve gigante borraría reales).
+        let mut v2 = vec![
+            ff(0, 100_000, false, 1), // falso positivo a max_size (no es contenedor confiable)
+            ff(500, 800, true, 2),    // archivo REAL adentro
+        ];
+        suppress_contained(&mut v2);
+        assert_eq!(
+            v2.len(),
+            2,
+            "un falso positivo no debe suprimir a los reales de adentro"
+        );
     }
 
     /// Arma un archivo ZIP válido (entradas STORED, sin comprimir) con su directorio central y EOCD

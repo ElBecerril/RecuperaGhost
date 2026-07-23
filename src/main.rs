@@ -51,6 +51,11 @@ struct CliArgs {
     /// sin este flag, el modo batch aborta en ese caso en vez de arriesgar tus datos.
     #[arg(long = "acepto-el-riesgo")]
     acepto_el_riesgo: bool,
+
+    /// Recuperar también los archivos "posiblemente dañados" (los que quedaron sin su final real).
+    /// Por defecto se saltan: suelen ser basura o estar incompletos, y son los que inflan el total.
+    #[arg(long = "incluir-danados")]
+    incluir_danados: bool,
 }
 
 impl CliArgs {
@@ -191,8 +196,9 @@ fn main() -> Result<()> {
         // ── Modo batch ──
         banner::show_banner();
 
-        // El flag se lee ANTES de consumir `args` en `into_scan_config`.
+        // Los flags se leen ANTES de consumir `args` en `into_scan_config`.
         let acepto_el_riesgo = args.acepto_el_riesgo;
+        let incluir_danados = args.incluir_danados;
         let config = args.into_scan_config(source);
 
         // Validar que la ruta existe (excepto dispositivos raw)
@@ -276,7 +282,7 @@ fn main() -> Result<()> {
         );
         println!();
 
-        if let Err(e) = run_scan(config, true) {
+        if let Err(e) = run_scan(config, true, incluir_danados) {
             eprintln!("{}", format!("  ❌ Error: {}", e).bright_red());
             if let Some(hint) = util::friendly_error_hint(&e) {
                 eprintln!("{}", hint.bright_yellow());
@@ -328,7 +334,7 @@ fn main() -> Result<()> {
             match ui::main_menu()? {
                 MainMenuChoice::Scan => {
                     if let Some(config) = ui::scan_menu()? {
-                        if let Err(e) = run_scan(config, false) {
+                        if let Err(e) = run_scan(config, false, false) {
                             eprintln!();
                             eprintln!(
                                 "{}",
@@ -394,7 +400,7 @@ fn wait_for_keypress() {
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
-fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
+fn run_scan(config: ScanConfig, batch: bool, include_damaged_batch: bool) -> Result<()> {
     println!();
     println!(
         "{}",
@@ -480,23 +486,42 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
     }
     println!();
 
-    // Contar los dudosos para avisar sin ocultarlos.
+    // Contar los "posiblemente dañados" (Suspect): son los que quedaron sin su final real (carveados
+    // a tamaño máximo). Por defecto NO se recuperan —son la principal fuente de basura y de tamaño
+    // inflado— pero NUNCA se ocultan de la lista de arriba.
     let suspect_count = result
         .found_files
         .iter()
         .filter(|f| f.integrity() == scanner::Integrity::Suspect)
         .count();
-    if suspect_count > 0 {
+    // ¿Incluirlos igual? En batch por el flag; en interactivo se pregunta (default no) si hay.
+    let include_damaged = if batch {
+        include_damaged_batch
+    } else if suspect_count > 0 {
+        ui::ask_include_damaged(suspect_count)?
+    } else {
+        false
+    };
+    if suspect_count > 0 && !include_damaged {
         println!(
             "{}",
             format!(
-                "  ⚠️  {} archivo(s) podrían estar dañados o incompletos (quedaron sin su final).\n     Igual puedes recuperarlos: a veces se abren bien o se reparan aparte.",
-                suspect_count
+                "  ⚠️  {} archivo(s) posiblemente dañados NO se van a guardar (quedaron sin su final:\n     suelen estar incompletos o ser basura). Para incluirlos igual, {}.",
+                suspect_count,
+                if batch { "usa --incluir-danados" } else { "responde que sí a la pregunta anterior" }
             )
             .bright_yellow()
         );
         println!();
     }
+
+    // Los que se van a recuperar: todos menos los posiblemente dañados, salvo que se pidan.
+    let to_recover: Vec<_> = result
+        .found_files
+        .iter()
+        .filter(|f| include_damaged || f.integrity() != scanner::Integrity::Suspect)
+        .cloned()
+        .collect();
 
     // En modo batch: recuperar directamente. En interactivo: preguntar.
     let should_recover = if batch { true } else { ui::ask_recover()? };
@@ -522,7 +547,7 @@ fn run_scan(config: ScanConfig, batch: bool) -> Result<()> {
         println!();
 
         let recovery_result =
-            recovery::recover_files(&config.source_path, &result.found_files, &config.output_dir)?;
+            recovery::recover_files(&config.source_path, &to_recover, &config.output_dir)?;
 
         println!();
         // El titular tiene que decir la verdad. Ahora que la recuperación se puede cancelar con
@@ -615,7 +640,7 @@ fn run_clone(config: CloneConfig) -> Result<()> {
     // Ofrecer escanear la imagen recién creada sin volver a pedir el origen.
     if ui::ask_scan_cloned_image(&config.output_path)? {
         if let Some(scan_config) = ui::scan_menu_with_source(Some(config.output_path.clone()))? {
-            run_scan(scan_config, false)?;
+            run_scan(scan_config, false, false)?;
         }
     } else {
         println!();

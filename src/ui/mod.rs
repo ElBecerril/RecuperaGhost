@@ -1112,6 +1112,20 @@ pub fn ask_recover() -> Result<bool> {
     Ok(confirm)
 }
 
+/// Pregunta si incluir también los archivos "posiblemente dañados" (Suspect). El default es NO:
+/// suelen estar incompletos o ser basura, y son los que inflan el total. No se ocultan de la lista;
+/// esto solo decide si se GUARDAN.
+pub fn ask_include_damaged(count: usize) -> Result<bool> {
+    println!();
+    let confirm = Confirm::new()
+        .with_prompt(format!(
+            "  ⚠️  ¿Incluir también los {count} archivo(s) posiblemente dañados? (suelen estar incompletos)"
+        ))
+        .default(false)
+        .interact()?;
+    Ok(confirm)
+}
+
 /// Muestra la pantalla "Acerca de"
 pub fn show_about() {
     println!();
