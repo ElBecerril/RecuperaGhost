@@ -3852,4 +3852,68 @@ mod tests {
             "el tamaño debe cubrir la etiqueta ID3 más todos los frames"
         );
     }
+
+    /// Las dos pasadas de refinamiento nuevas releen el disco, así que tienen que respetar el
+    /// "Detener" del usuario: en un disco que está muriendo, seguir leyendo es exactamente lo que
+    /// se pidió dejar de hacer. Mismo requisito que `refine_footers`.
+    #[test]
+    fn test_el_refinamiento_de_audio_respeta_la_cancelacion() {
+        let mp3 = repeat(&mpeg_frame(), 3000);
+        assert!(mp3.len() > BUFFER_SIZE, "debe necesitar la pasada en disco");
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&mp3).unwrap();
+        file.flush().unwrap();
+
+        let sig = audio_sigs()
+            .into_iter()
+            .find(|s| s.name == "MP3 (Sync)")
+            .unwrap();
+        let mut files = vec![found_with(sig, false)];
+        let tamano_original = files[0].size;
+
+        // Con la cancelación pedida: no toca nada.
+        refine_audio_streams(file.path(), &mut files, &AtomicBool::new(true));
+        assert!(!files[0].footer_found, "cancelado, no debe refinar");
+        assert_eq!(files[0].size, tamano_original);
+
+        // Sin cancelar: refina de verdad (o sea, el test anterior no pasa por casualidad).
+        refine_audio_streams(file.path(), &mut files, &AtomicBool::new(false));
+        assert!(files[0].footer_found);
+        assert_eq!(files[0].size, mp3.len() as u64);
+    }
+
+    #[test]
+    fn test_el_refinamiento_de_video_respeta_la_cancelacion() {
+        // ISOBMFF mínimo: caja `ftyp` + caja `mdat`.
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&16u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0u8; 4]);
+        mp4.extend_from_slice(&1000u32.to_be_bytes());
+        mp4.extend_from_slice(b"mdat");
+        mp4.resize(16 + 1000, 0x5A);
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&mp4).unwrap();
+        file.flush().unwrap();
+
+        let sig = signatures_for_categories(&[FileCategory::Video])
+            .into_iter()
+            .find(|s| s.name == "MP4/M4V")
+            .unwrap();
+        let mut files = vec![found_with(sig, false)];
+        let tamano_original = files[0].size;
+
+        refine_isobmff_sizes(file.path(), &mut files, &AtomicBool::new(true));
+        assert!(!files[0].footer_found, "cancelado, no debe refinar");
+        assert_eq!(files[0].size, tamano_original);
+
+        refine_isobmff_sizes(file.path(), &mut files, &AtomicBool::new(false));
+        assert!(files[0].footer_found);
+        assert_eq!(
+            files[0].size,
+            mp4.len() as u64,
+            "el tamaño sale de recorrer las cajas"
+        );
+    }
 }
