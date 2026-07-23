@@ -17,6 +17,7 @@
 
 fn main() {
     instalar_aviso_de_panico();
+    instalar_manejador_de_crash_nativo();
 
     // Si `run()` devuelve `Err` NO hay que dejarlo morir en silencio. Un `Err` de arranque no es
     // un panic, así que el hook de arriba NO lo atrapa; y como el binario no tiene consola
@@ -43,6 +44,70 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+/// Muestra un cartel accionable ante un **crash nativo** (una excepción del sistema como un access
+/// violation), que NO es un panic de Rust y por lo tanto el hook de arriba no atrapa.
+///
+/// El caso real que disparó esto: en una PC con gráficos Intel integrados y un driver viejo, el
+/// driver de OpenGL (`ig9icd64.dll`) reventó con `0xc0000005` a mitad de un escaneo. Sin consola
+/// (`windows_subsystem = "windows"`) el proceso se esfumaba sin decir nada. Con este filtro, antes
+/// de morir, se explica que fue el driver de video del equipo (no los archivos del usuario) y se
+/// ofrece la salida concreta: actualizar el driver o usar la versión de línea de comandos.
+///
+/// Solo en release de Windows: en debug hay consola (y conviene que el crash llegue al depurador),
+/// y en otros sistemas no aplica.
+#[cfg(all(windows, not(debug_assertions)))]
+fn instalar_manejador_de_crash_nativo() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // FFI mínima a `SetUnhandledExceptionFilter` (kernel32, linkeado por defecto en Windows). Se
+    // evita depender de `windows-sys` como dependencia directa: solo se necesita esta función.
+    #[allow(non_camel_case_types)]
+    type LptopLevelExceptionFilter =
+        Option<unsafe extern "system" fn(*mut core::ffi::c_void) -> i32>;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetUnhandledExceptionFilter(
+            filter: LptopLevelExceptionFilter,
+        ) -> LptopLevelExceptionFilter;
+    }
+
+    // EXCEPTION_EXECUTE_HANDLER: tras mostrar el cartel, terminar el proceso (sin encadenar además
+    // el cartel genérico de "la aplicación dejó de funcionar" de Windows Error Reporting).
+    const EXCEPTION_EXECUTE_HANDLER: i32 = 1;
+
+    unsafe extern "system" fn filtro(_info: *mut core::ffi::c_void) -> i32 {
+        // Un access violation suele dejar el heap intacto (fue un puntero malo en el driver, no
+        // corrupción de memoria), así que MessageBox —que es lo que usa rfd por debajo— funciona.
+        // Una sola vez, por si el propio manejo llegara a fallar en cadena.
+        static YA_AVISADO: AtomicBool = AtomicBool::new(false);
+        if !YA_AVISADO.swap(true, Ordering::SeqCst) {
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("RecupeGhost: falló la parte gráfica")
+                .set_description(
+                    "La parte gráfica de RecupeGhost se cerró por un problema con el driver de \
+                     video de este equipo. Es un fallo del driver, no de tus archivos.\n\nProbá \
+                     esto:\n1) Actualizá el driver de tu tarjeta o chip de video (Windows Update, \
+                     o la página del fabricante).\n2) Si sigue igual, usá la versión de línea de \
+                     comandos (recupe_ghost.exe): hace lo mismo sin usar la parte gráfica.\n\nLo \
+                     que ya se haya guardado en la carpeta de destino sigue ahí. El disco que \
+                     estabas revisando no se modificó, salvo que hayas elegido guardar en ese \
+                     mismo disco.",
+                )
+                .show();
+        }
+        EXCEPTION_EXECUTE_HANDLER
+    }
+
+    unsafe {
+        SetUnhandledExceptionFilter(Some(filtro));
+    }
+}
+
+/// No-op fuera de release-Windows (ver la versión real más arriba).
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn instalar_manejador_de_crash_nativo() {}
 
 /// Muestra los panics en un cartel del sistema en vez de dejarlos desaparecer.
 ///
