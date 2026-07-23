@@ -180,7 +180,7 @@ pub fn scan_menu_with_source(preselected: Option<PathBuf>) -> Result<Option<Scan
         "📷 Fotos (JPG, PNG, GIF, BMP, WebP, TIFF, HEIC, CR2)",
         "🎬 Videos (MP4, AVI, MKV, MOV, FLV, 3GP)",
         "🎵 Audio (MP3, WAV, FLAC, OGG, AAC, M4A, AMR, WMA, OPUS)",
-        "📄 Documentos (PDF)",
+        "📄 Documentos (PDF, Word, Excel, PowerPoint)",
     ];
 
     let selected_types = MultiSelect::new()

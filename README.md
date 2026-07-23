@@ -19,14 +19,14 @@
 
 Herramienta CLI de recuperacion de archivos multimedia borrados, escrita en Rust. Utiliza **file carving** para buscar firmas (magic bytes) directamente en discos o imagenes raw, sin depender del sistema de archivos.
 
-## Formatos soportados (25)
+## Formatos soportados (28)
 
 | Categoria | Formatos |
 |-----------|----------|
 | Fotos (9) | JPEG, PNG, GIF, BMP, WebP, TIFF (little-endian y big-endian), HEIC/HEIF, CR2 (Canon RAW) |
 | Videos (6) | MP4/M4V, AVI, MKV, FLV, MOV, 3GP |
 | Audio (9) | MP3, WAV, FLAC, OGG Vorbis, AAC, M4A, WMA, AMR, OPUS |
-| Documentos (1) | PDF |
+| Documentos (4) | PDF, DOCX (Word), XLSX (Excel), PPTX (PowerPoint) |
 
 > **Nikon NEF:** no tiene un marcador propio a offset fijo (es TIFF-based sin firma
 > distintiva salvo parseando tags IFD como `Make`), asi que un NEF se recupera bajo la firma

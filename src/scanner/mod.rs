@@ -127,10 +127,12 @@ impl FoundFile {
     /// I/O extra. La idea es avisarle al usuario cuáles resultados son confiables y cuáles pueden
     /// estar dañados/incompletos, SIN ocultar ninguno (puede recuperarlos todos igual).
     pub fn integrity(&self) -> Integrity {
-        // Un formato tiene "final detectable" si define un footer o si codifica su tamaño en el
-        // header (ej. BMP). En esos casos `footer_found` nos dice si dimos con el final real.
-        let end_detectable =
-            self.signature.footer.is_some() || self.signature.size_from_header.is_some();
+        // Un formato tiene "final detectable" si define un footer, si codifica su tamaño en el
+        // header (ej. BMP), o si es un OOXML/ZIP (el fin se saca del EOCD, ver `zip_ooxml_size`). En
+        // esos casos `footer_found` nos dice si dimos con el final real.
+        let end_detectable = self.signature.footer.is_some()
+            || self.signature.size_from_header.is_some()
+            || signature_is_zip_ooxml(&self.signature);
         if end_detectable {
             if self.footer_found {
                 Integrity::Intact
@@ -1106,6 +1108,31 @@ fn scan_source_impl(
     })
 }
 
+/// Header local de una entrada ZIP (`PK\x03\x04`). Los documentos OOXML (docx/xlsx/pptx) son ZIPs y
+/// necesitan un cálculo de tamaño propio: su tamaño NO está en el header inicial (como BMP) NI se
+/// puede sacar con un footer fijo. Dos motivos: (1) el header `PK\x03\x04` se repite en CADA entrada
+/// interna del zip, así que la lógica de footer anidado nunca cerraría; (2) el registro de fin
+/// (EOCD, `PK\x05\x06`) lleva 18+ bytes variables detrás, que un footer fijo no capturaría.
+const ZIP_LOCAL_FILE_HEADER: &[u8] = &[0x50, 0x4B, 0x03, 0x04];
+
+/// True si la firma es un documento OOXML (ZIP): usa el cálculo de tamaño `zip_ooxml_size` en vez
+/// de footer / size_from_header. Solo las firmas docx/xlsx/pptx tienen este header.
+fn signature_is_zip_ooxml(sig: &FileSignature) -> bool {
+    sig.header == ZIP_LOCAL_FILE_HEADER
+}
+
+/// Tamaño exacto de un archivo ZIP/OOXML que empieza en `start`, delegando en
+/// `signatures::zip_local_file_end` (que ubica y valida el EOCD). Se acota la vista del buffer a
+/// `search_limit` para no gastar en buscar más allá de `max_size`, y para que un archivo cuyo EOCD
+/// caiga más allá devuelva `None` (→ se cae a max_size, como un footer no hallado).
+fn zip_ooxml_size(buf: &[u8], start: usize, search_limit: usize) -> Option<usize> {
+    let end_scan = search_limit.min(buf.len());
+    if start >= end_scan {
+        return None;
+    }
+    crate::signatures::zip_local_file_end(&buf[start..end_scan])
+}
+
 /// Busca firmas dentro de un buffer.
 /// El tamaño se determina buscando el footer DENTRO del buffer (sin seeks extra al disco).
 /// Esto hace el escaneo puramente secuencial y rápido incluso en USBs.
@@ -1165,8 +1192,19 @@ fn check_signatures_in_buffer(
                     source_size.saturating_sub(absolute_offset),
                 );
 
-                // Determinar tamaño: campo de tamaño en el header (BMP), footer, o max_size.
-                let (size, footer_found) = if let Some((sf_offset, sf_len)) = sig.size_from_header {
+                // Determinar tamaño: EOCD del zip (OOXML), campo de tamaño en el header (BMP),
+                // footer, o max_size.
+                let (size, footer_found) = if signature_is_zip_ooxml(sig) {
+                    // OOXML/ZIP: tamaño exacto parseando el EOCD (ver `zip_ooxml_size`). Se acota la
+                    // búsqueda al mismo `max_possible` que el resto (un EOCD más allá de max_size no
+                    // serviría). Si no se encuentra/valida, se cae a max_size como un footer no
+                    // hallado (footer_found=false → el archivo sale marcado "posiblemente dañado").
+                    let limit = i.saturating_add(max_possible as usize);
+                    match zip_ooxml_size(buf, i, limit) {
+                        Some(sz) if sz as u64 <= max_possible && sz > 0 => (sz as u64, true),
+                        _ => (max_possible, false),
+                    }
+                } else if let Some((sf_offset, sf_len)) = sig.size_from_header {
                     let sf_start = i + sf_offset;
                     let sf_end = sf_start + sf_len;
                     if sf_end <= buf.len() {
@@ -1492,6 +1530,165 @@ mod tests {
             index: 1,
             footer_found,
         }
+    }
+
+    /// Arma un archivo ZIP válido (entradas STORED, sin comprimir) con su directorio central y EOCD
+    /// correctos, para probar el carver de OOXML. El CRC va en 0 a propósito: el carver no lo valida
+    /// (solo lee nombres y los campos estructurales del EOCD), y así el helper queda mínimo.
+    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        fn u16le(v: &mut Vec<u8>, x: u16) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        fn u32le(v: &mut Vec<u8>, x: u32) {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        let mut out = Vec::new();
+        let mut local_offsets = Vec::new();
+        for (name, data) in entries {
+            local_offsets.push(out.len() as u32);
+            u32le(&mut out, 0x0403_4b50); // header local
+            u16le(&mut out, 20); // versión necesaria
+            u16le(&mut out, 0); // flags
+            u16le(&mut out, 0); // método = stored
+            u16le(&mut out, 0); // hora
+            u16le(&mut out, 0); // fecha
+            u32le(&mut out, 0); // crc32
+            u32le(&mut out, data.len() as u32); // tamaño comprimido
+            u32le(&mut out, data.len() as u32); // tamaño sin comprimir
+            u16le(&mut out, name.len() as u16); // largo del nombre
+            u16le(&mut out, 0); // largo del campo extra
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+        }
+        let cd_offset = out.len() as u32;
+        for (i, (name, data)) in entries.iter().enumerate() {
+            u32le(&mut out, 0x0201_4b50); // header del directorio central
+            u16le(&mut out, 20); // versión que lo creó
+            u16le(&mut out, 20); // versión necesaria
+            u16le(&mut out, 0); // flags
+            u16le(&mut out, 0); // método
+            u16le(&mut out, 0); // hora
+            u16le(&mut out, 0); // fecha
+            u32le(&mut out, 0); // crc32
+            u32le(&mut out, data.len() as u32);
+            u32le(&mut out, data.len() as u32);
+            u16le(&mut out, name.len() as u16);
+            u16le(&mut out, 0); // extra
+            u16le(&mut out, 0); // comentario
+            u16le(&mut out, 0); // disco de inicio
+            u16le(&mut out, 0); // attrs internos
+            u32le(&mut out, 0); // attrs externos
+            u32le(&mut out, local_offsets[i]); // offset del header local
+            out.extend_from_slice(name.as_bytes());
+        }
+        let cd_size = out.len() as u32 - cd_offset;
+        u32le(&mut out, 0x0605_4b50); // EOCD
+        u16le(&mut out, 0); // disco
+        u16le(&mut out, 0); // disco del CD
+        u16le(&mut out, entries.len() as u16); // entradas en este disco
+        u16le(&mut out, entries.len() as u16); // entradas totales
+        u32le(&mut out, cd_size);
+        u32le(&mut out, cd_offset);
+        u16le(&mut out, 0); // largo del comentario
+        out
+    }
+
+    /// Un docx/xlsx/pptx mínimo pero VÁLIDO: primera entrada `first` (para simular el orden de MS
+    /// Office con `[Content_Types].xml` o el de LibreOffice con `_rels/.rels`), y la parte principal
+    /// `main` con relleno para superar el filtro de 512 bytes.
+    fn build_ooxml(first: &str, main: &str) -> Vec<u8> {
+        let pad = vec![b'x'; 700];
+        build_zip(&[
+            (first, b"<Types/>"),
+            ("[Content_Types].xml", b"<Types/>"),
+            (main, &pad),
+        ])
+    }
+
+    fn scan_bytes_as_docs(data: &[u8]) -> Vec<FoundFile> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(data).unwrap();
+        let sigs = signatures_for_categories(&[FileCategory::Document]);
+        scan_source(file.path(), &sigs).unwrap().found_files
+    }
+
+    #[test]
+    fn test_ooxml_docx_xlsx_pptx_detected_sized_and_not_cross_matched() {
+        let docx = build_ooxml("[Content_Types].xml", "word/document.xml");
+        let xlsx = build_ooxml("[Content_Types].xml", "xl/workbook.xml");
+        let pptx = build_ooxml("[Content_Types].xml", "ppt/presentation.xml");
+        // Tres Office SEGUIDOS (con relleno no-PK entre medio): el caso que destapó el falso
+        // positivo cruzado (un docx "encontraba" el xl/workbook.xml del xlsx de al lado).
+        let mut img = Vec::new();
+        let mut offsets = Vec::new();
+        for f in [&docx, &xlsx, &pptx] {
+            img.extend_from_slice(&[0xAA; 4096]);
+            offsets.push(img.len() as u64);
+            img.extend_from_slice(f);
+        }
+        img.extend_from_slice(&[0xAA; 4096]);
+
+        let found = scan_bytes_as_docs(&img);
+        assert_eq!(found.len(), 3, "esperaba exactamente 3 (sin duplicados)");
+        for (i, (ext, data)) in [("docx", &docx), ("xlsx", &xlsx), ("pptx", &pptx)]
+            .iter()
+            .enumerate()
+        {
+            let f = found
+                .iter()
+                .find(|f| f.offset == offsets[i])
+                .unwrap_or_else(|| panic!("no se detectó nada en el offset del {ext}"));
+            assert_eq!(f.signature.extension, *ext, "tipo mal clasificado");
+            assert_eq!(
+                f.size,
+                data.len() as u64,
+                "tamaño (EOCD) incorrecto para {ext}"
+            );
+            assert!(
+                f.footer_found,
+                "{ext}: debería tener el fin detectado (EOCD)"
+            );
+            assert_eq!(
+                f.integrity(),
+                Integrity::Intact,
+                "{ext}: debería ser íntegro"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ooxml_libreoffice_style_rels_first_detected() {
+        // LibreOffice abre el zip con `_rels/.rels`, no con `[Content_Types].xml` (verificado con un
+        // .docx real). El anclaje por EOCD tiene que detectarlo igual.
+        let docx = build_ooxml("_rels/.rels", "word/document.xml");
+        let mut img = vec![0xAA; 4096];
+        img.extend_from_slice(&docx);
+        img.extend_from_slice(&[0xAA; 4096]);
+        let found = scan_bytes_as_docs(&img);
+        assert_eq!(found.len(), 1, "un solo docx");
+        assert_eq!(found[0].signature.extension, "docx");
+        assert_eq!(found[0].size, docx.len() as u64);
+    }
+
+    #[test]
+    fn test_generic_zip_not_detected_as_office() {
+        // Un .zip común (sin las partes de OOXML), de más de 512 bytes para descartar que lo filtre
+        // el umbral de tamaño: se rechaza por el validator, no por chico.
+        let readme = vec![b'r'; 600];
+        let zip = build_zip(&[("readme.txt", &readme), ("data/blob.bin", &[0u8; 300])]);
+        assert!(zip.len() > 512);
+        let mut img = vec![0xAA; 4096];
+        img.extend_from_slice(&zip);
+        img.extend_from_slice(&[0xAA; 4096]);
+        let found = scan_bytes_as_docs(&img);
+        assert!(
+            found.is_empty(),
+            "un zip común NO debe carvearse como Office, encontró: {:?}",
+            found
+                .iter()
+                .map(|f| f.signature.extension)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

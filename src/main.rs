@@ -33,7 +33,7 @@ struct CliArgs {
     #[arg(long)]
     audio: bool,
 
-    /// Buscar documentos (PDF)
+    /// Buscar documentos (PDF, Word, Excel, PowerPoint)
     #[arg(long)]
     documentos: bool,
 

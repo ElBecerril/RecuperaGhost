@@ -833,7 +833,7 @@ impl RecupeGhostApp {
             ("📷  Fotos", "JPG, PNG, HEIC, RAW de cámara…"),
             ("🎬  Videos", "MP4, MOV, AVI, MKV…"),
             ("🎵  Audio", "MP3, WAV, FLAC, M4A…"),
-            ("📄  Documentos", "PDF"),
+            ("📄  Documentos", "PDF, Word, Excel, PowerPoint"),
         ];
         for (i, (nombre, ejemplos)) in TIPOS.iter().enumerate() {
             ui.horizontal(|ui| {

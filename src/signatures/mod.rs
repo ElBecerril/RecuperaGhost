@@ -253,6 +253,107 @@ fn validate_tiff_le_not_cr2(bytes: &[u8]) -> bool {
     !is_cr2_marker(bytes)
 }
 
+// ── Documentos de Office modernos (DOCX/XLSX/PPTX) = paquetes OOXML = archivos ZIP ──
+// Comparten el header `PK\x03\x04` con CUALQUIER zip/jar/epub, y ese header se repite en CADA
+// entrada interna del paquete. La detección NO usa `extra_check`: el nombre de la primera entrada
+// varía según el productor (MS Office abre con `[Content_Types].xml`, LibreOffice con `_rels/.rels`
+// — verificado con un .docx real de cada uno), así que un patrón fijo en un offset fijo dejaría
+// afuera a LibreOffice. En su lugar el `validator` (`ooxml_has_part`) valida el EOCD del zip —que
+// estructuralmente solo cierra en el INICIO real del archivo, no en las entradas internas— y busca
+// el marcador de tipo (word/xl/ppt) dentro del propio archivo. El TAMAÑO sale del mismo EOCD (ver
+// `zip_local_file_end` y `scanner::zip_ooxml_size`).
+
+/// Dado un buffer que ARRANCA en el header local de un zip (`PK\x03\x04`), devuelve el largo total
+/// del archivo zip ubicando su registro End Of Central Directory (`PK\x05\x06`), validado
+/// estructuralmente: el offset + tamaño del directorio central (campos del propio EOCD, relativos
+/// al inicio del zip = 0 acá) tienen que caer EXACTAMENTE donde arranca el EOCD. Eso hace dos cosas:
+///   (a) confirma que es el EOCD REAL de este archivo, no una coincidencia de esos 4 bytes en datos
+///       comprimidos, y
+///   (b) evita agarrar el EOCD de OTRO zip que caiga más adelante en el buffer: sus offsets serían
+///       relativos a SU inicio, no a 0, así que la ecuación no daría.
+/// Devuelve `None` si no hay un EOCD válido dentro del buffer (archivo grande cuyo fin cae fuera, o
+/// un ZIP64, cuyos campos van en 0xFFFFFFFF y no cierran la ecuación). Lo usan el `validator` (para
+/// acotar la búsqueda del marcador de tipo al propio archivo) y el scanner (para el tamaño).
+pub fn zip_local_file_end(bytes: &[u8]) -> Option<usize> {
+    const EOCD: [u8; 4] = [0x50, 0x4B, 0x05, 0x06];
+    let mut p = 0usize;
+    while p + 22 <= bytes.len() {
+        if bytes[p..p + 4] == EOCD {
+            let cd_size =
+                u32::from_le_bytes([bytes[p + 12], bytes[p + 13], bytes[p + 14], bytes[p + 15]])
+                    as usize;
+            let cd_offset =
+                u32::from_le_bytes([bytes[p + 16], bytes[p + 17], bytes[p + 18], bytes[p + 19]])
+                    as usize;
+            if cd_offset.checked_add(cd_size) == Some(p) {
+                let comment_len = u16::from_le_bytes([bytes[p + 20], bytes[p + 21]]) as usize;
+                let end = p + 22 + comment_len;
+                return if end <= bytes.len() { Some(end) } else { None };
+            }
+        }
+        p += 1;
+    }
+    None
+}
+
+/// ¿El header local en `bytes` (offset 0) nombra una de las entradas que un paquete OOXML pone
+/// PRIMERO? MS Office abre el zip con `[Content_Types].xml`; LibreOffice con `_rels/.rels`
+/// (verificado con un .docx real de cada uno). Es un filtro BARATO (solo lee el nombre del header,
+/// no barre nada) para no correr la validación cara del EOCD en cada una de las MUCHAS entradas
+/// internas del zip, que tienen otros nombres (`word/document.xml`, `xl/worksheets/…`, etc.).
+fn ooxml_local_name_is_start(bytes: &[u8]) -> bool {
+    if bytes.len() < 30 {
+        return false;
+    }
+    let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+    match bytes.get(30..30 + name_len) {
+        Some(name) => name == b"[Content_Types].xml" || name == b"_rels/.rels",
+        None => false,
+    }
+}
+
+/// True si `bytes` (que arranca en un header local de zip) es el INICIO de un OOXML cuya parte
+/// principal es `marker`. Tres pasos:
+///  1. Filtro barato: el nombre de la entrada tiene que ser un arranque de OOXML
+///     (`ooxml_local_name_is_start`); si no, es una entrada interna del zip → descartar.
+///  2. `zip_local_file_end` valida el EOCD: confirma que este es el INICIO REAL del archivo (en una
+///     entrada interna la ecuación del EOCD no cierra → devuelve None → descartar) y da el fin del
+///     archivo, para acotar la búsqueda del marcador al PROPIO archivo. Sin acotar, la búsqueda
+///     cruzaría al archivo siguiente del buffer y un docx "encontraría" el `xl/workbook.xml` del
+///     xlsx de al lado, carveándose además como xlsx (falso positivo cruzado, visto en la
+///     verificación real con 3 Office seguidos).
+///  3. Buscar `marker` dentro de `[inicio, fin]`. Los tres marcadores (word/xl/ppt) son mutuamente
+///     excluyentes → un archivo nunca matchea dos firmas → no se carvea dos veces.
+///
+/// Limitación v1: si el EOCD cae fuera del buffer del escaneo (archivo Office más grande que el
+/// buffer), devuelve false → ese archivo no se detecta. La enorme mayoría de los documentos entran.
+fn ooxml_has_part(bytes: &[u8], marker: &[u8]) -> bool {
+    if !ooxml_local_name_is_start(bytes) {
+        return false;
+    }
+    let end = match zip_local_file_end(bytes) {
+        Some(e) => e,
+        None => return false,
+    };
+    let hay = &bytes[..end.min(bytes.len())];
+    hay.len() >= marker.len() && hay.windows(marker.len()).any(|w| w == marker)
+}
+
+/// DOCX: paquete OOXML con la parte principal `word/document.xml`.
+fn validate_ooxml_docx(bytes: &[u8]) -> bool {
+    ooxml_has_part(bytes, b"word/document.xml")
+}
+
+/// XLSX: paquete OOXML con la parte principal `xl/workbook.xml`.
+fn validate_ooxml_xlsx(bytes: &[u8]) -> bool {
+    ooxml_has_part(bytes, b"xl/workbook.xml")
+}
+
+/// PPTX: paquete OOXML con la parte principal `ppt/presentation.xml`.
+fn validate_ooxml_pptx(bytes: &[u8]) -> bool {
+    ooxml_has_part(bytes, b"ppt/presentation.xml")
+}
+
 /// Retorna todas las firmas conocidas
 pub fn all_signatures() -> Vec<FileSignature> {
     vec![
@@ -585,6 +686,48 @@ pub fn all_signatures() -> Vec<FileSignature> {
             footer: Some(&[0x25, 0x25, 0x45, 0x4F, 0x46]), // "%%EOF"
             max_size: 200 * 1024 * 1024,
             validator: None,
+            size_from_header: None,
+        },
+        // ── Office moderno (OOXML = ZIP). Ver los validators `validate_ooxml_*` arriba: el
+        //    `validator` valida el EOCD del zip (que estructuralmente solo cierra en el arranque
+        //    REAL del archivo, no en las entradas internas que también empiezan con PK0304) y
+        //    distingue el tipo. El TAMAÑO tampoco sale del header ni de un footer fijo: lo calcula
+        //    `scanner::zip_ooxml_size` con el mismo EOCD. Sin `extra_check`: el nombre de la primera
+        //    entrada varía entre productores (MS Office vs LibreOffice). ──
+        FileSignature {
+            name: "Word (DOCX)",
+            extension: "docx",
+            category: FileCategory::Document,
+            header: &[0x50, 0x4B, 0x03, 0x04], // "PK\x03\x04" (header local de zip)
+            header_offset: 0,
+            extra_check: None,
+            footer: None,
+            max_size: 100 * 1024 * 1024, // 100 MB (documentos con imágenes embebidas)
+            validator: Some((validate_ooxml_docx, 30)),
+            size_from_header: None,
+        },
+        FileSignature {
+            name: "Excel (XLSX)",
+            extension: "xlsx",
+            category: FileCategory::Document,
+            header: &[0x50, 0x4B, 0x03, 0x04],
+            header_offset: 0,
+            extra_check: None,
+            footer: None,
+            max_size: 100 * 1024 * 1024,
+            validator: Some((validate_ooxml_xlsx, 30)),
+            size_from_header: None,
+        },
+        FileSignature {
+            name: "PowerPoint (PPTX)",
+            extension: "pptx",
+            category: FileCategory::Document,
+            header: &[0x50, 0x4B, 0x03, 0x04],
+            header_offset: 0,
+            extra_check: None,
+            footer: None,
+            max_size: 100 * 1024 * 1024,
+            validator: Some((validate_ooxml_pptx, 30)),
             size_from_header: None,
         },
     ]
