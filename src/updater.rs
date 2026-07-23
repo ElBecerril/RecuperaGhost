@@ -118,14 +118,38 @@ pub fn cleanup_old_binary() {
 /// Windows Defender pusiera el .exe en cuarentena). Si falla cualquier cosa (sin internet, etc.),
 /// continúa en silencio.
 pub fn check_for_updates() {
-    if try_check_for_updates().is_err() {
-        // Silencio total: no bloquear el programa por errores de red/parsing
+    if let Some(info) = available_update() {
+        show_update_available(&info.version, &info.url);
     }
+}
+
+/// Versión nueva disponible: el mismo chequeo que usa el CLI, pero DEVOLVIENDO el dato en vez de
+/// imprimirlo.
+///
+/// Existe para la GUI, que corre como subsistema gráfico y no tiene consola: un `println!` ahí no
+/// lo ve nadie, así que sin esto un usuario de la interfaz gráfica jamás se enteraba de una versión
+/// nueva. La política es la misma que en el CLI: solo avisar, nunca descargar ni reemplazar el
+/// binario (ese patrón es el que disparaba al antivirus).
+///
+/// Hace I/O de red con timeouts cortos: llamarla desde un hilo de fondo, no desde el hilo de la
+/// interfaz. Ante cualquier fallo (sin internet, API caída, JSON raro) devuelve `None` en silencio
+/// — no enterarse de una actualización nunca debe romperle el programa a quien vino a rescatar sus
+/// archivos.
+pub fn available_update() -> Option<UpdateInfo> {
+    try_check_for_updates().ok().flatten()
+}
+
+/// Datos de una versión nueva publicada, para mostrarlos donde corresponda (consola o interfaz).
+pub struct UpdateInfo {
+    /// Tag tal como está publicado en GitHub (ej. "v0.5.2").
+    pub version: String,
+    /// URL de la página del release, para que el usuario la descargue a mano.
+    pub url: String,
 }
 
 // ─── Lógica interna ─────────────────────────────────────────────────────────
 
-fn try_check_for_updates() -> Result<(), Box<dyn std::error::Error>> {
+fn try_check_for_updates() -> Result<Option<UpdateInfo>, Box<dyn std::error::Error>> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .timeout_read(std::time::Duration::from_secs(READ_TIMEOUT_SECS))
@@ -144,12 +168,14 @@ fn try_check_for_updates() -> Result<(), Box<dyn std::error::Error>> {
     let current = parse_version(banner::VERSION).ok_or("No se pudo parsear la versión local")?;
 
     if !is_newer(&latest, &current) {
-        return Ok(());
+        return Ok(None);
     }
 
-    // Hay una versión nueva: solo avisamos (no se descarga ni se reemplaza nada).
-    show_update_available(&release.tag_name, &release.html_url);
-    Ok(())
+    // Hay una versión nueva: solo se informa (no se descarga ni se reemplaza nada).
+    Ok(Some(UpdateInfo {
+        version: release.tag_name,
+        url: release.html_url,
+    }))
 }
 
 // ─── UI ─────────────────────────────────────────────────────────────────────

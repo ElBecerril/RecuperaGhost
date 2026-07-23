@@ -21,6 +21,7 @@ use crate::drives::{self, DriveInfo};
 use crate::recovery::{self, RecoveryResult};
 use crate::scanner::{self, Integrity, ScanResult};
 use crate::signatures::{signatures_for_categories, FileCategory};
+use crate::updater::{self, UpdateInfo};
 use crate::util::{self, format_size};
 
 /// Abre la ventana de la GUI. Bloquea hasta que el usuario la cierra.
@@ -39,7 +40,7 @@ pub fn run() -> eframe::Result<()> {
             // Sistema visual (tema claro, escala tipográfica grande, controles anchos). Sin esto
             // la GUI sale con los defaults de egui, que son de una herramienta de programador.
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(RecupeGhostApp::new()))
+            Ok(Box::new(RecupeGhostApp::new(&cc.egui_ctx)))
         }),
     )
 }
@@ -149,10 +150,19 @@ struct RecupeGhostApp {
     /// Si incluir los "posiblemente dañados" (Suspect) al recuperar. Default: NO (son la principal
     /// fuente de basura y de tamaño inflado). El usuario lo activa con un checkbox en resultados.
     include_damaged: bool,
+
+    /// Chequeo de versión nueva, corriendo en un hilo de fondo (hace I/O de red).
+    /// El CLI avisa por consola; la GUI no tiene consola, así que sin este aviso in-app un usuario
+    /// de la interfaz gráfica nunca se enteraría de una versión nueva.
+    update_rx: Option<Receiver<Option<UpdateInfo>>>,
+    /// Versión nueva encontrada, si la hay. Solo se avisa: no se descarga ni se reemplaza nada.
+    update_info: Option<UpdateInfo>,
+    /// El usuario cerró el aviso con "Ahora no": no volver a mostrarlo en esta corrida.
+    update_dismissed: bool,
 }
 
 impl RecupeGhostApp {
-    fn new() -> Self {
+    fn new(ctx: &egui::Context) -> Self {
         let drives = drives::list_drives();
         // Preseleccionar el primer disco EXTRAÍBLE. El índice 0 suele ser el disco del sistema,
         // y el caso central de la herramienta es "formateé el USB / la tarjeta de la cámara":
@@ -180,6 +190,9 @@ impl RecupeGhostApp {
             error_msg: String::new(),
             error_hint: None,
             include_damaged: false,
+            update_rx: Some(spawn_update_check(ctx.clone())),
+            update_info: None,
+            update_dismissed: false,
         };
         app.apply_demo_state();
         app
@@ -243,6 +256,17 @@ impl RecupeGhostApp {
                     output_path: PathBuf::from("/tmp/RecupeGhost_imagen_demo.img"),
                 });
                 self.phase = Phase::CloneDone;
+            }
+            // Aviso de versión nueva sin tener que esperar a que GitHub publique una: el chequeo
+            // real depende de la red y de que exista un release más nuevo, así que la pantalla
+            // quedaría imposible de MIRAR (que es de donde salieron los tofu de las sesiones 12-13).
+            Ok("update") => {
+                self.update_info = Some(UpdateInfo {
+                    version: "v9.9.9".to_string(),
+                    url: "https://github.com/ElBecerril/RecuperaGhost/releases/latest".to_string(),
+                });
+                self.update_rx = None;
+                self.phase = Phase::Setup(Step::Source);
             }
             // Pasos del asistente: para poder mirarlos sin tener que clickear.
             Ok("types") => self.phase = Phase::Setup(Step::Types),
@@ -623,7 +647,76 @@ impl RecupeGhostApp {
         }
     }
 
+    /// Recoge el resultado del chequeo de versión cuando el hilo de fondo termina.
+    ///
+    /// A diferencia del escaneo/clonado, esto NO pide repintados mientras espera: un aviso de
+    /// actualización no vale despertar la ventana (ni martillar el driver de video, que ya nos
+    /// costó un crash con las Intel). Llega en el primer repintado posterior a que el hilo conteste
+    /// — y como el usuario se mueve por el asistente, eso pasa enseguida.
+    fn poll_update_check(&mut self) {
+        let Some(rx) = self.update_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(info) => {
+                self.update_info = info;
+                self.update_rx = None;
+            }
+            // El hilo murió sin contestar: sin aviso, que es exactamente el comportamiento de
+            // "no hay internet". No es un error que valga molestar al usuario.
+            Err(TryRecvError::Disconnected) => self.update_rx = None,
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     // ── Pantallas ──
+
+    /// Aviso discreto de versión nueva, arriba de la primera pantalla.
+    ///
+    /// Solo AVISA con el enlace: igual que el CLI, la GUI nunca descarga ni se reemplaza sola (ese
+    /// patrón es el que disparaba al antivirus). Va únicamente en el primer paso: interrumpir a
+    /// alguien a mitad de un rescate para ofrecerle otra descarga sería exactamente el peor momento.
+    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
+        if self.update_dismissed {
+            return;
+        }
+        let Some(info) = self.update_info.as_ref() else {
+            return;
+        };
+        let (version, url) = (info.version.clone(), info.url.clone());
+
+        egui::Frame::none()
+            .fill(theme::BRAND_TINT)
+            .stroke(egui::Stroke::new(1.0_f32, theme::BRAND))
+            .rounding(6.0)
+            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Hay una versión más nueva de RecupeGhost ({version}). Tienes la \
+                         v{}.",
+                        crate::banner::VERSION
+                    ))
+                    .color(theme::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(
+                        "Puedes seguir usando esta sin problema; la nueva se descarga e instala a mano.",
+                    )
+                    .color(theme::TEXT_WEAK),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Ver la versión nueva").clicked() {
+                        crate::ui::open_url(&url);
+                    }
+                    if ui.button("Ahora no").clicked() {
+                        self.update_dismissed = true;
+                    }
+                });
+            });
+        ui.add_space(10.0);
+    }
 
     /// Barra de pasos del asistente. Responde sin que haya que preguntar "¿cuánto falta?", que es
     /// la duda que hace abandonar a alguien que ya está nervioso.
@@ -733,6 +826,7 @@ impl RecupeGhostApp {
 
     fn ui_step_source(&mut self, ui: &mut egui::Ui) {
         self.ui_volver_a_resultados(ui);
+        self.ui_update_banner(ui);
         theme::section_title(ui, "¿Dónde estaban tus archivos?");
         ui.label(
             egui::RichText::new("Elige el disco o la memoria que quieres revisar.")
@@ -1635,6 +1729,7 @@ impl RecupeGhostApp {
 impl eframe::App for RecupeGhostApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background(ctx);
+        self.poll_update_check();
 
         // Con la advertencia de mismo-disco en pantalla, TODO lo de atrás queda deshabilitado.
         // `egui::Window` es una ventana flotante, no un modal (`egui::Modal` recién existe desde
@@ -1794,6 +1889,26 @@ impl RecupeGhostApp {
 /// con la letra de unidad: `D: - Kingston DataTraveler (14.5 GB)`). Acá solo se le agrega la marca
 /// de extraíble, que es el dato que de verdad ayuda a reconocer "este es mi USB". La ruta cruda
 /// del dispositivo queda en el tooltip: no le dice nada al público objetivo y encima asusta.
+/// Lanza el chequeo de versión nueva en un hilo aparte y devuelve el canal por donde contesta.
+///
+/// Va en un hilo porque hace I/O de red (con timeouts de 5 s de conexión y 8 s de lectura): hacerlo
+/// en el hilo de la interfaz congelaría la ventana al abrir, justo cuando alguien que acaba de
+/// perder sus archivos abre el programa por primera vez. El hilo es "fire and forget": si nadie
+/// recoge la respuesta porque la ventana ya se cerró, el `send` falla y no pasa nada.
+///
+/// El `request_repaint()` del final NO es opcional: egui solo redibuja ante un evento, así que sin
+/// él la respuesta se quedaba esperando en el canal y el aviso NO APARECÍA (verificado: con la
+/// versión local bajada a mano, el CLI mostraba la versión nueva y la GUI no). Como el chequeo
+/// tarda más que el arranque, la ventana ya está quieta cuando llega: hay que despertarla una vez.
+fn spawn_update_check(ctx: egui::Context) -> Receiver<Option<UpdateInfo>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(updater::available_update());
+        ctx.request_repaint();
+    });
+    rx
+}
+
 fn drive_label(d: &DriveInfo) -> String {
     if d.is_removable {
         format!("{}  ·  Extraíble", d.display_name)
