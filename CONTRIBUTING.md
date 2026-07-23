@@ -31,7 +31,7 @@ Abre un [issue](https://github.com/ElBecerril/RecuperaGhost/issues) con:
 1. Haz fork del repositorio
 2. Crea una rama descriptiva (`git checkout -b feature/nuevo-formato-heic`)
 3. Haz tus cambios
-4. Asegurate de que todos los tests pasen: `cargo test`
+4. Asegúrate de que todos los tests pasen: `cargo test`
 5. Verifica que no haya warnings: `cargo build --release`
 6. Haz commit con mensajes claros en espanol o ingles
 7. Abre un Pull Request describiendo los cambios
