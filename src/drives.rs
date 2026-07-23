@@ -105,6 +105,17 @@ struct WmiPartitionMapping {
     dependent: Option<String>,
 }
 
+/// Fila de `Get-Partition | Select DiskNumber, DriveLetter` (módulo Storage). Más directo y
+/// robusto que parsear los `__PATH` de las asociaciones WMI (ver `get_drive_letter_map`).
+#[cfg(target_os = "windows")]
+#[derive(Deserialize)]
+struct PartitionMapping {
+    #[serde(rename = "DiskNumber")]
+    disk_number: Option<u32>,
+    #[serde(rename = "DriveLetter")]
+    drive_letter: Option<String>,
+}
+
 #[cfg(target_os = "windows")]
 fn list_drives_windows() -> Vec<DriveInfo> {
     // Intentar con PowerShell primero
@@ -223,6 +234,69 @@ fn list_drives_powershell() -> Option<Vec<DriveInfo>> {
 /// Obtiene un mapeo de disco físico (número) → letra de unidad.
 #[cfg(target_os = "windows")]
 fn get_drive_letter_map() -> Vec<(String, String)> {
+    // Principal: `Get-Partition` (módulo Storage, presente en Windows 8+/Server 2012+). Devuelve
+    // DiskNumber + DriveLetter directo, sin el frágil parseo de los `__PATH` de las asociaciones
+    // WMI (`Win32_LogicalDiskToPartition`). Esa consulta vieja devolvía vacío en Windows 10/11
+    // reales y dejaba TODOS los discos sin letra -> `same_device_warning` caía siempre en el modo
+    // "no pude confirmar", incluso en el caso seguro (escanear un USB y guardar en C:), lo que
+    // entrena al público a ignorar la advertencia. Verificado en una PC real: Get-Partition
+    // devuelve `[{DiskNumber:0,DriveLetter:"C"},{...:"D"},{DiskNumber:1,DriveLetter:"F"}]`.
+    let map = get_drive_letter_map_get_partition();
+    if !map.is_empty() {
+        return map;
+    }
+    // Respaldo por si `Get-Partition` no estuviera disponible (Windows muy viejo o módulo ausente).
+    get_drive_letter_map_wmi()
+}
+
+#[cfg(target_os = "windows")]
+fn get_drive_letter_map_get_partition() -> Vec<(String, String)> {
+    let output = crate::util::sin_ventana(&mut Command::new("powershell"))
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Partition | Where-Object DriveLetter | Select-Object DiskNumber, DriveLetter | ConvertTo-Json",
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let json = String::from_utf8_lossy(&output.stdout);
+    let json = json.trim();
+    if json.is_empty() {
+        return Vec::new();
+    }
+
+    // Una sola partición con letra -> objeto suelto; varias -> array. Mismo patrón que el resto.
+    let mappings: Vec<PartitionMapping> = if json.starts_with('[') {
+        serde_json::from_str(json).unwrap_or_default()
+    } else {
+        match serde_json::from_str::<PartitionMapping>(json) {
+            Ok(m) => vec![m],
+            Err(_) => return Vec::new(),
+        }
+    };
+
+    mappings
+        .into_iter()
+        .filter_map(|m| {
+            let disk = m.disk_number?;
+            let letter = m.drive_letter?;
+            let letter = letter.trim();
+            if letter.is_empty() {
+                return None;
+            }
+            // Get-Partition da la letra sin ":" ("C"); el resto del código espera el formato "C:".
+            Some((disk.to_string(), format!("{letter}:")))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn get_drive_letter_map_wmi() -> Vec<(String, String)> {
     // Usamos una consulta más directa: para cada LogicalDisk, obtener el disco físico
     let output = crate::util::sin_ventana(&mut Command::new("powershell"))
         .args([
