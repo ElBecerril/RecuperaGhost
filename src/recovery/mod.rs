@@ -475,6 +475,7 @@ mod tests {
 
     fn make_found(offset: u64, size: u64, index: usize) -> FoundFile {
         FoundFile {
+            end_unknown: false,
             signature: TEST_SIGNATURE.clone(),
             offset,
             size,

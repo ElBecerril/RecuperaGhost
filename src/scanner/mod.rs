@@ -96,6 +96,16 @@ pub struct FoundFile {
     /// Usado por `refine_footers` (A2) para saber a qué archivos vale la pena reintentarles
     /// una búsqueda de footer más profunda, fuera del buffer/chunk original.
     pub footer_found: bool,
+    /// True cuando NO se pudo determinar el final del archivo por una limitación externa —error de
+    /// I/O, cancelación, tamaño mayor al máximo de la firma, o una caja que declara "hasta el fin
+    /// del archivo"— y no porque se haya comprobado que el archivo no cierra.
+    ///
+    /// La diferencia decide si el archivo se guarda: "confirmé que esto no cierra" es un probable
+    /// falso positivo (dudoso, no se guarda por defecto), pero "no pude saberlo" es exactamente lo
+    /// que pasa con un archivo REAL en un disco que está fallando — y ese tiene que seguir
+    /// guardándose, como antes. Sin esta distinción, un MP3 al que le faltaban 200 bytes al final
+    /// pasaba de recuperarse a perderse entero (lo encontró una revisión adversarial).
+    pub end_unknown: bool,
 }
 
 impl std::fmt::Display for FoundFile {
@@ -139,8 +149,17 @@ impl FoundFile {
             // "no verificable", que sí se guardaba.
             || self.signature.stream_end().is_some();
         if end_detectable {
-            if self.footer_found {
+            // `end_unknown` gana sobre `footer_found`: puede saberse hasta dónde llega un archivo y
+            // aun así no poder afirmar que esté completo (al que le falta el final, por ejemplo).
+            // Afirmar "íntegro" ahí sería mentirle al usuario sobre un archivo al que le falta un
+            // pedazo.
+            if self.footer_found && !self.end_unknown {
                 Integrity::Intact
+            } else if self.end_unknown {
+                // No se pudo determinar el final por una limitación externa (I/O, cancelación,
+                // tamaño). No se afirma ni se niega: se guarda igual, como antes de que estos
+                // formatos tuvieran cálculo de tamaño.
+                Integrity::Unverifiable
             } else {
                 // El formato TIENE un final detectable pero no lo encontramos: el archivo quedó
                 // truncado a max_size. Probable falso positivo o archivo incompleto/dañado.
@@ -1363,6 +1382,8 @@ fn check_signatures_in_buffer(
                         size,
                         index: *file_index,
                         footer_found,
+                        // El pase de refinamiento lo ajusta si corresponde.
+                        end_unknown: false,
                     });
                 }
             }
@@ -1475,6 +1496,26 @@ fn scan_nesting(
 /// pequeño (solo los que no encontraron footer). Esto también hace el resultado determinista
 /// entre 1 hilo y N hilos: antes, un archivo cuyo header caía cerca del final de un chunk se
 /// carveaba a max_size de forma distinta según dónde cayeran las fronteras de segmento/chunk.
+/// Qué se pudo concluir sobre el final de un archivo en el pase de refinamiento.
+enum EndResult {
+    /// Se determinó el tamaño real y el archivo cierra bien.
+    Size(u64),
+    /// Se sabe HASTA DÓNDE llega (y ese tamaño es confiable para no confundirlo con lo que sigue),
+    /// pero no se puede afirmar que esté completo: al archivo le falta un pedazo del final.
+    ///
+    /// Es el caso del archivo REAL cortado —imagen truncada, último sector pisado— y hace falta que
+    /// sea distinto de los otros dos: si se lo trata como "no se pudo saber", cada frame del audio
+    /// vuelve a contarse como un archivo suelto (536 archivos de basura por una sola canción); si se
+    /// lo trata como completo, se le miente al usuario diciendo que está íntegro.
+    SizeUnverified(u64),
+    /// Se comprobó que la cadena/las cajas NO describen un archivo válido: probable falso positivo.
+    Rejected,
+    /// No se pudo saber por una limitación externa (I/O, cancelación, tope de tamaño). NO es lo
+    /// mismo que rechazarlo: un archivo REAL en un disco que falla cae acá, y tiene que seguir
+    /// recuperándose.
+    Unknown,
+}
+
 /// Segundo pase para el audio por frames (MP3/AAC): sigue la cadena de frames LEYENDO DEL DISCO,
 /// para los candidatos cuya cadena no cerró dentro del buffer de 1 MB del escaneo.
 ///
@@ -1489,27 +1530,64 @@ fn scan_nesting(
 fn refine_audio_streams(source_path: &Path, found_files: &mut [FoundFile], cancel: &AtomicBool) {
     const AUDIO_CHUNK: usize = 1024 * 1024;
 
-    for f in found_files.iter_mut() {
+    // Se recorre por OFFSET creciente para poder saltar los candidatos que caen dentro de un
+    // archivo ya resuelto. Cada frame de un MP3 empieza con el mismo syncword, así que el escaneo
+    // registra un candidato POR FRAME (~2400 por MB): sin este salto, cada uno vuelve a recorrer el
+    // tema entero desde su offset hasta el final, lo que hace el pase cuadrático (medido: 16 MB de
+    // música contigua tardaban ~44 s, y una tarjeta de 4 GB se iba a más de una hora con la barra
+    // congelada al 100%). Los saltados quedan sin refinar y `suppress_contained` los descarta
+    // después, porque caen enteros dentro de un contenedor confiable.
+    //
+    // NO se reordena `found_files`: el orden fija el nombre `recovered_NNNN`. Se ordena una lista de
+    // índices.
+    let mut orden: Vec<usize> = (0..found_files.len()).collect();
+    orden.sort_by_key(|&i| found_files[i].offset);
+    let mut resuelto_hasta: u64 = 0;
+
+    for i in orden {
         if cancel.load(Ordering::SeqCst) {
             break;
         }
+        let f = &found_files[i];
         // Ya tiene tamaño real (la cadena cerró dentro del buffer): nada que hacer.
         if f.footer_found {
+            resuelto_hasta = resuelto_hasta.max(f.offset.saturating_add(f.size));
             continue;
         }
         let Some(kind) = f.signature.audio_stream() else {
             continue;
         };
-        if let Some(size) = walk_audio_stream_on_disk(
-            source_path,
-            f.offset,
-            f.signature.max_size as u64,
-            kind,
-            AUDIO_CHUNK,
-            cancel,
-        ) {
-            f.size = size;
-            f.footer_found = true;
+        if f.offset < resuelto_hasta {
+            // Está dentro de un audio ya resuelto: es uno de sus frames, no un archivo. Se le acota
+            // el tamaño al del archivo que lo contiene —no puede seguir más allá— para que
+            // `suppress_contained` lo reconozca como contenido y lo descarte. Sin esto conservaban
+            // el tamaño "hasta el final del origen", sobresalían del contenedor y sobrevivían: una
+            // sola canción cortada dejaba 39 archivos basura.
+            let dentro = resuelto_hasta.saturating_sub(f.offset);
+            let i_mut = i;
+            found_files[i_mut].size = found_files[i_mut].size.min(dentro);
+            continue;
+        }
+        let (offset, max_size) = (f.offset, f.signature.max_size as u64);
+        let resultado =
+            walk_audio_stream_on_disk(source_path, offset, max_size, kind, AUDIO_CHUNK, cancel);
+        let f = &mut found_files[i];
+        match resultado {
+            EndResult::Size(size) => {
+                f.size = size;
+                f.footer_found = true;
+                resuelto_hasta = offset.saturating_add(size);
+            }
+            // El tamaño sirve (y evita que el archivo se confunda con lo que sigue), pero se marca
+            // como no verificable: se guarda igual, sin afirmar que está entero.
+            EndResult::SizeUnverified(size) => {
+                f.size = size;
+                f.footer_found = true;
+                f.end_unknown = true;
+                resuelto_hasta = offset.saturating_add(size);
+            }
+            EndResult::Unknown => f.end_unknown = true,
+            EndResult::Rejected => {}
         }
     }
 }
@@ -1538,68 +1616,148 @@ fn refine_isobmff_sizes(source_path: &Path, found_files: &mut [FoundFile], cance
         if f.footer_found || !f.signature.is_isobmff() {
             continue;
         }
-        if let Some(size) = walk_isobmff_on_disk(
+        match walk_isobmff_on_disk(
             source_path,
             f.offset,
             f.signature.max_size as u64,
             source_size,
             cancel,
         ) {
-            f.size = size;
-            f.footer_found = true;
+            EndResult::Size(size) => {
+                f.size = size;
+                f.footer_found = true;
+            }
+            // El tamaño sirve (y evita que el archivo se confunda con lo que sigue), pero se marca
+            // como no verificable: se guarda igual, sin afirmar que está entero.
+            EndResult::SizeUnverified(size) => {
+                f.size = size;
+                f.footer_found = true;
+                f.end_unknown = true;
+            }
+            EndResult::Unknown => f.end_unknown = true,
+            EndResult::Rejected => {}
         }
     }
 }
 
 /// Recorre las cajas de un ISOBMFF saltando de una a la siguiente, y devuelve el tamaño real del
 /// archivo. `None` si no se puede afirmar dónde termina.
+///
+/// Aplica las mismas reglas que el recorrido en memoria (`signatures::walk_isobmff_boxes`), que
+/// salieron de bugs reales: la primera caja tiene que ser `ftyp`; al toparse con otro `ftyp` se
+/// para (ahí empieza el archivo siguiente, y sin esto los videos contiguos de una tarjeta de cámara
+/// se fusionaban en uno); hay que haber visto el índice (`moov`/`moof`/`meta`) para afirmar que el
+/// archivo sirve; y `size == 0` significa "hasta el fin del archivo", no "acá no hay caja".
 fn walk_isobmff_on_disk(
     source_path: &Path,
     offset: u64,
     max_size: u64,
     source_size: u64,
     cancel: &AtomicBool,
-) -> Option<u64> {
-    use crate::signatures::{isobmff_box_len_at, ISOBMFF_MIN_BOXES};
+) -> EndResult {
+    use crate::signatures::{
+        is_isobmff_index_box_bytes, isobmff_box_len_at, isobmff_box_type_at_bytes, BoxLen,
+        ISOBMFF_MAX_BOXES, ISOBMFF_MIN_BOXES,
+    };
 
-    let mut file = File::open(source_path).ok()?;
-    let mut header = [0u8; 16];
+    let Ok(mut file) = File::open(source_path) else {
+        return EndResult::Unknown;
+    };
+    // 16 bytes de header de caja + un sector para el desfase de alineación.
+    let mut header = [0u8; ISOBMFF_HEADER_READ + SECTOR as usize];
     let mut pos: u64 = 0;
     let mut boxes: usize = 0;
+    let mut has_index = false;
+
+    // Cierra el recorrido: solo se afirma un tamaño si además del encadenado se vio el índice. Si
+    // no, es un candidato que NO describe un archivo utilizable: rechazado.
+    let terminar = |boxes: usize, has_index: bool, pos: u64| -> EndResult {
+        if boxes >= ISOBMFF_MIN_BOXES && has_index && pos > 0 {
+            EndResult::Size(pos)
+        } else {
+            EndResult::Rejected
+        }
+    };
 
     loop {
+        // Cancelar y los topes de tamaño NO son un rechazo: no se pudo saber.
         if cancel.load(Ordering::SeqCst) {
-            return None;
+            return EndResult::Unknown;
         }
-        if pos > max_size {
-            // Más grande de lo que esta firma admite: no se afirma un tamaño.
-            return None;
+        if pos > max_size || boxes >= ISOBMFF_MAX_BOXES {
+            return EndResult::Unknown;
         }
-        let absolute = offset.checked_add(pos)?;
+        let Some(absolute) = offset.checked_add(pos) else {
+            return EndResult::Unknown;
+        };
         if absolute >= source_size {
-            // Las cajas llegan justo hasta el final del origen: final limpio.
-            return (boxes >= ISOBMFF_MIN_BOXES && absolute == source_size).then_some(pos);
+            return if absolute == source_size {
+                terminar(boxes, has_index, pos)
+            } else {
+                EndResult::Unknown
+            };
         }
 
-        file.seek(SeekFrom::Start(absolute)).ok()?;
-        let n = read_up_to(&mut file, &mut header)?;
-        let Some(len) = isobmff_box_len_at(&header[..n]) else {
-            // Lo que sigue no es una caja: ahí termina el archivo.
-            return (boxes >= ISOBMFF_MIN_BOXES).then_some(pos);
+        let Some((skew, n)) = read_aligned(&mut file, absolute, ISOBMFF_HEADER_READ, &mut header)
+        else {
+            // Error de I/O (sector dañado): no se pudo saber, no es un rechazo.
+            return EndResult::Unknown;
         };
-        let next = pos.checked_add(len)?;
-        if offset.checked_add(next)? > source_size {
-            // La última caja declara más de lo que hay en el origen: archivo cortado.
-            return None;
+        let vista = &header[skew..skew + n];
+
+        let Some(tipo) = isobmff_box_type_at_bytes(vista) else {
+            // Lo que sigue no es una caja: ahí termina el archivo.
+            return terminar(boxes, has_index, pos);
+        };
+        if boxes == 0 && &tipo != b"ftyp" {
+            // El candidato no empieza en el inicio de un archivo: rechazado.
+            return EndResult::Rejected;
         }
-        pos = next;
-        boxes += 1;
+        if boxes > 0 && &tipo == b"ftyp" {
+            // Empieza el archivo siguiente: este termina acá.
+            return terminar(boxes, has_index, pos);
+        }
+        has_index |= is_isobmff_index_box_bytes(&tipo);
+
+        match isobmff_box_len_at(vista) {
+            BoxLen::Bytes(len) => {
+                if boxes == 0 && len > crate::signatures::ISOBMFF_MAX_FTYP {
+                    // Un `ftyp` enorme no describe un archivo (ver ISOBMFF_MAX_FTYP).
+                    return EndResult::Rejected;
+                }
+                let Some(next) = pos.checked_add(len) else {
+                    return EndResult::Unknown;
+                };
+                match offset.checked_add(next) {
+                    // La última caja declara más de lo que hay: el archivo está CORTADO. Se sabe que
+                    // llega al menos hasta el fin del origen, así que se usa eso y se marca como no
+                    // verificable — es el archivo real parcialmente sobrescrito, no un falso
+                    // positivo, y tiene que seguir recuperándose.
+                    Some(fin) if fin > source_size => {
+                        let hasta = source_size.saturating_sub(offset);
+                        return if boxes >= ISOBMFF_MIN_BOXES && has_index && hasta > 0 {
+                            EndResult::SizeUnverified(hasta.min(max_size))
+                        } else {
+                            EndResult::Unknown
+                        };
+                    }
+                    None => return EndResult::Unknown,
+                    _ => {}
+                }
+                pos = next;
+                boxes += 1;
+            }
+            // `size == 0` = "esta caja llega hasta el fin del archivo". En una imagen de disco no
+            // hay forma de saber dónde termina de verdad (lo que sigue puede ser el archivo
+            // siguiente), así que no se afirma nada: se recupera igual, sin mentir que está íntegro.
+            BoxLen::ToEndOfFile => return EndResult::Unknown,
+            BoxLen::Invalid => return terminar(boxes, has_index, pos),
+        }
     }
 }
 
-/// Recorre la cadena de frames de un audio leyendo secuencialmente desde `offset`, y devuelve su
-/// tamaño real. `None` si no se puede afirmar dónde termina (cadena demasiado corta, archivo
-/// cortado, error de lectura o cancelación).
+/// Recorre la cadena de frames de un audio leyendo secuencialmente desde `offset` y concluye sobre
+/// su final: el tamaño real, un rechazo (no era audio), o que no se pudo saber.
 ///
 /// Lee de a `chunk_size` bytes y arrastra el recorrido entre chunks: `consumed` marca hasta dónde
 /// llegó la cadena confirmada, y el chunk siguiente se lee desde ahí, así que ningún frame queda
@@ -1611,32 +1769,56 @@ fn walk_audio_stream_on_disk(
     kind: crate::signatures::AudioStream,
     chunk_size: usize,
     cancel: &AtomicBool,
-) -> Option<u64> {
+) -> EndResult {
     use crate::signatures::{id3v2_tag_size, walk_audio_frames, ChainStop};
 
-    let mut file = File::open(source_path).ok()?;
-    file.seek(SeekFrom::Start(offset)).ok()?;
+    let Ok(mut file) = File::open(source_path) else {
+        return EndResult::Unknown;
+    };
 
-    let mut buf = vec![0u8; chunk_size];
+    // Un sector extra: la lectura alineada arranca antes del offset pedido.
+    let mut buf = vec![0u8; chunk_size + SECTOR as usize];
     let mut consumed: u64 = 0;
     let mut frames: usize = 0;
-    let mut sample_rate: Option<u8> = None;
+    let mut sample_rate: Option<u32> = None;
     // La etiqueta ID3 inicial no es audio: se saltea antes de empezar a encadenar frames.
     let mut tag: Option<u64> = None;
 
+    // Cierra el recorrido con lo acumulado: si la cadena fue lo bastante larga, es el tamaño real;
+    // si no, el candidato no era audio.
+    let terminar = |frames: usize, consumed: u64| -> EndResult {
+        if frames >= crate::signatures::AUDIO_MIN_CHAIN_FRAMES && consumed > 0 {
+            EndResult::Size(consumed)
+        } else {
+            EndResult::Rejected
+        }
+    };
+
     loop {
+        // Cancelar y el tope de tamaño no son un rechazo: no se pudo saber.
         if cancel.load(Ordering::SeqCst) {
-            return None;
+            return EndResult::Unknown;
         }
         if consumed >= max_size {
-            // Más largo que lo que esta firma admite: no se puede afirmar un tamaño.
-            return None;
+            // Si no se encontró NI UN frame, esto no era audio: es un rechazo, no un "no pude
+            // saberlo". Distinguirlo importa porque lo no-sabido se guarda por defecto: sin esto,
+            // un "ID3" falso en datos binarios —cuyo tamaño de etiqueta basura salta de una más
+            // allá del máximo— se guardaba como un MP3 de 50 MB. Medido: 15 de esos, 712 MB de
+            // basura sobre un corpus de 382 MB.
+            return if frames == 0 {
+                EndResult::Rejected
+            } else {
+                EndResult::Unknown
+            };
         }
 
-        file.seek(SeekFrom::Start(offset + consumed)).ok()?;
         let want = std::cmp::min(chunk_size as u64, max_size - consumed) as usize;
-        let n = read_up_to(&mut file, &mut buf[..want])?;
-        let data = &buf[..n];
+        let Some((skew, n)) = read_aligned(&mut file, offset + consumed, want, &mut buf) else {
+            // Error de I/O (sector dañado): no se pudo saber, no es un rechazo. Es exactamente el
+            // caso del disco que está fallando, donde el archivo suele ser real.
+            return EndResult::Unknown;
+        };
+        let data = &buf[skew..skew + n];
         // Se leyó menos de lo pedido => se llegó al final del origen.
         let at_source_end = n < want;
 
@@ -1644,10 +1826,15 @@ fn walk_audio_stream_on_disk(
             Some(_) => 0,
             None => {
                 let t = id3v2_tag_size(data).unwrap_or(0);
+                // Una etiqueta que sola se pasa del tamaño máximo del formato no es una etiqueta:
+                // es basura leída como si lo fuera.
+                if t as u64 >= max_size {
+                    return EndResult::Rejected;
+                }
                 tag = Some(t as u64);
                 if t >= data.len() {
-                    // La etiqueta sola llena el chunk (raro, pero posible con carátulas grandes):
-                    // saltarla y seguir en la vuelta siguiente.
+                    // La etiqueta sola llena el chunk (posible con carátulas grandes): saltarla y
+                    // seguir en la vuelta siguiente.
                     consumed += t as u64;
                     continue;
                 }
@@ -1661,60 +1848,75 @@ fn walk_audio_stream_on_disk(
         consumed += (start + chain.bytes) as u64;
 
         match chain.stop {
-            // La cadena terminó de verdad (lo que sigue no es audio): ese es el tamaño.
-            ChainStop::BadData => {
-                let total = FrameChainTotal {
-                    frames,
-                    bytes: consumed,
-                };
-                return total.size_if_credible();
-            }
-            // Se acabaron los datos del chunk, o el último frame no entraba entero en él. Si esos
-            // datos eran el final del origen, el archivo está cortado de verdad (Truncated) o
-            // termina limpio justo ahí (NoMoreData). Si no, simplemente hay que leer el chunk
-            // siguiente: `consumed` quedó apuntando al inicio del frame que no entró, así que se
-            // retoma exactamente ahí sin partir ningún frame.
+            // La cadena terminó de verdad: lo que sigue no es audio.
+            ChainStop::BadData => return terminar(frames, consumed),
             ChainStop::NoMoreData | ChainStop::Truncated => {
                 if at_source_end {
-                    if chain.stop == ChainStop::Truncated {
-                        // El archivo se corta a la mitad de un frame: no se puede afirmar su tamaño.
-                        return None;
-                    }
-                    let total = FrameChainTotal {
-                        frames,
-                        bytes: consumed,
+                    return if chain.stop == ChainStop::Truncated {
+                        // El archivo se corta a mitad de un frame justo donde termina el origen: es
+                        // un archivo REAL al que le falta un pedazo (imagen truncada, último sector
+                        // pisado). Se conoce hasta dónde llega, así que se usa ese tamaño, pero sin
+                        // afirmar que está entero.
+                        if frames >= crate::signatures::AUDIO_MIN_CHAIN_FRAMES && consumed > 0 {
+                            EndResult::SizeUnverified(consumed)
+                        } else {
+                            EndResult::Rejected
+                        }
+                    } else {
+                        terminar(frames, consumed)
                     };
-                    return total.size_if_credible();
                 }
                 if chain.bytes == 0 && start == 0 {
-                    // No se avanzó nada y todavía hay datos por leer: sin esta guarda el bucle no
-                    // terminaría nunca. (Un frame no entra en un chunk de 1 MB solo si algo está
-                    // muy mal: el máximo real son 1441 bytes en MP3 y 8191 en AAC.)
-                    return None;
+                    // No se avanzó y quedan datos por leer: sin esta guarda el bucle no terminaría.
+                    // (Un frame no entra en un chunk de 1 MB solo si algo está muy mal: el máximo
+                    // real son 1441 bytes en MP3 y 8191 en AAC.)
+                    return EndResult::Rejected;
                 }
             }
             // Tope de frames: imposible acá, se recorre con `usize::MAX`.
-            ChainStop::Capped => return None,
+            ChainStop::Capped => return EndResult::Unknown,
         }
     }
 }
 
-/// Cadena acumulada a lo largo de varios chunks de lectura.
-struct FrameChainTotal {
-    frames: usize,
-    bytes: u64,
-}
+/// Tamaño de sector al que hay que alinear las lecturas de un disco físico crudo.
+const SECTOR: u64 = 512;
+/// Bytes que se leen para inspeccionar el header de una caja ISOBMFF (8 normales, 16 si el tamaño
+/// viene en 64 bits).
+const ISOBMFF_HEADER_READ: usize = 16;
 
-impl FrameChainTotal {
-    /// El tamaño solo se afirma si la cadena fue lo bastante larga para creerle (mismo criterio que
-    /// dentro del buffer): si no, el candidato queda marcado "posiblemente dañado".
-    fn size_if_credible(&self) -> Option<u64> {
-        if self.frames >= crate::signatures::AUDIO_MIN_CHAIN_FRAMES && self.bytes > 0 {
-            Some(self.bytes)
-        } else {
-            None
-        }
+/// Lee `want` bytes lógicos desde `offset`, ALINEANDO la lectura física a 512 bytes.
+///
+/// Los dispositivos físicos crudos de Windows (`\\.\PhysicalDriveN`) rechazan con
+/// `ERROR_INVALID_PARAMETER` cualquier `ReadFile` cuyo offset o tamaño no sea múltiplo de 512.
+/// Los dos pases de refinamiento leen en fronteras de frame o de caja —posiciones arbitrarias por
+/// definición—, así que sin esto TODAS sus lecturas fallaban en el escenario más común del público:
+/// meter el USB y escanear el disco directo, sin clonar a `.img` primero. Como cada fallo deja al
+/// candidato sin poder cerrar su cadena, el resultado era "0 archivos" en música, video y fotos de
+/// iPhone. En un archivo normal alinear no cuesta nada (se lee un poco de más y se descarta), así
+/// que se hace siempre en vez de preguntar qué es el origen.
+///
+/// `buf` tiene que tener lugar para `want` + un sector. Devuelve `(inicio_util, bytes_utiles)`.
+fn read_aligned(
+    file: &mut File,
+    offset: u64,
+    want: usize,
+    buf: &mut [u8],
+) -> Option<(usize, usize)> {
+    let aligned = offset & !(SECTOR - 1);
+    let skew = (offset - aligned) as usize;
+    // Se redondea hacia arriba para que el LARGO leído también sea múltiplo de sector.
+    let physical = (skew + want).div_ceil(SECTOR as usize) * SECTOR as usize;
+    let physical = physical.min(buf.len());
+    if physical <= skew {
+        return Some((skew, 0));
     }
+
+    file.seek(SeekFrom::Start(aligned)).ok()?;
+    let leidos = read_up_to(file, &mut buf[..physical])?;
+    // Lo que se pidió de verdad empieza pasado el desfase, y nunca es más que `want`.
+    let utiles = leidos.saturating_sub(skew).min(want);
+    Some((skew, utiles))
 }
 
 /// Lee hasta llenar `buf`, tolerando lecturas cortas. Devuelve cuántos bytes se leyeron, o `None`
@@ -1876,6 +2078,7 @@ mod tests {
             size: 1000,
             index: 1,
             footer_found,
+            end_unknown: false,
         }
     }
 
@@ -1891,6 +2094,7 @@ mod tests {
             size,
             index,
             footer_found,
+            end_unknown: false,
         };
 
         // Dentro de un contenedor CONFIABLE (footer hallado) → se suprime lo de adentro; lo de
@@ -3853,6 +4057,179 @@ mod tests {
         );
     }
 
+    // ── Regresiones que encontró la revisión adversarial (sesión 15) ──
+
+    /// Un frame MPEG-2 / MPEG-2.5 (22050, 24000, 16000, 12000, 11025, 8000 Hz) tiene otra tabla de
+    /// bitrates, otros sample rates y otra fórmula de largo que MPEG-1. El código solo conocía
+    /// MPEG-1 y ni siquiera leía los bits de versión, así que a la MITAD del universo de MP3 —justo
+    /// la de podcasts, audiolibros y notas de voz— le calculaba mal el largo, la cadena rompía en el
+    /// primer frame y el archivo terminaba marcado "posiblemente dañado", o sea sin guardarse.
+    #[test]
+    fn test_se_reconocen_los_mp3_de_mpeg2_y_mpeg25() {
+        // MPEG-2 Layer III, 22050 Hz: h[1]=0xF3 (versión 10, capa 01). h[2]=0x80 -> bitrate_idx 8
+        // = 64 kbps en la tabla de MPEG-2, sr_idx 0 = 22050, sin padding.
+        // Largo = 72 * 64000 / 22050 = 208 bytes.
+        let mut v2 = vec![0xFF, 0xF3, 0x80, 0x00];
+        v2.resize(208, 0x5A);
+        // MPEG-2.5 Layer III, 11025 Hz: h[1]=0xE3. Largo = 72 * 64000 / 11025 = 417 bytes.
+        let mut v25 = vec![0xFF, 0xE3, 0x80, 0x00];
+        v25.resize(417, 0x5A);
+
+        for (nombre, frame) in [("MPEG-2 22050 Hz", v2), ("MPEG-2.5 11025 Hz", v25)] {
+            // Con etiqueta ID3 delante, que es como los escribe cualquier programa real. NOTA: sin
+            // etiqueta no se detectan, porque la firma "MP3 (Sync)" es `FF FB` = MPEG-1 Layer III
+            // solamente, y estos empiezan con `FF F3` / `FF E3`. Es un hueco PREEXISTENTE de
+            // detección (no de esta sesión), anotado en los próximos pasos.
+            let mut audio = vec![b'I', b'D', b'3', 0x03, 0x00, 0x00, 0, 0, 0, 0];
+            audio.extend_from_slice(&frame.repeat(30));
+            let mut data = vec![0u8; 4096];
+            let offset = data.len();
+            data.extend_from_slice(&audio);
+            data.extend_from_slice(&[0x00; 4096]);
+
+            let found = scan_bytes(&data, &audio_sigs());
+            let f = found
+                .iter()
+                .find(|f| f.offset == offset as u64)
+                .unwrap_or_else(|| panic!("no se detectó el audio {nombre}"));
+            assert_eq!(f.size, audio.len() as u64, "tamaño real de {nombre}");
+            assert_eq!(f.integrity(), Integrity::Intact, "{nombre}");
+        }
+    }
+
+    /// En una tarjeta de cámara los archivos van uno pegado al otro. El recorrido de cajas paraba en
+    /// el primer byte que no pareciera caja, no al terminar el archivo — y como el `ftyp` del
+    /// siguiente SÍ es una caja válida, seguía de largo: tres videos se fusionaban en uno solo, y
+    /// tres fotos HEIC de iPhone se convertían en una.
+    #[test]
+    fn test_dos_videos_pegados_no_se_fusionan_en_uno() {
+        let a = make_mp4(2000);
+        let b = make_mp4(3000);
+        let mut data = vec![0u8; 4096];
+        let (off_a, off_b) = (data.len(), data.len() + a.len());
+        data.extend_from_slice(&a);
+        data.extend_from_slice(&b); // pegado, sin relleno entre medio
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let sigs = signatures_for_categories(&[FileCategory::Video]);
+        let found = scan_bytes(&data, &sigs);
+
+        let fa = found
+            .iter()
+            .find(|f| f.offset == off_a as u64)
+            .expect("falta el 1ro");
+        let fb = found
+            .iter()
+            .find(|f| f.offset == off_b as u64)
+            .expect("falta el 2do");
+        assert_eq!(fa.size, a.len() as u64, "el 1ro no debe englobar al 2do");
+        assert_eq!(fb.size, b.len() as u64);
+    }
+
+    /// `size == 0` en una caja significa "esta caja llega hasta el fin del archivo" y es válido por
+    /// norma (lo escriben cámaras y muxers que graban a streaming). Tratarlo como "acá no hay caja"
+    /// cortaba el video justo antes de sus datos y lo declaraba ÍNTEGRO: el usuario guardaba un
+    /// archivo vacío convencido de que estaba bien.
+    #[test]
+    fn test_una_caja_hasta_el_fin_del_archivo_no_se_declara_integra_a_medias() {
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&16u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypisom");
+        mp4.extend_from_slice(&[0u8; 4]);
+        mp4.extend_from_slice(&24u32.to_be_bytes());
+        mp4.extend_from_slice(b"moov");
+        mp4.extend_from_slice(&[0x11; 16]);
+        mp4.extend_from_slice(&0u32.to_be_bytes()); // size 0 = hasta el fin del archivo
+        mp4.extend_from_slice(b"mdat");
+        mp4.resize(16 + 24 + 8 + 4000, 0x5A);
+
+        let mut data = vec![0u8; 4096];
+        let offset = data.len();
+        data.extend_from_slice(&mp4);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let sigs = signatures_for_categories(&[FileCategory::Video]);
+        let found = scan_bytes(&data, &sigs);
+        let f = found
+            .iter()
+            .find(|f| f.offset == offset as u64)
+            .expect("no se detectó");
+
+        assert_ne!(
+            f.integrity(),
+            Integrity::Intact,
+            "no se puede afirmar que esté íntegro si no se sabe dónde termina"
+        );
+        assert!(
+            f.size >= mp4.len() as u64,
+            "y no puede cortarse antes de los datos: {} < {}",
+            f.size,
+            mp4.len()
+        );
+    }
+
+    /// Un `ftyp` fabricado que declara un tamaño enorme se volvía "contenedor confiable" y
+    /// `suppress_contained` borraba las fotos REALES que quedaban adentro: en la prueba de la
+    /// revisión desaparecían 6 JPEG sin ningún aviso. Un `ftyp` real mide decenas de bytes.
+    #[test]
+    fn test_un_ftyp_gigante_no_se_traga_las_fotos_de_adentro() {
+        let jpeg = {
+            let mut j = vec![0xFF, 0xD8, 0xFF];
+            j.resize(2048, 0x7C);
+            j.extend_from_slice(&[0xFF, 0xD9]);
+            j
+        };
+        let total = 200_000usize;
+        let mut falso = Vec::new();
+        falso.extend_from_slice(&(total as u32).to_be_bytes()); // ftyp que declara 200 KB
+        falso.extend_from_slice(b"ftypisom");
+        falso.extend_from_slice(&[0u8; 4]);
+        falso.resize(total, 0x00);
+        // una foto real adentro del rango que el ftyp falso dice ocupar
+        let pos_foto = 50_000;
+        falso[pos_foto..pos_foto + jpeg.len()].copy_from_slice(&jpeg);
+        // y una caja plausible justo al final, para que el encadenado "cierre"
+        falso.extend_from_slice(&24u32.to_be_bytes());
+        falso.extend_from_slice(b"moov");
+        falso.extend_from_slice(&[0x11; 16]);
+
+        let mut data = vec![0u8; 4096];
+        let off_foto = data.len() + pos_foto;
+        data.extend_from_slice(&falso);
+        data.extend_from_slice(&[0x00; 4096]);
+
+        let sigs = signatures_for_categories(&[FileCategory::Photo, FileCategory::Video]);
+        let found = scan_bytes(&data, &sigs);
+
+        assert!(
+            found.iter().any(|f| f.offset == off_foto as u64),
+            "la foto real no puede desaparecer por un ftyp inventado"
+        );
+    }
+
+    /// A un audio al que le falta un pedazo del final (imagen truncada, último sector pisado) hay
+    /// que recuperarlo igual: es un archivo REAL. Pero tampoco puede salir como "íntegro", ni
+    /// desarmarse en un archivo por frame — los tres resultados posibles estuvieron mal en algún
+    /// momento de esta sesión.
+    #[test]
+    fn test_un_audio_cortado_al_final_se_recupera_entero_y_sin_mentir() {
+        let mp3 = repeat(&mpeg_frame(), 40);
+        let cortado = &mp3[..mp3.len() - 200]; // le falta parte del último frame
+        let mut data = vec![0u8; 4096];
+        let offset = data.len();
+        data.extend_from_slice(cortado);
+
+        let found = scan_bytes(&data, &audio_sigs());
+        assert_eq!(found.len(), 1, "un archivo, no uno por frame");
+        assert_eq!(found[0].offset, offset as u64);
+        assert_eq!(
+            found[0].integrity(),
+            Integrity::Unverifiable,
+            "no está íntegro, pero tampoco es basura: se guarda igual"
+        );
+        assert!(found[0].size >= (cortado.len() - 2000) as u64);
+    }
+
     /// Las dos pasadas de refinamiento nuevas releen el disco, así que tienen que respetar el
     /// "Detener" del usuario: en un disco que está muriendo, seguir leyendo es exactamente lo que
     /// se pidió dejar de hacer. Mismo requisito que `refine_footers`.
@@ -3882,16 +4259,27 @@ mod tests {
         assert_eq!(files[0].size, mp3.len() as u64);
     }
 
+    /// Arma un ISOBMFF válido: `ftyp` + `moov` + `mdat` con `datos` bytes de contenido.
+    fn make_mp4(datos: usize) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&16u32.to_be_bytes());
+        b.extend_from_slice(b"ftypisom");
+        b.extend_from_slice(&[0u8; 4]);
+        b.extend_from_slice(&24u32.to_be_bytes());
+        b.extend_from_slice(b"moov");
+        b.extend_from_slice(&[0x11; 16]);
+        b.extend_from_slice(&((datos + 8) as u32).to_be_bytes());
+        b.extend_from_slice(b"mdat");
+        b.resize(16 + 24 + 8 + datos, 0x5A);
+        b
+    }
+
     #[test]
     fn test_el_refinamiento_de_video_respeta_la_cancelacion() {
-        // ISOBMFF mínimo: caja `ftyp` + caja `mdat`.
-        let mut mp4 = Vec::new();
-        mp4.extend_from_slice(&16u32.to_be_bytes());
-        mp4.extend_from_slice(b"ftypisom");
-        mp4.extend_from_slice(&[0u8; 4]);
-        mp4.extend_from_slice(&1000u32.to_be_bytes());
-        mp4.extend_from_slice(b"mdat");
-        mp4.resize(16 + 1000, 0x5A);
+        // ISOBMFF mínimo REAL: `ftyp` + `moov` (el índice, sin el cual el archivo no abre en
+        // ningún reproductor) + `mdat`. El fixture anterior no tenía `moov` y aun así se daba por
+        // bueno: describía un archivo que en la vida real no sirve.
+        let mp4 = make_mp4(1000);
 
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(&mp4).unwrap();

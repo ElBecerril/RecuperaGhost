@@ -144,7 +144,30 @@ pub struct UpdateInfo {
     /// Tag tal como está publicado en GitHub (ej. "v0.5.2").
     pub version: String,
     /// URL de la página del release, para que el usuario la descargue a mano.
+    /// SIEMPRE apunta a este repo: ver `safe_release_url`.
     pub url: String,
+}
+
+/// Prefijo que tiene que tener cualquier URL que el programa vaya a ABRIR.
+const RELEASES_PREFIX: &str = "https://github.com/ElBecerril/RecuperaGhost/releases";
+/// A dónde mandar al usuario si la URL que vino por la red no es de este repo.
+const RELEASES_FALLBACK: &str = "https://github.com/ElBecerril/RecuperaGhost/releases/latest";
+
+/// Acota la URL que llega de la red a una que de verdad apunte a los releases de este repo.
+///
+/// El CLI solo IMPRIME el enlace, pero la GUI lo ABRE, y en Windows `open_url` termina en
+/// `cmd /C start "" <url>`: `cmd` reinterpreta la cadena, así que una URL hostil en la respuesta de
+/// la API (API comprometida, TLS interceptado, un proxy corporativo que reescribe) pasaría de ser
+/// texto en pantalla a ejecutarse en la máquina de alguien que está justo rescatando su disco.
+///
+/// Es la misma política que ya regía para el updater cuando descargaba: la URL debe empezar con el
+/// path de ESTE repo, no con `github.com` a secas (si no, `github.com/otro/repo` pasaría el filtro).
+fn safe_release_url(url: &str) -> String {
+    if url.starts_with(RELEASES_PREFIX) {
+        url.to_string()
+    } else {
+        RELEASES_FALLBACK.to_string()
+    }
 }
 
 // ─── Lógica interna ─────────────────────────────────────────────────────────
@@ -174,7 +197,7 @@ fn try_check_for_updates() -> Result<Option<UpdateInfo>, Box<dyn std::error::Err
     // Hay una versión nueva: solo se informa (no se descarga ni se reemplaza nada).
     Ok(Some(UpdateInfo {
         version: release.tag_name,
-        url: release.html_url,
+        url: safe_release_url(&release.html_url),
     }))
 }
 
@@ -378,5 +401,30 @@ mod tests {
         // Y una beta posterior sigue sin avisarle a quien ya está en la estable.
         let beta_next = parse_version("0.5.0-beta.2").unwrap();
         assert!(!is_newer(&beta_next, &stable));
+    }
+
+    /// La GUI ABRE esta URL (en Windows, via `cmd /C start`), asi que no puede salir de lo que
+    /// diga la red. El CLI solo la imprimia; el riesgo lo introdujo el cartel de la interfaz.
+    #[test]
+    fn test_solo_se_abren_urls_de_releases_de_este_repo() {
+        let buena = "https://github.com/ElBecerril/RecuperaGhost/releases/tag/v9.9.9";
+        assert_eq!(safe_release_url(buena), buena);
+
+        // `github.com` a secas NO alcanza: otro repo puede publicar lo que quiera.
+        for hostil in [
+            "https://github.com/atacante/malicioso/releases/tag/v1",
+            "https://evil.example/payload.exe",
+            "https://github.com.evil.example/ElBecerril/RecuperaGhost/releases",
+            "http://github.com/ElBecerril/RecuperaGhost/releases",
+            "https://github.com/ElBecerril/RecuperaGhost2/releases",
+            "\" & calc.exe & \"",
+            "",
+        ] {
+            assert_eq!(
+                safe_release_url(hostil),
+                RELEASES_FALLBACK,
+                "deberia caer al fallback: {hostil}"
+            );
+        }
     }
 }

@@ -100,7 +100,7 @@ enum Phase {
 }
 
 /// Qué acción está esperando a que el usuario resuelva la advertencia de mismo-disco.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PendingAction {
     Scan,
     Recover,
@@ -2235,6 +2235,101 @@ mod tests {
         );
         assert!(matches!(a.phase, Phase::Setup(Step::Source)));
         assert!(a.error_msg.is_empty(), "no es un error que valga molestar");
+    }
+
+    /// PROTECCION DE DATOS, la barrera de verdad: `blocked_by_same_device` es lo que FRENA la
+    /// accion y deja la advertencia en pantalla. El test que habia solo probaba `already_accepted`
+    /// —un getter— en aislamiento: una revision adversarial desactivo esta guarda entera
+    /// (`if true { return false }`) y los 13 tests seguian en verde. O sea, la unica proteccion
+    /// contra pisar el disco que se esta rescatando estaba sin cubrir.
+    ///
+    /// Se usa un dispositivo que NO existe a proposito: el detector no puede confirmar sus puntos
+    /// de montaje y cae en su fail-safe (advertir igual), que es justo la conducta que se quiere
+    /// fijar — ante la duda, avisar.
+    #[test]
+    fn test_la_barrera_de_mismo_disco_frena_la_accion_y_guarda_la_pareja() {
+        let dir = tempfile::tempdir().unwrap();
+        let origen = PathBuf::from("/dev/sdzzz_inexistente");
+        let destino = dir.path().to_path_buf();
+        let mut a = app_con(Vec::new());
+
+        assert!(
+            a.blocked_by_same_device(&origen, &destino, PendingAction::Recover),
+            "ante un disco fisico cuyos montajes no se pueden confirmar, tiene que FRENAR"
+        );
+        let (_, accion, org, dst) = a
+            .pending_warning
+            .clone()
+            .expect("debe quedar la advertencia");
+        assert_eq!(accion, PendingAction::Recover);
+        assert_eq!((org, dst), (origen.clone(), destino.clone()));
+    }
+
+    /// Y una vez aceptado el riesgo para ESA pareja exacta, deja de frenar — pero solo para esa.
+    #[test]
+    fn test_aceptar_el_riesgo_desbloquea_solo_esa_pareja() {
+        let dir = tempfile::tempdir().unwrap();
+        let origen = PathBuf::from("/dev/sdzzz_inexistente");
+        let destino = dir.path().to_path_buf();
+        let mut a = app_con(Vec::new());
+        a.same_device_accepted = Some((origen.clone(), destino.clone()));
+
+        assert!(
+            !a.blocked_by_same_device(&origen, &destino, PendingAction::Recover),
+            "la pareja aceptada no debe volver a frenar"
+        );
+        assert!(a.pending_warning.is_none());
+
+        // Otro destino: la aceptacion anterior NO vale.
+        let otro = dir.path().join("otra_carpeta");
+        assert!(
+            a.blocked_by_same_device(&origen, &otro, PendingAction::Recover),
+            "cambiar el destino tiene que volver a frenar"
+        );
+    }
+
+    /// El guard de `start_recovery` es el que importa: es la ruta que ESCRIBE bytes. El test que
+    /// habia solo cubria `start_scan`; una revision adversarial borro este guard y los 13 tests
+    /// siguieron en verde.
+    #[test]
+    fn test_no_arranca_una_recuperacion_con_la_advertencia_en_pantalla() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("origen.img");
+        std::fs::write(&img, vec![0u8; 1024]).unwrap();
+
+        let mut a = app_con(Vec::new());
+        a.source = Some(img.clone());
+        a.output_dir = dir.path().join("salida").display().to_string();
+        a.scan_result = Some(ScanResult {
+            found_files: Vec::new(),
+            bytes_scanned: 1024,
+            photos_count: 0,
+            videos_count: 0,
+            audios_count: 0,
+            documents_count: 0,
+            had_errors: false,
+            cancelled: false,
+        });
+        a.phase = Phase::Results;
+        a.pending_warning = Some((
+            "aviso".to_string(),
+            PendingAction::Recover,
+            img,
+            dir.path().to_path_buf(),
+        ));
+
+        a.start_recovery();
+
+        assert!(
+            matches!(a.phase, Phase::Results),
+            "no debe salir de resultados"
+        );
+        assert!(a.recovery_rx.is_none(), "no debe haber arrancado un hilo");
+        assert_eq!(
+            a.pending_warning.as_ref().map(|(m, ..)| m.as_str()),
+            Some("aviso"),
+            "la decision sigue pendiente"
+        );
     }
 
     /// Los pasos del asistente van en orden y el primero no tiene "anterior" (el botón Volver no

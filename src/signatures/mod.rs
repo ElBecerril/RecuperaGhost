@@ -29,7 +29,7 @@ pub type SignatureValidator = (fn(&[u8]) -> bool, usize);
 pub type StreamEndFn = fn(&[u8], bool) -> Option<usize>;
 
 /// Devuelve `(largo_del_frame, indice_de_sample_rate)` del frame que empieza en la posición dada.
-type FrameAtFn = fn(&[u8], usize) -> Option<(usize, u8)>;
+type FrameAtFn = fn(&[u8], usize) -> Option<(usize, u32)>;
 
 /// Firma de archivo: magic bytes de cabecera y pie opcional
 #[derive(Debug, Clone)]
@@ -94,16 +94,41 @@ impl fmt::Display for FileSignature {
     }
 }
 
-/// Tabla de bitrates (kbps) para MPEG1 Layer III, indexada por el campo bitrate_index (4
-/// bits) del 3er byte del header. Índices 0 (free) y 15 (inválido) se marcan con 0 y se
-/// rechazan antes de usar la tabla.
-const MP3_BITRATES_KBPS: [u32; 16] = [
+// Tablas de bitrate (kbps) por versión y capa de MPEG Audio. Índices 0 (free) y 15 (inválido) van
+// en 0 y se rechazan antes de indexar.
+//
+// Hubo un bug REAL acá: el código solo tenía las tablas de MPEG-1 y ni siquiera leía los bits de
+// versión, así que a un MP3 de MPEG-2 o 2.5 le calculaba mal el largo del frame, la cadena rompía en
+// el primer frame y el archivo quedaba marcado "posiblemente dañado" → no se guardaba. Eso es la
+// MITAD del universo de sample rates de MP3, y justo la que usan podcasts, audiolibros, notas de voz
+// y ringtones. Lo encontró una revisión adversarial con archivos reales.
+const MP3_BITRATES_V1_L1: [u32; 16] = [
+    0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 0,
+];
+const MP3_BITRATES_V1_L2: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 0,
+];
+const MP3_BITRATES_V1_L3: [u32; 16] = [
     0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0,
 ];
+const MP3_BITRATES_V2_L1: [u32; 16] = [
+    0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256, 0,
+];
+/// MPEG-2 / 2.5 comparten tabla para las capas II y III.
+const MP3_BITRATES_V2_L23: [u32; 16] = [
+    0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
+];
 
-/// Tabla de sample rates (Hz) para MPEG1, indexada por sample_rate_index (2 bits). Índice 3
-/// (reservado) se marca con 0 y se rechaza antes de usar la tabla.
-const MP3_SAMPLE_RATES_HZ: [u32; 4] = [44100, 48000, 32000, 0];
+/// Sample rates (Hz) por versión, indexados por sample_rate_index (2 bits). El índice 3 es
+/// reservado: va en 0 y se rechaza antes de usarlo.
+const MP3_SAMPLE_RATES_V1: [u32; 4] = [44100, 48000, 32000, 0];
+const MP3_SAMPLE_RATES_V2: [u32; 4] = [22050, 24000, 16000, 0];
+const MP3_SAMPLE_RATES_V25: [u32; 4] = [11025, 12000, 8000, 0];
+
+/// Sample rates (Hz) de ADTS, indexados por sampling_frequency_index (4 bits).
+const ADTS_SAMPLE_RATES: [u32; 13] = [
+    96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
+];
 
 /// Cuántos frames consecutivos hay que encadenar para creerle a un syncword de audio.
 ///
@@ -136,7 +161,7 @@ impl AudioStream {
     /// Bytes mínimos para poder leer un header de frame de esta familia.
     fn header_len(self) -> usize {
         match self {
-            AudioStream::Mpeg => 3,
+            AudioStream::Mpeg => 4,
             AudioStream::Adts => 6,
         }
     }
@@ -166,9 +191,9 @@ pub struct FrameChain {
     /// Cuántos bytes cubren esos frames (el tamaño real del stream si la cadena terminó).
     pub bytes: usize,
     pub stop: ChainStop,
-    /// Índice de sample rate visto en la cadena. Se devuelve para poder seguir el recorrido en el
-    /// chunk siguiente sin perder el invariante de "el sample rate no cambia dentro de un stream".
-    pub sample_rate: Option<u8>,
+    /// Sample rate (Hz) visto en la cadena. Se devuelve para poder seguir el recorrido en el chunk
+    /// siguiente sin perder el invariante de "el sample rate no cambia dentro de un stream".
+    pub sample_rate: Option<u32>,
 }
 
 /// Largo del frame MPEG Audio que empieza en `pos`, y su índice de sample rate.
@@ -176,32 +201,67 @@ pub struct FrameChain {
 /// El largo sale de la fórmula estándar de MPEG1 Layer III
 /// (144000 * bitrate_kbps / sample_rate_hz + padding) con los campos del propio header. Devuelve
 /// `None` si ahí no hay un header estructuralmente válido (o si no quedan bytes para leerlo).
-fn mpeg_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u8)> {
-    let h = bytes.get(pos..pos.checked_add(3)?)?;
+fn mpeg_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u32)> {
+    let h = bytes.get(pos..pos.checked_add(4)?)?;
     if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
         return None;
     }
+    // Versión: 0 = MPEG-2.5, 1 = reservado, 2 = MPEG-2, 3 = MPEG-1.
+    // Capa:    0 = reservado, 1 = Layer III, 2 = Layer II, 3 = Layer I.
+    let version = (h[1] >> 3) & 0x03;
+    let layer = (h[1] >> 1) & 0x03;
+    if version == 1 || layer == 0 {
+        return None;
+    }
+
     let b2 = h[2];
     let bitrate_index = (b2 >> 4) & 0x0F;
     let sample_rate_index = (b2 >> 2) & 0x03;
     if bitrate_index == 0x00 || bitrate_index == 0x0F || sample_rate_index == 0x03 {
         return None;
     }
-    let bitrate_kbps = MP3_BITRATES_KBPS[bitrate_index as usize];
-    let sample_rate_hz = MP3_SAMPLE_RATES_HZ[sample_rate_index as usize];
+
+    let es_v1 = version == 3;
+    let bitrates = match (es_v1, layer) {
+        (true, 3) => &MP3_BITRATES_V1_L1,
+        (true, 2) => &MP3_BITRATES_V1_L2,
+        (true, _) => &MP3_BITRATES_V1_L3,
+        (false, 3) => &MP3_BITRATES_V2_L1,
+        (false, _) => &MP3_BITRATES_V2_L23,
+    };
+    let sample_rates = match version {
+        3 => &MP3_SAMPLE_RATES_V1,
+        2 => &MP3_SAMPLE_RATES_V2,
+        _ => &MP3_SAMPLE_RATES_V25,
+    };
+    let bitrate_kbps = bitrates[bitrate_index as usize];
+    let sample_rate_hz = sample_rates[sample_rate_index as usize];
+    if bitrate_kbps == 0 || sample_rate_hz == 0 {
+        return None;
+    }
     let padding = ((b2 >> 1) & 0x01) as u32;
-    // Ya se descartaron los índices inválidos, así que ambos son > 0: la división es segura.
-    let frame_len = ((144_000 * bitrate_kbps) / sample_rate_hz + padding) as usize;
+
+    // Muestras por frame: Layer I = 384, Layer II = 1152, Layer III = 1152 en MPEG-1 pero 576 en
+    // MPEG-2/2.5. El largo en bytes es (muestras/8) * bitrate / sample_rate, más el relleno (que en
+    // Layer I se mide en ranuras de 4 bytes).
+    let frame_len = if layer == 3 {
+        ((12 * bitrate_kbps * 1000 / sample_rate_hz) + padding) as usize * 4
+    } else {
+        let coeficiente = if layer == 1 && !es_v1 { 72 } else { 144 };
+        ((coeficiente * bitrate_kbps * 1000 / sample_rate_hz) + padding) as usize
+    };
     if frame_len == 0 {
         return None;
     }
-    Some((frame_len, sample_rate_index))
+    // La identidad que se exige constante a lo largo del stream es el sample rate REAL en Hz, no el
+    // índice: el mismo índice significa cosas distintas en MPEG-1, 2 y 2.5.
+    Some((frame_len, sample_rate_hz))
 }
 
 /// Largo del frame ADTS (AAC) que empieza en `pos`, y su índice de sample rate.
 ///
 /// A diferencia de MP3, ADTS trae el largo EXPLÍCITO en 13 bits repartidos en los bytes 3-5.
-fn adts_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u8)> {
+fn adts_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u32)> {
     let h = bytes.get(pos..pos.checked_add(6)?)?;
     if h[0] != 0xFF || (h[1] & 0xF0) != 0xF0 {
         return None;
@@ -218,7 +278,10 @@ fn adts_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u8)> {
     if frame_length < 7 {
         return None;
     }
-    Some((frame_length, sampling_freq_index))
+    Some((
+        frame_length,
+        ADTS_SAMPLE_RATES[sampling_freq_index as usize],
+    ))
 }
 
 /// Recorre frames consecutivos desde el inicio de `bytes`, parando en `max_frames`.
@@ -230,12 +293,12 @@ pub fn walk_audio_frames(
     bytes: &[u8],
     kind: AudioStream,
     max_frames: usize,
-    expected_sample_rate: Option<u8>,
+    expected_sample_rate: Option<u32>,
 ) -> FrameChain {
     let (frame_at, header_len) = (kind.frame_at(), kind.header_len());
     let mut pos = 0usize;
     let mut frames = 0usize;
-    let mut sample_rate: Option<u8> = expected_sample_rate;
+    let mut sample_rate: Option<u32> = expected_sample_rate;
     let stop = loop {
         if frames >= max_frames {
             break ChainStop::Capped;
@@ -389,9 +452,38 @@ pub fn aac_stream_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
 const ISOBMFF_BOX_HEADER: usize = 8;
 /// Header de una caja con tamaño extendido de 64 bits (`size == 1`).
 const ISOBMFF_BOX_HEADER_LARGE: usize = 16;
-/// Cuántas cajas encadenadas alcanzan para creerle a un `ftyp`. Con 2 ya hace falta que el tamaño
-/// declarado por la primera caiga justo sobre otro header de caja válido.
+/// Cuántas cajas encadenadas alcanzan para creerle a un `ftyp`.
 pub const ISOBMFF_MIN_BOXES: usize = 2;
+/// Tamaño máximo creíble para la caja `ftyp`, que solo lleva la marca del formato y la lista de
+/// marcas compatibles: en archivos reales mide entre 16 y ~100 bytes.
+///
+/// Sale de un ataque concreto que encontró una revisión adversarial: un `ftyp` fabricado que declara
+/// 3 MB "encadena" con cualquier cosa que parezca una caja al final de ese rango, se declara
+/// contenedor confiable, y `suppress_contained` borra las fotos REALES que quedaron adentro. En la
+/// prueba desaparecían 6 JPEG sin ningún aviso.
+pub const ISOBMFF_MAX_FTYP: u64 = 1024;
+
+/// Tope de cajas a recorrer. Sin esto, un candidato falso cuyas "cajas" midan el mínimo de 8 bytes
+/// obliga a 268 millones de lecturas de 16 bytes para agotar los 2 GB de `max_size` de un MP4:
+/// medido, 8.5 segundos por candidato con solo 50 MB de cajas mínimas. Ningún archivo real anda
+/// cerca de este número (un MP4 normal tiene unas pocas cajas de nivel superior).
+pub const ISOBMFF_MAX_BOXES: usize = 4096;
+
+/// Resultado de leer el header de una caja.
+pub enum BoxLen {
+    /// La caja mide esta cantidad de bytes.
+    Bytes(u64),
+    /// `size == 0`: la caja es la última y llega HASTA EL FINAL del archivo. Es válido por norma
+    /// (ISO/IEC 14496-12) y lo escriben las cámaras y los muxers que graban a streaming, que no
+    /// pueden volver atrás a completar el tamaño.
+    ///
+    /// Tratarlo como "acá no hay caja" fue un bug REAL: el video se cortaba justo antes de sus datos
+    /// y encima salía marcado "íntegro", así que el usuario guardaba un archivo vacío creyendo que
+    /// estaba bien. Lo encontró una revisión adversarial.
+    ToEndOfFile,
+    /// Ahí no empieza una caja.
+    Invalid,
+}
 
 /// Un tipo de caja son 4 caracteres imprimibles, empezando por letra o dígito (`ftyp`, `moov`,
 /// `mdat`, `free`…). No se usa una lista cerrada a propósito: rechazar un tipo legítimo pero poco
@@ -402,80 +494,173 @@ fn is_isobmff_box_type(t: &[u8]) -> bool {
         && t.iter().all(|c| c.is_ascii_graphic() || *c == b' ')
 }
 
+/// True si la caja es la que hace utilizable al archivo: `moov` (el índice de un MP4/M4A/3GP),
+/// `moof` (fragmentado) o `meta` (HEIC). Sin ella el archivo no abre en ningún reproductor, así que
+/// no se puede afirmar que esté íntegro por más que las cajas encadenen.
+fn is_isobmff_index_box(t: &[u8]) -> bool {
+    matches!(t, b"moov" | b"moof" | b"meta")
+}
+
+/// Tipo de la caja que empieza al inicio de `bytes`, para quien lee de a un header del disco.
+pub fn isobmff_box_type_at_bytes(bytes: &[u8]) -> Option<[u8; 4]> {
+    isobmff_box_type_at(bytes, 0)
+}
+
+/// Igual que `is_isobmff_index_box`, expuesto para el recorrido en disco.
+pub fn is_isobmff_index_box_bytes(t: &[u8]) -> bool {
+    is_isobmff_index_box(t)
+}
+
+/// Tipo de la caja que empieza en `pos`, si ahí hay un header legible.
+fn isobmff_box_type_at(bytes: &[u8], pos: usize) -> Option<[u8; 4]> {
+    let h = bytes.get(pos..pos.checked_add(ISOBMFF_BOX_HEADER)?)?;
+    is_isobmff_box_type(&h[4..8]).then(|| [h[4], h[5], h[6], h[7]])
+}
+
 /// Largo de la caja que empieza al inicio de `bytes`, para quien lee de a un header por vez del
-/// disco. `None` si ahí no hay un header de caja válido (o si no alcanzan los bytes para saberlo).
-pub fn isobmff_box_len_at(bytes: &[u8]) -> Option<u64> {
+/// disco.
+pub fn isobmff_box_len_at(bytes: &[u8]) -> BoxLen {
     isobmff_box_len(bytes, 0)
 }
 
-/// Largo de la caja que empieza en `pos`. `None` si ahí no hay un header de caja válido.
-///
-/// Devuelve también cuántos bytes de header hacían falta, para poder distinguir "no hay caja" de
-/// "no alcanzan los bytes para saberlo".
-fn isobmff_box_len(bytes: &[u8], pos: usize) -> Option<u64> {
-    let h = bytes.get(pos..pos.checked_add(ISOBMFF_BOX_HEADER)?)?;
+/// Largo de la caja que empieza en `pos`.
+fn isobmff_box_len(bytes: &[u8], pos: usize) -> BoxLen {
+    let Some(end) = pos.checked_add(ISOBMFF_BOX_HEADER) else {
+        return BoxLen::Invalid;
+    };
+    let Some(h) = bytes.get(pos..end) else {
+        return BoxLen::Invalid;
+    };
     if !is_isobmff_box_type(&h[4..8]) {
-        return None;
+        return BoxLen::Invalid;
     }
     let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64;
     match size {
-        // `1` = el tamaño real viene en 64 bits justo después del tipo.
+        // El tamaño real viene en 64 bits justo después del tipo.
         1 => {
-            let h = bytes.get(pos..pos.checked_add(ISOBMFF_BOX_HEADER_LARGE)?)?;
-            let big = u64::from_be_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
-            (big >= ISOBMFF_BOX_HEADER_LARGE as u64).then_some(big)
+            let Some(end) = pos.checked_add(ISOBMFF_BOX_HEADER_LARGE) else {
+                return BoxLen::Invalid;
+            };
+            match bytes.get(pos..end) {
+                Some(h) => {
+                    let big =
+                        u64::from_be_bytes([h[8], h[9], h[10], h[11], h[12], h[13], h[14], h[15]]);
+                    if big >= ISOBMFF_BOX_HEADER_LARGE as u64 {
+                        BoxLen::Bytes(big)
+                    } else {
+                        BoxLen::Invalid
+                    }
+                }
+                None => BoxLen::Invalid,
+            }
         }
-        // `0` = la caja llega hasta el final del archivo. Es válido, pero no dice dónde termina:
-        // se trata como "no se puede afirmar el tamaño".
-        0 => None,
+        0 => BoxLen::ToEndOfFile,
         // Una caja no puede medir menos que su propio header.
-        s if s < ISOBMFF_BOX_HEADER as u64 => None,
-        s => Some(s),
+        s if s < ISOBMFF_BOX_HEADER as u64 => BoxLen::Invalid,
+        s => BoxLen::Bytes(s),
     }
 }
 
-/// Recorre cajas ISOBMFF desde el inicio de `bytes` y devuelve cuántas encadenó, hasta dónde
-/// llegó, y por qué paró (mismo criterio que la cadena de frames de audio).
-pub fn walk_isobmff_boxes(bytes: &[u8], max_boxes: usize) -> FrameChain {
+/// Resultado de recorrer las cajas de un ISOBMFF.
+pub struct BoxChain {
+    pub boxes: usize,
+    pub bytes: usize,
+    pub stop: ChainStop,
+    /// Si se vio la caja que hace utilizable al archivo (`moov`/`moof`/`meta`).
+    pub has_index: bool,
+    /// La última caja llega hasta el final del archivo (`size == 0`).
+    pub to_end_of_file: bool,
+}
+
+/// Recorre cajas ISOBMFF desde el inicio de `bytes`.
+///
+/// Dos reglas que salieron de bugs reales encontrados en revisión:
+/// - La primera caja TIENE que ser `ftyp`. Es lo que hace que el recorrido describa un archivo y no
+///   una porción cualquiera de datos.
+/// - Al toparse con OTRO `ftyp` se para: ahí empieza el archivo siguiente. Sin esto, en una tarjeta
+///   de cámara —donde los archivos van uno pegado al otro— tres videos se fusionaban en uno solo, y
+///   tres fotos HEIC se convertían en una.
+pub fn walk_isobmff_boxes(bytes: &[u8], max_boxes: usize) -> BoxChain {
     let mut pos = 0usize;
     let mut boxes = 0usize;
+    let mut has_index = false;
+    let mut to_end_of_file = false;
+
     let stop = loop {
-        if boxes >= max_boxes {
+        if boxes >= max_boxes.min(ISOBMFF_MAX_BOXES) {
             break ChainStop::Capped;
         }
         if pos.saturating_add(ISOBMFF_BOX_HEADER) > bytes.len() {
             break ChainStop::NoMoreData;
         }
-        let Some(len) = isobmff_box_len(bytes, pos) else {
-            // Puede ser que falten bytes para leer un header extendido de 64 bits, y no que la caja
-            // sea inválida: se distingue para no declarar "basura" lo que es falta de datos.
-            if pos.saturating_add(ISOBMFF_BOX_HEADER_LARGE) > bytes.len() {
+        let Some(tipo) = isobmff_box_type_at(bytes, pos) else {
+            break ChainStop::BadData;
+        };
+        if boxes == 0 && &tipo != b"ftyp" {
+            // El candidato no empieza en el inicio de un archivo.
+            break ChainStop::BadData;
+        }
+        if boxes > 0 && &tipo == b"ftyp" {
+            // Empieza el archivo siguiente: este termina acá, y termina limpio.
+            break ChainStop::BadData;
+        }
+        match isobmff_box_len(bytes, pos) {
+            BoxLen::Bytes(len) => {
+                if boxes == 0 && len > ISOBMFF_MAX_FTYP {
+                    // Un `ftyp` enorme no es un archivo: es un falso positivo que englobaría a los
+                    // archivos reales que tenga adentro.
+                    break ChainStop::BadData;
+                }
+                let Some(next) = (pos as u64).checked_add(len) else {
+                    break ChainStop::BadData;
+                };
+                if next > bytes.len() as u64 {
+                    break ChainStop::Truncated;
+                }
+                has_index |= is_isobmff_index_box(&tipo);
+                pos = next as usize;
+                boxes += 1;
+            }
+            BoxLen::ToEndOfFile => {
+                has_index |= is_isobmff_index_box(&tipo);
+                to_end_of_file = true;
+                boxes += 1;
                 break ChainStop::NoMoreData;
             }
-            break ChainStop::BadData;
-        };
-        let Some(next) = (pos as u64).checked_add(len) else {
-            break ChainStop::BadData;
-        };
-        if next > bytes.len() as u64 {
-            // La caja declara más de lo que hay acá: puede seguir más allá del buffer.
-            break ChainStop::Truncated;
+            BoxLen::Invalid => {
+                // Puede faltar el header extendido de 64 bits, no ser datos malos.
+                if pos.saturating_add(ISOBMFF_BOX_HEADER_LARGE) > bytes.len() {
+                    break ChainStop::NoMoreData;
+                }
+                break ChainStop::BadData;
+            }
         }
-        pos = next as usize;
-        boxes += 1;
     };
-    FrameChain {
-        frames: boxes,
+
+    BoxChain {
+        boxes,
         bytes: pos.min(bytes.len()),
         stop,
-        sample_rate: None,
+        has_index,
+        to_end_of_file,
     }
 }
 
 /// Tamaño real de un archivo ISOBMFF (MP4/HEIC/3GP/M4A) que empieza en el inicio de `bytes`.
+///
+/// Solo se afirma un tamaño si además de encadenar cajas se vio el índice (`moov`/`moof`/`meta`):
+/// sin él el archivo no abre, y declararlo "íntegro" le mentiría al usuario sobre un video que en
+/// realidad no sirve.
 pub fn isobmff_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
     let chain = walk_isobmff_boxes(bytes, usize::MAX);
-    if chain.frames < ISOBMFF_MIN_BOXES {
+    if chain.boxes < ISOBMFF_MIN_BOXES || !chain.has_index {
+        return None;
+    }
+    if chain.to_end_of_file {
+        // La última caja llega "hasta el final del archivo", pero en una imagen de disco no hay
+        // forma de saber dónde termina de verdad: lo que sigue puede ser el archivo siguiente. No se
+        // afirma nada — se recupera igual (queda como no verificable), sin declararlo íntegro.
+        let _ = at_source_end;
         return None;
     }
     match chain.stop {
