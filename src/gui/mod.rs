@@ -1680,8 +1680,11 @@ impl RecupeGhostApp {
         if ui.button("↩ Volver al inicio").clicked() {
             self.reset_to_start();
         }
-
-        self.ui_apoyo(ui);
+        // El bloque de apoyo al canal NO va acá: se dibuja en un panel FIJO al pie (ver `update`),
+        // porque es lo que da de comer al proyecto y no puede quedar abajo del pliegue. Metido en el
+        // scroll, cuando la pantalla final trae texto de más (recuperación cancelada, archivos
+        // truncados) o en una notebook baja, los botones de YouTube/Facebook quedaban fuera de vista
+        // con la barra de scroll semi-invisible de egui — o sea, invisibles para el usuario.
     }
 
     /// Bloque de apoyo al canal. El CLI ya lo tenía en `ui::show_goodbye()` y la GUI no lo tenía
@@ -1790,6 +1793,24 @@ impl eframe::App for RecupeGhostApp {
                 });
         }
 
+        // El apoyo al canal (YouTube/Facebook) va en un panel FIJO al pie de la pantalla final: es
+        // lo que sostiene al proyecto, así que no puede quedar abajo del pliegue ni depender de que
+        // el usuario descubra la barra de scroll (que egui desvanece). Solo en `Done`.
+        if matches!(self.phase, Phase::Done) {
+            egui::TopBottomPanel::bottom("apoyo_canal")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::GROUND)
+                        .inner_margin(egui::Margin::symmetric(14.0, 6.0)),
+                )
+                .show(ctx, |ui| {
+                    if blocked {
+                        ui.disable();
+                    }
+                    self.ui_apoyo(ui);
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if blocked {
                 ui.disable();
@@ -1798,11 +1819,14 @@ impl eframe::App for RecupeGhostApp {
             ui.heading("👻 RecupeGhost");
             ui.label("Recupera fotos, videos, audios y documentos borrados.");
             ui.separator();
+            // Barra de scroll SÓLIDA (no flotante): la flotante de egui casi no se ve, así que
+            // cuando el contenido no entra en una ventana chica el usuario no sabe que hay más
+            // abajo. Con la sólida aparece un canal claro apenas hay desborde (y nada cuando entra
+            // todo), que es lo que hace descubrible el botón "Volver al inicio" / "Continuar".
+            ui.style_mut().spacing.scroll.floating = false;
             // El contenido va dentro de un área con scroll. Sin esto, en una ventana chica (una
-            // notebook de 768 px de alto, o alguien que achica la ventana) el contenido se corta
-            // SIN barra de desplazamiento: se vio en la pantalla final, donde los enlaces al canal
-            // quedaban fuera de vista. En un paso del asistente eso deja al usuario sin poder
-            // llegar al botón "Continuar", o sea trabado sin forma de saber por qué.
+            // notebook de 768 px de alto, o alguien que achica la ventana) el contenido se corta:
+            // en un paso del asistente eso deja al usuario sin poder llegar al botón "Continuar".
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.phase {
