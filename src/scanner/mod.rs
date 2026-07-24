@@ -1185,6 +1185,16 @@ fn zip_ooxml_size(buf: &[u8], start: usize, search_limit: usize) -> Option<usize
 /// falso positivo carveado a `max_size` (que englobaría archivos reales que vengan después) tiene
 /// `footer_found=false`, así que NO cuenta como contenedor y NUNCA borra a los reales de adentro
 /// —esos los filtra después el criterio de integridad al recuperar—.
+/// True si el FINAL de esta firma se detecta por una validación ESTRUCTURAL (no por matchear un
+/// footer de pocos bytes). Solo estos pueden suprimir archivos que tienen su propio final —ver
+/// `suppress_contained`.
+fn es_contenedor_fuerte(sig: &FileSignature) -> bool {
+    signature_is_zip_ooxml(sig)          // EOCD del ZIP/OOXML
+        || sig.is_isobmff()              // cadena de cajas MP4/HEIC/3GP/M4A
+        || sig.audio_stream().is_some()  // cadena de frames MP3/AAC
+        || sig.size_from_header.is_some() // tamaño en el header (BMP)
+}
+
 fn suppress_contained(found_files: &mut Vec<FoundFile>) {
     if found_files.len() < 2 {
         return;
@@ -1200,19 +1210,35 @@ fn suppress_contained(found_files: &mut Vec<FoundFile>) {
     });
 
     let mut drop_flags = vec![false; found_files.len()];
-    // `container_end` = fin máximo de un contenedor confiable visto hasta ahora. Por el orden, ese
-    // contenedor arranca en o antes del archivo actual; si además su fin llega hasta el fin del
-    // actual, el actual está enteramente contenido → se descarta.
-    let mut container_end: u64 = 0;
+    // Se distinguen dos clases de contenedor porque su final es de fiar en grados MUY distintos:
+    //
+    // - FUERTE: el final salió de una validación ESTRUCTURAL — el EOCD de un ZIP/OOXML, la cadena de
+    //   cajas de un ISOBMFF, la cadena de frames de un audio, o el tamaño en el header (BMP). Estos
+    //   casi no dan falsos positivos, así que suprimen TODO lo que engloban (incluidos archivos con
+    //   su propio footer: una miniatura real dentro de un video, una imagen dentro de un ZIP).
+    //
+    // - DÉBIL: el final salió de matchear un footer de pocos bytes (JPEG `FF D9`, GIF `00 3B`), que
+    //   aparece por azar ~16 veces por MB en datos cualquiera. Un contenedor así NO puede suprimir a
+    //   un archivo que tiene su PROPIO final detectado — porque casi siempre significa que ESE
+    //   contenedor agarró un footer espurio dentro de los datos del archivo de al lado. Caso medido:
+    //   una foto truncada se tragaba las DOS fotos reales que venían detrás. Sí suprime lo que no
+    //   tiene final propio (frames internos, miniaturas carveadas a max_size).
+    let mut strong_end: u64 = 0;
+    let mut any_end: u64 = 0;
     for &i in &order {
         let f = &found_files[i];
         let f_end = f.offset.saturating_add(f.size);
-        if f_end <= container_end {
+        let contenido_fuerte = f_end <= strong_end;
+        let contenido_debil = f_end <= any_end && !f.footer_found;
+        if contenido_fuerte || contenido_debil {
             drop_flags[i] = true;
             continue;
         }
         if f.footer_found {
-            container_end = container_end.max(f_end);
+            any_end = any_end.max(f_end);
+            if es_contenedor_fuerte(&f.signature) {
+                strong_end = strong_end.max(f_end);
+            }
         }
     }
 
@@ -2175,11 +2201,23 @@ mod tests {
             end_unknown: false,
         };
 
-        // Dentro de un contenedor CONFIABLE (footer hallado) → se suprime lo de adentro; lo de
-        // afuera se conserva.
+        // Dentro de un contenedor FUERTE (final estructural: EOCD, ISOBMFF, audio, tamaño en header)
+        // → se suprime lo de adentro aunque tenga su propio footer; lo de afuera se conserva.
+        let zip = all_signatures()
+            .into_iter()
+            .find(|s| s.extension == "docx")
+            .unwrap();
+        let fz = |offset: u64, size: u64, footer_found: bool, index: usize| FoundFile {
+            signature: zip.clone(),
+            offset,
+            size,
+            index,
+            footer_found,
+            end_unknown: false,
+        };
         let mut v = vec![
-            ff(0, 1000, true, 1),   // contenedor intacto
-            ff(100, 200, true, 2),  // miniatura embebida (dentro)
+            fz(0, 1000, true, 1),   // contenedor ZIP/OOXML (final estructural = fuerte)
+            ff(100, 200, true, 2),  // imagen embebida (dentro), con su propio footer
             ff(5000, 300, true, 3), // archivo aparte (no contenido)
         ];
         suppress_contained(&mut v);
@@ -2187,7 +2225,22 @@ mod tests {
         assert_eq!(
             offsets,
             vec![0, 5000],
-            "solo la miniatura embebida debe irse"
+            "un contenedor fuerte suprime lo embebido, incluso con footer propio"
+        );
+
+        // REGRESIÓN (ronda 3): un contenedor DÉBIL (footer de 2 bytes, JPEG) NO puede suprimir a un
+        // archivo con su propio final. Una foto truncada agarraba un `FF D9` espurio dentro de los
+        // datos de la de al lado y se tragaba las fotos reales que venían detrás.
+        let mut v_debil = vec![
+            ff(0, 100_000, true, 1),    // "foto" con footer espurio lejano (débil)
+            ff(10_000, 5_000, true, 2), // FOTO REAL adentro, con su propio footer
+            ff(50_000, 5_000, true, 3), // otra FOTO REAL adentro
+        ];
+        suppress_contained(&mut v_debil);
+        assert_eq!(
+            v_debil.len(),
+            3,
+            "un contenedor de footer débil no puede borrar fotos reales que englobó"
         );
 
         // Dentro de un FALSO POSITIVO carveado a max_size (footer_found=false) → NO se suprime al
@@ -2340,6 +2393,21 @@ mod tests {
         assert_eq!(found.len(), 1, "un solo docx");
         assert_eq!(found[0].signature.extension, "docx");
         assert_eq!(found[0].size, docx.len() as u64);
+    }
+
+    #[test]
+    fn test_ooxml_libreoffice_calc_workbook_rels_first_detected() {
+        // REGRESIÓN (ronda 3): LibreOffice CALC abre el zip con `xl/_rels/workbook.xml.rels`, no con
+        // `[Content_Types].xml` ni `_rels/.rels`. El filtro de nombres exactos perdía ENTERO ese
+        // xlsx —ni como dañado—, una feature recién lanzada. Verificado con un xlsx real de Calc.
+        let xlsx = build_ooxml("xl/_rels/workbook.xml.rels", "xl/workbook.xml");
+        let mut img = vec![0xAA; 4096];
+        img.extend_from_slice(&xlsx);
+        img.extend_from_slice(&[0xAA; 4096]);
+        let found = scan_bytes_as_docs(&img);
+        assert_eq!(found.len(), 1, "un solo xlsx");
+        assert_eq!(found[0].signature.extension, "xlsx");
+        assert_eq!(found[0].size, xlsx.len() as u64);
     }
 
     #[test]

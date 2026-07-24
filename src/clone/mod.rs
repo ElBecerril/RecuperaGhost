@@ -199,6 +199,19 @@ fn clone_to_image_impl(
             );
         }
     }
+    // PROTECCIÓN DE DATOS: destino == origen destruiría el origen. `File::create` trunca el destino
+    // ANTES de leer, así que si es el mismo archivo, el origen se vacía y la "copia" queda llena de
+    // ceros — reportando éxito. La barrera de mismo-disco no cubre este caso: cuando el origen es un
+    // `.img` (re-clonar una copia), `same_device_risk` devuelve `None` porque no es un dispositivo
+    // físico. Se comparan las rutas canónicas; para el destino, que aún no existe, se canoniza el
+    // directorio padre y se le agrega el nombre.
+    if es_el_mismo_archivo(source_path, output_path) {
+        anyhow::bail!(
+            "El destino y el origen son el mismo archivo. La copia tiene que ir a otro lado, \
+             o se borraría lo que estás intentando salvar. Elige otra ruta para la copia."
+        );
+    }
+
     let mut dst = File::create(output_path)
         .with_context(|| format!("No se pudo crear la imagen: {}", output_path.display()))?;
 
@@ -373,6 +386,27 @@ fn copy_block(
 /// Lee de `src` hacia `buf` reintentando en short reads hasta llenar `buf` o llegar a EOF real
 /// (`read` == 0). Devuelve la cantidad de bytes leídos. Propaga el primer error de lectura real
 /// (sector dañado): eso es lo que dispara el modo refinamiento en `copy_block`.
+/// True si `origen` y `destino` resuelven al mismo archivo del disco.
+///
+/// El origen existe (ya se abrió), así que se canoniza directo. El destino todavía no existe, así
+/// que se canoniza su directorio padre y se le pega el nombre — comparar las rutas crudas no
+/// alcanza (`./copia.img` vs `/ruta/copia.img` son la misma). Si algo no se puede canonizar (padre
+/// inexistente, etc.), se cae a comparar las rutas tal cual: nunca un falso "son distintos" que
+/// deje pasar el truncado.
+fn es_el_mismo_archivo(origen: &Path, destino: &Path) -> bool {
+    let can_origen = std::fs::canonicalize(origen).ok();
+    let can_destino = match (destino.parent(), destino.file_name()) {
+        (Some(padre), Some(nombre)) => std::fs::canonicalize(padre).ok().map(|p| p.join(nombre)),
+        // Sin padre/nombre (ruta rara): se canoniza el destino entero si existe.
+        _ => std::fs::canonicalize(destino).ok(),
+    };
+    match (can_origen, can_destino) {
+        (Some(a), Some(b)) => a == b,
+        // No se pudo canonizar alguno: comparación cruda como red de seguridad.
+        _ => origen == destino,
+    }
+}
+
 fn read_filling(src: &mut File, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -518,6 +552,34 @@ mod tests {
             std::fs::read(&target).unwrap(),
             b"contenido previo",
             "no se debe haber escrito a través del symlink"
+        );
+    }
+
+    /// PROTECCIÓN DE DATOS: clonar un archivo SOBRE SÍ MISMO lo destruiría (`File::create` trunca
+    /// antes de leer), y la barrera de mismo-disco no lo cubre porque un `.img` no es un dispositivo
+    /// físico. Es pérdida total de la única copia del disco que se está rescatando.
+    #[test]
+    fn test_clone_rechaza_destino_igual_al_origen() {
+        let dir = tempfile::tempdir().unwrap();
+        let archivo = dir.path().join("copia.img");
+        std::fs::write(&archivo, vec![0x42u8; 4096]).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let progress = AtomicU64::new(0);
+
+        // Mismo archivo, y también la forma no-canónica de nombrarlo (debe frenar igual).
+        for destino in [archivo.clone(), dir.path().join(".").join("copia.img")] {
+            let res = clone_to_image_impl(&archivo, &destino, &cancel, &progress, false);
+            assert!(
+                res.is_err(),
+                "destino == origen debe rechazarse ({destino:?})"
+            );
+        }
+        // Y el origen quedó intacto, no truncado a ceros.
+        assert_eq!(
+            std::fs::read(&archivo).unwrap(),
+            vec![0x42u8; 4096],
+            "el origen no se debe haber tocado"
         );
     }
 }

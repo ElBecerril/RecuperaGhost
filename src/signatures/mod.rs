@@ -921,10 +921,26 @@ fn ooxml_local_name_is_start(bytes: &[u8]) -> bool {
         return false;
     }
     let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
-    match bytes.get(30..30 + name_len) {
-        Some(name) => name == b"[Content_Types].xml" || name == b"_rels/.rels",
-        None => false,
-    }
+    let Some(name) = bytes.get(30..30 + name_len) else {
+        return false;
+    };
+    // MS Office abre con `[Content_Types].xml`; LibreOffice Writer con `_rels/.rels`. Pero
+    // LibreOffice Calc abre con `xl/_rels/workbook.xml.rels` e Impress con `ppt/...`, así que un
+    // filtro de nombres exactos perdía ENTEROS los .xlsx/.pptx hechos con LibreOffice (medido: un
+    // xlsx real de Calc no se recuperaba, ni como dañado). Se aceptan también los prefijos de las
+    // carpetas de partes de un OOXML — el EOCD (paso 2) sigue siendo el filtro fuerte: en una
+    // entrada interna la ecuación no cierra, así que un prefijo de más solo cuesta un chequeo, no
+    // un falso positivo.
+    const INICIOS: &[&[u8]] = &[
+        b"[Content_Types].xml",
+        b"_rels/",
+        b"word/",
+        b"xl/",
+        b"ppt/",
+        b"docProps/",
+        b"customXml/",
+    ];
+    INICIOS.iter().any(|p| name.starts_with(p))
 }
 
 /// True si `bytes` (que arranca en un header local de zip) es el INICIO de un OOXML cuya parte
