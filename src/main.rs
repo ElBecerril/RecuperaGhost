@@ -114,11 +114,12 @@ impl CliArgs {
             || self.audio
             || self.documentos
             || self.output.is_some()
-            || self.acepto_el_riesgo;
+            || self.acepto_el_riesgo
+            || self.incluir_danados;
         if self.source.is_none() && has_flags {
             eprintln!(
                 "{}",
-                "  ❌ Error: debes especificar una ruta de origen cuando usas --fotos, --videos, --audio, --documentos u -o."
+                "  ❌ Error: debes especificar una ruta de origen cuando usas --fotos, --videos, --audio, --documentos, -o o --incluir-danados."
                     .bright_red()
             );
             eprintln!(
@@ -282,7 +283,9 @@ fn main() -> Result<()> {
         );
         println!();
 
+        let mut scan_failed = false;
         if let Err(e) = run_scan(config, true, incluir_danados) {
+            scan_failed = true;
             eprintln!("{}", format!("  ❌ Error: {}", e).bright_red());
             if let Some(hint) = util::friendly_error_hint(&e) {
                 eprintln!("{}", hint.bright_yellow());
@@ -302,6 +305,12 @@ fn main() -> Result<()> {
         // Un cron/script sin TTY nunca debe quedar colgado esperando ENTER.
         if is_tty {
             wait_for_keypress();
+        }
+        // Un script/cron (el público del modo batch) necesita poder distinguir éxito de
+        // fracaso por el exit code; los demás caminos de error del archivo ya usan
+        // `process::exit(1)`, este lo hacía implícitamente 0 al llegar al final de `main`.
+        if scan_failed {
+            process::exit(1);
         }
     } else {
         // Sin source y sin TTY de ENTRADA (script/cron que olvidó pasar argumentos,

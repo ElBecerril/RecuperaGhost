@@ -706,8 +706,21 @@ fn same_device_risk(
             Err(_) => output_dir.to_path_buf(),
         }
     };
-    let candidate_str = candidate.to_string_lossy().replace('\\', "/");
 
+    evaluate_same_device_risk(&src_str, &mounts, &candidate)
+}
+
+/// Núcleo PURO de la decisión de riesgo: recibe el origen, los mounts ya resueltos del disco
+/// origen y el destino candidato (ambos ya calculados por `same_device_risk`), y decide
+/// Same/Unconfirmed/None. No toca `drives::list_drives()` (no determinista) — solo hace
+/// comparación de strings y, en Unix, `std::fs::metadata` best-effort sobre las rutas que
+/// recibe. Separado de `same_device_risk` únicamente para poder testear la decisión con mounts
+/// fabricados a mano; el comportamiento es idéntico al que tenía inline.
+fn evaluate_same_device_risk(
+    src_str: &str,
+    mounts: &[String],
+    candidate: &std::path::Path,
+) -> Option<SameDeviceRisk> {
     // Bug #4: si no pudimos determinar ningún mountpoint/letra del disco de
     // origen (ya sea porque el disco no aparece en `list_drives()` o porque
     // no tiene ninguna partición montada detectada), no hay forma segura de
@@ -719,7 +732,9 @@ fn same_device_risk(
         return Some(SameDeviceRisk::Unconfirmed(src_str.to_string()));
     }
 
-    for mount in &mounts {
+    let candidate_str = candidate.to_string_lossy().replace('\\', "/");
+
+    for mount in mounts {
         let mount_path = PathBuf::from(mount);
         let mount_str = mount_path.to_string_lossy().replace('\\', "/");
         let mount_prefix = mount_str.trim_end_matches('/');
@@ -772,9 +787,10 @@ fn same_device_risk(
                 }
             }
 
-            if let (Some(out_dev), Some(mount_dev)) =
-                (dev_id_of(candidate.clone()), dev_id_of(mount_path.clone()))
-            {
+            if let (Some(out_dev), Some(mount_dev)) = (
+                dev_id_of(candidate.to_path_buf()),
+                dev_id_of(mount_path.clone()),
+            ) {
                 same = out_dev == mount_dev;
             }
         }
@@ -1500,5 +1516,100 @@ mod tests {
             Path::new("/home/usuario/recuperados")
         )
         .is_none());
+    }
+
+    // --- evaluate_same_device_risk (núcleo puro de same_device_risk) ---
+
+    /// Bug F (fail-open): si no se pudo determinar NINGÚN mount del disco origen, el fail-safe
+    /// tiene que advertir (Unconfirmed), no devolver None. Es la red que protege discos
+    /// fallando con particiones sin montar.
+    #[test]
+    fn test_evaluate_same_device_risk_empty_mounts_is_unconfirmed() {
+        let result =
+            evaluate_same_device_risk("/dev/sdz", &[], std::path::Path::new("/cualquier/salida"));
+        match result {
+            Some(SameDeviceRisk::Unconfirmed(src)) => assert_eq!(src, "/dev/sdz"),
+            other => panic!("esperaba Unconfirmed, salió {:?}", other.is_some()),
+        }
+    }
+
+    /// Bug H (prefijo de mount): el destino cae DENTRO del mount del origen
+    /// (`/mnt/usb/salida` bajo `/mnt/usb`) → debe detectarse Same vía el chequeo de prefijo.
+    /// Se usan rutas relativas inexistentes para que el fallback de device-id de Unix (que
+    /// también correría en este repo) no pueda confirmar nada por su cuenta y la detección
+    /// dependa EXCLUSIVAMENTE del chequeo de prefijo bajo prueba.
+    #[test]
+    fn test_evaluate_same_device_risk_mount_prefix_match_is_same() {
+        let mounts = vec!["recupeghost_test_mount_no_existe".to_string()];
+        let candidate = std::path::Path::new("recupeghost_test_mount_no_existe/salida");
+        let result = evaluate_same_device_risk("/dev/sdz", &mounts, candidate);
+        match result {
+            Some(SameDeviceRisk::Same(mount)) => {
+                assert_eq!(mount, "recupeghost_test_mount_no_existe")
+            }
+            other => panic!("esperaba Same, salió {:?}", other.is_some()),
+        }
+    }
+
+    /// Bug I (device-id Unix): dos rutas SIN relación de prefijo (no matchean por string) pero
+    /// que viven en el mismo dispositivo real deben detectarse Same vía `st_dev`. Es la red que
+    /// atrapa mounts con distinto texto (bind mounts, symlinks, letras vs. rutas UNC) que
+    /// terminan siendo el mismo disco físico.
+    #[test]
+    #[cfg(unix)]
+    fn test_evaluate_same_device_risk_same_device_id_is_same() {
+        let base = std::env::temp_dir();
+        let dir_a = tempfile::tempdir_in(&base).expect("crear dir_a en /tmp");
+        let dir_b = tempfile::tempdir_in(&base).expect("crear dir_b en /tmp");
+
+        // Ni uno es prefijo del otro (son hermanos bajo /tmp), así que sin el chequeo de
+        // device-id no hay forma de que matcheen por string.
+        let mount = dir_a.path().to_string_lossy().to_string();
+        let mounts = vec![mount.clone()];
+        let result = evaluate_same_device_risk("/dev/sdz", &mounts, dir_b.path());
+
+        match result {
+            Some(SameDeviceRisk::Same(m)) => assert_eq!(m, mount),
+            other => panic!(
+                "esperaba Same (mismo device-id), salió {:?}",
+                other.is_some()
+            ),
+        }
+    }
+
+    /// Inverso del anterior: dos rutas reales sin relación de prefijo Y en dispositivos
+    /// DISTINTOS (`/tmp` vs `/dev/shm`, normalmente tmpfs separados) no deben dar Same — para
+    /// no crear un falso positivo cuando el device-id sí puede resolverse y de verdad difiere.
+    #[test]
+    #[cfg(unix)]
+    fn test_evaluate_same_device_risk_different_device_id_is_none() {
+        let dir_tmp = tempfile::tempdir_in(std::env::temp_dir()).expect("crear dir en /tmp");
+        let shm = std::path::Path::new("/dev/shm");
+        if !shm.exists() {
+            // Sin /dev/shm en este entorno no podemos garantizar dos devices distintos: no
+            // hay nada seguro que afirmar, así que salteamos en vez de dar un falso resultado.
+            return;
+        }
+        let dir_shm = match tempfile::tempdir_in(shm) {
+            Ok(d) => d,
+            Err(_) => return, // sin permiso de escritura en /dev/shm, no hay caso que probar
+        };
+
+        // Si por algún motivo este entorno tiene /tmp y /dev/shm en el mismo device, el test
+        // no es significativo: lo saltamos en vez de afirmar un falso None.
+        use std::os::unix::fs::MetadataExt;
+        let dev_tmp = std::fs::metadata(dir_tmp.path()).unwrap().dev();
+        let dev_shm = std::fs::metadata(dir_shm.path()).unwrap().dev();
+        if dev_tmp == dev_shm {
+            return;
+        }
+
+        let mount = dir_tmp.path().to_string_lossy().to_string();
+        let mounts = vec![mount];
+        let result = evaluate_same_device_risk("/dev/sdz", &mounts, dir_shm.path());
+        assert!(
+            result.is_none(),
+            "esperaba None, discos claramente distintos"
+        );
     }
 }

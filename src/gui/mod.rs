@@ -1266,7 +1266,10 @@ impl RecupeGhostApp {
                 res.found_files
                     .iter()
                     .take(500)
-                    .map(|f| (f.integrity(), f.friendly_summary()))
+                    // `friendly_summary()` puede traer `⚠️` (U+FE0F) para el "posiblemente
+                    // dañado"; Atkinson no lo tiene y egui lo dibuja como tofu. El mensaje se
+                    // comparte con el CLI (donde sí se ve bien), así que solo se saca acá.
+                    .map(|f| (f.integrity(), f.friendly_summary().replace('\u{fe0f}', "")))
                     .collect(),
             ),
             None => return,
@@ -1371,9 +1374,13 @@ impl RecupeGhostApp {
             if ui.add(theme::primary_button("💾  Recuperar")).clicked() {
                 self.start_recovery();
             }
+            // OJO: a diferencia de otros "↩ Volver" de la app, este NO limpia `scan_result`. Un
+            // escaneo puede haber tardado horas sobre un disco que está muriendo — descartarlo en
+            // silencio para "solo cambiar algo" obligaría a re-escanear todo. `ui_step_source`
+            // muestra "Volver a los resultados" (`ui_volver_a_resultados`) mientras `scan_result`
+            // siga vivo, así que el usuario puede corregir y volver sin perder nada.
             if ui.button("↩ Volver").clicked() {
                 self.phase = Phase::Setup(Step::Source);
-                self.scan_result = None;
             }
         });
         ui.label(
@@ -1599,7 +1606,10 @@ impl RecupeGhostApp {
     fn ui_done(&mut self, ui: &mut egui::Ui) {
         let (summary, recovered, incomplete, cancelled, out) = match self.recovery_result.as_ref() {
             Some(r) => (
-                r.summary(),
+                // `summary()` puede traer `⏹️`/`⚠️` con selector de variación (U+FE0F); Atkinson
+                // no lo tiene y egui lo dibuja como tofu. Se saca solo para este display — el
+                // mensaje se comparte con el CLI, donde en terminal se ve bien.
+                r.summary().replace('\u{fe0f}', ""),
                 r.recovered,
                 r.truncated + r.failed,
                 r.cancelled,
@@ -1722,7 +1732,9 @@ impl RecupeGhostApp {
         // "Acceso denegado. (os error 5)" es el final del intento, cuando la solución era abrir el
         // programa como administrador. El texto técnico queda abajo, para quien vaya a pedir ayuda.
         if let Some(hint) = self.error_hint {
-            ui.label(egui::RichText::new(hint.trim()).strong());
+            // `friendly_error_hint` puede traer `⏱️` con selector de variación (U+FE0F); Atkinson
+            // no lo tiene y egui lo dibuja como tofu. Se saca solo para este display.
+            ui.label(egui::RichText::new(hint.trim().replace('\u{fe0f}', "")).strong());
             ui.add_space(8.0);
             ui.label("Tus archivos siguen donde estaban: esto no borró nada.");
             ui.add_space(10.0);
@@ -2345,6 +2357,65 @@ mod tests {
             a.pending_warning.as_ref().map(|(m, ..)| m.as_str()),
             Some("aviso"),
             "la decision sigue pendiente"
+        );
+    }
+
+    /// El test anterior solo cubre el guard de `pending_warning` YA seteado. Lo que falta es el
+    /// CABLEADO: que `start_scan` de verdad LLAME a `blocked_by_same_device` cuando todavia no hay
+    /// ninguna advertencia en pantalla. Sin este test, borrar esa llamada (mutacion M6) deja los 13
+    /// tests anteriores en verde — la barrera de proteccion de datos quedaria desconectada de la
+    /// ruta real que la dispara.
+    #[test]
+    fn test_start_scan_dispara_la_barrera_de_mismo_disco_cuando_no_hay_aviso_previo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = RecupeGhostApp::with_drives(Vec::new(), None);
+        a.manual_path = "/dev/sdzzz_inexistente".to_string();
+        a.output_dir = dir.path().display().to_string();
+
+        a.start_scan();
+
+        assert!(
+            a.pending_warning.is_some(),
+            "ante un disco fisico cuyos montajes no se pueden confirmar, tiene que quedar la \
+             advertencia en pantalla"
+        );
+        assert!(
+            a.scan_rx.is_none(),
+            "no debe haber arrancado ningun hilo de escaneo"
+        );
+    }
+
+    /// Mismo razonamiento que el test anterior, pero para `start_recovery`: es la ruta que
+    /// ESCRIBE bytes, asi que es la que mas importa frenar. Sin este test, borrar la llamada a
+    /// `blocked_by_same_device` en `start_recovery` (mutacion M5) deja los tests en verde.
+    #[test]
+    fn test_start_recovery_dispara_la_barrera_de_mismo_disco_cuando_no_hay_aviso_previo() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = RecupeGhostApp::with_drives(Vec::new(), None);
+        a.manual_path = "/dev/sdzzz_inexistente".to_string();
+        a.source = Some(PathBuf::from("/dev/sdzzz_inexistente"));
+        a.output_dir = dir.path().display().to_string();
+        a.scan_result = Some(ScanResult {
+            found_files: Vec::new(),
+            bytes_scanned: 1024,
+            photos_count: 0,
+            videos_count: 0,
+            audios_count: 0,
+            documents_count: 0,
+            had_errors: false,
+            cancelled: false,
+        });
+
+        a.start_recovery();
+
+        assert!(
+            a.pending_warning.is_some(),
+            "ante un disco fisico cuyos montajes no se pueden confirmar, tiene que quedar la \
+             advertencia en pantalla"
+        );
+        assert!(
+            a.recovery_rx.is_none(),
+            "no debe haber arrancado ningun hilo de recuperacion"
         );
     }
 
