@@ -192,7 +192,7 @@ src/
 cargo test
 ```
 
-81 tests automatizados (97 compilando tambien la GUI, con `--features gui`):
+90 tests automatizados (106 compilando tambien la GUI, con `--features gui`):
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
