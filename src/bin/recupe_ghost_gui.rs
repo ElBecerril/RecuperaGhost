@@ -35,8 +35,8 @@ fn main() {
             .set_description(format!(
                 "No se pudo iniciar la parte gráfica del programa.\n\nCasi siempre es porque este \
                  equipo no tiene drivers de tarjeta de video actualizados (pasa en máquinas \
-                 virtuales, escritorio remoto o computadoras viejas). Probá actualizar Windows y \
-                 los drivers de video, y volvé a intentar.\n\nMientras tanto podés usar la versión \
+                 virtuales, escritorio remoto o computadoras viejas). Prueba actualizar Windows y \
+                 los drivers de video, y vuelve a intentar.\n\nMientras tanto puedes usar la versión \
                  de línea de comandos (recupe_ghost.exe), que hace lo mismo sin necesitar video.\n\n\
                  Detalle técnico (por si pedís ayuda):\n{e}"
             ))
@@ -87,9 +87,9 @@ fn instalar_manejador_de_crash_nativo() {
                 .set_title("RecupeGhost: falló la parte gráfica")
                 .set_description(
                     "La parte gráfica de RecupeGhost se cerró por un problema con el driver de \
-                     video de este equipo. Es un fallo del driver, no de tus archivos.\n\nProbá \
-                     esto:\n1) Actualizá el driver de tu tarjeta o chip de video (Windows Update, \
-                     o la página del fabricante).\n2) Si sigue igual, usá la versión de línea de \
+                     video de este equipo. Es un fallo del driver, no de tus archivos.\n\nPrueba \
+                     esto:\n1) Actualiza el driver de tu tarjeta o chip de video (Windows Update, \
+                     o la página del fabricante).\n2) Si sigue igual, usa la versión de línea de \
                      comandos (recupe_ghost.exe): hace lo mismo sin usar la parte gráfica.\n\nLo \
                      que ya se haya guardado en la carpeta de destino sigue ahí. El disco que \
                      estabas revisando no se modificó, salvo que hayas elegido guardar en ese \
@@ -145,8 +145,8 @@ fn instalar_aviso_de_panico() {
             .set_description(format!(
                 "El programa se cerró por un error interno.\n\nLo que ya se haya guardado en la \
                  carpeta de destino sigue ahí y se puede abrir. El disco que estabas revisando no \
-                 se modificó, salvo que hayas elegido guardar en ese mismo disco.\n\nSi podés, \
-                 mandanos este detalle:\n\n{detalle}"
+                 se modificó, salvo que hayas elegido guardar en ese mismo disco.\n\nSi puedes, \
+                 mándanos este detalle:\n\n{detalle}"
             ))
             .show();
     }));

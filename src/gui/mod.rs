@@ -366,6 +366,10 @@ impl RecupeGhostApp {
     /// Estaba duplicado en las dos pantallas finales (Done y CloneDone) con el mismo contenido.
     fn reset_to_start(&mut self) {
         self.manual_path.clear();
+        // También se suelta la aceptación del riesgo de mismo-disco: al usuario "volver al inicio"
+        // le suena a empezar de cero, y una decisión de proteccion de datos no puede sobrevivir en
+        // silencio a ese botón. Si vuelve a elegir la misma pareja, se le vuelve a preguntar.
+        self.same_device_accepted = None;
         self.scan_result = None;
         self.recovery_result = None;
         self.clone_result = None;
@@ -864,7 +868,6 @@ impl RecupeGhostApp {
 
     fn ui_step_source(&mut self, ui: &mut egui::Ui) {
         self.ui_volver_a_resultados(ui);
-        self.ui_update_banner(ui);
         theme::section_title(ui, "¿Dónde estaban tus archivos?");
         ui.label(
             egui::RichText::new("Elige el disco o la memoria que quieres revisar.")
@@ -899,6 +902,12 @@ impl RecupeGhostApp {
                     }
                 }
             });
+
+        // El aviso de versión nueva va al PIE del paso, no arriba: llega cuando contesta la red
+        // (medio segundo o dos después de abrir), o sea con la persona ya mirando la lista de
+        // discos. Puesto arriba, empujaba la lista hacia abajo justo cuando se iba a hacer clic y
+        // el clic caía en otro disco — y esta es la pantalla que decide QUÉ se escanea.
+        self.ui_update_banner(ui);
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1908,12 +1917,6 @@ impl RecupeGhostApp {
     }
 }
 
-/// Etiqueta de un disco para la lista de elección.
-///
-/// `display_name` ya viene armado por `drives` con lo que le sirve al usuario (en Windows arranca
-/// con la letra de unidad: `D: - Kingston DataTraveler (14.5 GB)`). Acá solo se le agrega la marca
-/// de extraíble, que es el dato que de verdad ayuda a reconocer "este es mi USB". La ruta cruda
-/// del dispositivo queda en el tooltip: no le dice nada al público objetivo y encima asusta.
 /// Lanza el chequeo de versión nueva en un hilo aparte y devuelve el canal por donde contesta.
 ///
 /// Va en un hilo porque hace I/O de red (con timeouts de 5 s de conexión y 8 s de lectura): hacerlo
@@ -1934,6 +1937,12 @@ fn spawn_update_check(ctx: egui::Context) -> Receiver<Option<UpdateInfo>> {
     rx
 }
 
+/// Etiqueta de un disco para la lista de elección.
+///
+/// `display_name` ya viene armado por `drives` con lo que le sirve al usuario (en Windows arranca
+/// con la letra de unidad: `D: - Kingston DataTraveler (14.5 GB)`). Acá solo se le agrega la marca
+/// de extraíble, que es el dato que de verdad ayuda a reconocer "este es mi USB". La ruta cruda
+/// del dispositivo queda en el tooltip: no le dice nada al público objetivo y encima asusta.
 fn drive_label(d: &DriveInfo) -> String {
     if d.is_removable {
         format!("{}  ·  Extraíble", d.display_name)
@@ -2342,8 +2351,10 @@ mod tests {
         assert_eq!(Step::Types.prev(), Some(Step::Source));
         assert_eq!(Step::Summary.prev(), Some(Step::Output));
 
-        for (i, s) in Step::ALL.iter().enumerate() {
-            assert_eq!(s.index(), i);
+        // Ojo: `index()` está implementado como `position()` sobre `ALL`, así que compararlo con
+        // el índice del recorrido no puede fallar nunca. Lo que sí vale la pena fijar es que cada
+        // paso tenga una etiqueta para mostrar.
+        for s in Step::ALL.iter() {
             assert!(!s.label().is_empty());
         }
     }
