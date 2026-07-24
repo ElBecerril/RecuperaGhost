@@ -192,7 +192,7 @@ src/
 cargo test
 ```
 
-73 tests automatizados (86 compilando tambien la GUI, con `--features gui`):
+81 tests automatizados (97 compilando tambien la GUI, con `--features gui`):
 - Deteccion de las 10 firmas principales
 - Desambiguacion RIFF (WebP vs AVI vs WAV)
 - Desambiguacion OGG Vorbis vs OPUS
@@ -216,6 +216,12 @@ cargo test
 - Los frames internos de un MP3 no salen como archivos sueltos
 - Un audio que ocupa todo el origen no queda marcado como danado
 - Validador BMP estructural (encabezado DIB, planos, bits por pixel, coherencia de tamano)
+- MP3 de MPEG-2 y MPEG-2.5 (22050, 11025 Hz y demas): tablas y formula de largo por version
+- Archivos ISOBMFF contiguos (una tarjeta de camara) no se fusionan en uno solo
+- Una caja "hasta el fin del archivo" (mdat de tamano 0) no se declara integra a medias
+- Un ftyp inventado no puede englobar y borrar las fotos reales que tenga adentro
+- Un audio cortado al final se recupera entero, marcado como no verificable
+- Las dos pasadas de refinamiento respetan la cancelacion
 - Parseo de versiones y comparacion (aviso de nuevas versiones)
 - Deteccion del disco de sistema (Windows C: / raiz Unix) para avisos de UI
 - Cancelacion cooperativa del escaneo (corta antes de leer y conserva lo hallado)
