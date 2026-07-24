@@ -80,12 +80,26 @@ jobs:
       - name: Tests de la GUI
         run: cargo test --release --locked --features gui --target x86_64-pc-windows-gnu
 
-      - name: Renombrar binario
-        shell: bash
-        run: cp target/x86_64-pc-windows-gnu/release/recupe_ghost_gui.exe recupe_ghost_gui.exe
+      # El CLI tambien, como artefacto: es la unica forma de probar en Windows real el escaneo de
+      # un DISCO FISICO crudo (alineacion a 512 bytes), que no se puede verificar en Linux ni con
+      # una imagen .img. Comparte la compilacion con el paso anterior, asi que cuesta poco.
+      - name: Compilar el CLI
+        run: cargo build --release --locked --bin recupe_ghost --target x86_64-pc-windows-gnu
 
-      - name: Subir artefacto descargable
+      - name: Renombrar binarios
+        shell: bash
+        run: |
+          cp target/x86_64-pc-windows-gnu/release/recupe_ghost_gui.exe recupe_ghost_gui.exe
+          cp target/x86_64-pc-windows-gnu/release/recupe_ghost.exe recupe_ghost.exe
+
+      - name: Subir artefacto descargable (GUI)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: recupe_ghost_gui-windows
           path: recupe_ghost_gui.exe
+
+      - name: Subir artefacto descargable (CLI)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: recupe_ghost-cli-windows
+          path: recupe_ghost.exe
