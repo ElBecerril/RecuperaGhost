@@ -19,6 +19,9 @@ const READ_TIMEOUT_SECS: u64 = 8;
 #[derive(Deserialize)]
 struct GitHubRelease {
     tag_name: String,
+    /// Solo se deserializa para poder afirmar en un test que NUNCA se usa como URL: lo que manda la
+    /// red no puede terminar en un `cmd /C start`. La URL se arma desde el tag (`safe_release_url`).
+    #[allow(dead_code)]
     html_url: String,
 }
 
@@ -153,18 +156,36 @@ const RELEASES_PREFIX: &str = "https://github.com/ElBecerril/RecuperaGhost/relea
 /// A dónde mandar al usuario si la URL que vino por la red no es de este repo.
 const RELEASES_FALLBACK: &str = "https://github.com/ElBecerril/RecuperaGhost/releases/latest";
 
-/// Acota la URL que llega de la red a una que de verdad apunte a los releases de este repo.
+/// URL a la que se manda al usuario, CONSTRUIDA ACÁ a partir del tag. Nada que venga por la red se
+/// reenvía tal cual.
 ///
 /// El CLI solo IMPRIME el enlace, pero la GUI lo ABRE, y en Windows `open_url` termina en
-/// `cmd /C start "" <url>`: `cmd` reinterpreta la cadena, así que una URL hostil en la respuesta de
-/// la API (API comprometida, TLS interceptado, un proxy corporativo que reescribe) pasaría de ser
-/// texto en pantalla a ejecutarse en la máquina de alguien que está justo rescatando su disco.
-///
-/// Es la misma política que ya regía para el updater cuando descargaba: la URL debe empezar con el
-/// path de ESTE repo, no con `github.com` a secas (si no, `github.com/otro/repo` pasaría el filtro).
-fn safe_release_url(url: &str) -> String {
-    if url.starts_with(RELEASES_PREFIX) {
-        url.to_string()
+/// `cmd /C start "" <url>`, donde `cmd` reinterpreta la cadena. Validar solo el PREFIJO no alcanzaba
+/// —el resto seguía llegando crudo, así que algo como
+/// `https://github.com/ElBecerril/RecuperaGhost/releases"&calc.exe&"` pasaba el filtro y `cmd`
+/// cortaba en el `&`—. Por eso acá no se filtra la URL: se arma una nueva con un tag que solo puede
+/// tener caracteres inofensivos. Si el tag trae cualquier otra cosa, se manda a la página de
+/// releases y listo.
+/// Arma el aviso a partir de la respuesta de la API. Está separado de la parte de red para poder
+/// fijar EN UN TEST que la URL nunca sale de `release.html_url` — o sea, el CABLEADO y no solo la
+/// función que lo hace bien.
+fn update_info_from(release: GitHubRelease) -> UpdateInfo {
+    UpdateInfo {
+        // La URL se arma desde el TAG, nunca desde `release.html_url`: lo que manda la red no puede
+        // llegar a un `cmd /C start`.
+        url: safe_release_url(&release.tag_name),
+        version: release.tag_name,
+    }
+}
+
+fn safe_release_url(tag: &str) -> String {
+    let tag_limpio = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'));
+    if tag_limpio {
+        format!("{RELEASES_PREFIX}/tag/{tag}")
     } else {
         RELEASES_FALLBACK.to_string()
     }
@@ -195,10 +216,7 @@ fn try_check_for_updates() -> Result<Option<UpdateInfo>, Box<dyn std::error::Err
     }
 
     // Hay una versión nueva: solo se informa (no se descarga ni se reemplaza nada).
-    Ok(Some(UpdateInfo {
-        version: release.tag_name,
-        url: safe_release_url(&release.html_url),
-    }))
+    Ok(Some(update_info_from(release)))
 }
 
 // ─── UI ─────────────────────────────────────────────────────────────────────
@@ -403,28 +421,59 @@ mod tests {
         assert!(!is_newer(&beta_next, &stable));
     }
 
-    /// La GUI ABRE esta URL (en Windows, via `cmd /C start`), asi que no puede salir de lo que
-    /// diga la red. El CLI solo la imprimia; el riesgo lo introdujo el cartel de la interfaz.
+    /// La GUI ABRE esta URL (en Windows, via `cmd /C start`, donde `cmd` reinterpreta la cadena),
+    /// asi que NADA de lo que venga por la red puede llegar ahi tal cual. La URL se arma aca desde
+    /// el tag, y el tag solo puede tener caracteres inofensivos.
+    ///
+    /// Validar solo el PREFIJO no alcanzaba: el sufijo seguia siendo libre, y una revision
+    /// adversarial mostro que `.../releases"&calc.exe&"` pasaba el filtro entero.
     #[test]
-    fn test_solo_se_abren_urls_de_releases_de_este_repo() {
-        let buena = "https://github.com/ElBecerril/RecuperaGhost/releases/tag/v9.9.9";
-        assert_eq!(safe_release_url(buena), buena);
+    fn test_la_url_se_arma_localmente_y_el_tag_no_puede_traer_sorpresas() {
+        assert_eq!(
+            safe_release_url("v0.5.2-beta.5"),
+            "https://github.com/ElBecerril/RecuperaGhost/releases/tag/v0.5.2-beta.5"
+        );
 
-        // `github.com` a secas NO alcanza: otro repo puede publicar lo que quiera.
+        // Cualquier caracter que `cmd` (o un navegador) pueda reinterpretar cae al fallback.
         for hostil in [
-            "https://github.com/atacante/malicioso/releases/tag/v1",
-            "https://evil.example/payload.exe",
-            "https://github.com.evil.example/ElBecerril/RecuperaGhost/releases",
-            "http://github.com/ElBecerril/RecuperaGhost/releases",
-            "https://github.com/ElBecerril/RecuperaGhost2/releases",
-            "\" & calc.exe & \"",
+            "v1\" & calc.exe & \"",
+            "v1&calc.exe",
+            "v1|calc",
+            "v1^x",
+            "v1>salida.txt",
+            "v1 %CD%",
+            "../../../Windows/System32/calc.exe",
+            "v1/../../otro/repo",
+            "v1?x=1",
+            "v1#frag",
             "",
         ] {
             assert_eq!(
                 safe_release_url(hostil),
                 RELEASES_FALLBACK,
-                "deberia caer al fallback: {hostil}"
+                "deberia caer al fallback: {hostil:?}"
             );
         }
+        // Y un tag absurdamente largo tampoco.
+        assert_eq!(safe_release_url(&"v".repeat(65)), RELEASES_FALLBACK);
+    }
+
+    /// El CABLEADO, no solo la funcion: que nadie vuelva a pasar `html_url` (lo que dice la red)
+    /// directamente. Una revision adversarial mostro que el test anterior probaba la funcion en
+    /// AISLAMIENTO y por eso no habria notado que se dejara de usar.
+    #[test]
+    fn test_la_url_publicada_nunca_es_la_que_manda_la_red() {
+        let json = r#"{"tag_name":"v9.9.9","html_url":"https://evil.example/payload"}"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        let info = update_info_from(release);
+        assert!(
+            !info.url.contains("evil.example"),
+            "la URL no puede venir de la red: {}",
+            info.url
+        );
+        assert_eq!(
+            info.url,
+            "https://github.com/ElBecerril/RecuperaGhost/releases/tag/v9.9.9"
+        );
     }
 }

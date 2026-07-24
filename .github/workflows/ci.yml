@@ -70,8 +70,8 @@ jobs:
       - name: Clippy de la GUI (sin warnings)
         run: cargo clippy --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu -- -D warnings
 
-      - name: Compilar la GUI
-        run: cargo build --release --locked --features gui --bin recupe_ghost_gui --target x86_64-pc-windows-gnu
+      - name: Compilar la GUI y el CLI
+        run: cargo build --release --locked --features gui --bin recupe_ghost_gui --bin recupe_ghost --target x86_64-pc-windows-gnu
 
       # Los tests de la maquina de estados de la GUI viven detras del feature `gui`, y el job
       # `test` de arriba corre SIN ese feature: sin este paso no se compilarian siquiera. Va aca
@@ -82,10 +82,8 @@ jobs:
 
       # El CLI tambien, como artefacto: es la unica forma de probar en Windows real el escaneo de
       # un DISCO FISICO crudo (alineacion a 512 bytes), que no se puede verificar en Linux ni con
-      # una imagen .img. Comparte la compilacion con el paso anterior, asi que cuesta poco.
-      - name: Compilar el CLI
-        run: cargo build --release --locked --bin recupe_ghost --target x86_64-pc-windows-gnu
-
+      # una imagen .img. Se compila EN EL MISMO paso que la GUI para compartir de verdad el trabajo:
+      # en pasos separados cambiaria el set de features y cargo recompilaria todo el arbol.
       - name: Renombrar binarios
         shell: bash
         run: |

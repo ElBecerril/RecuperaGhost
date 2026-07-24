@@ -713,51 +713,31 @@ impl RecupeGhostApp {
 
     // ── Pantallas ──
 
-    /// Aviso discreto de versión nueva, arriba de la primera pantalla.
+    /// Contenido del aviso de versión nueva. Lo dibuja `update()` en un panel PROPIO al pie de la
+    /// ventana, fuera del flujo del asistente, y en UNA sola línea.
+    ///
+    /// Las dos cosas salieron de mirarlo funcionando: metido en el contenido, el aviso llegaba
+    /// medio segundo o dos después de abrir (cuando contesta la red) y empujaba todo — arriba tapaba
+    /// la lista de discos justo cuando se iba a hacer clic, y abajo dejaba el botón "Continuar"
+    /// fuera de la pantalla, con la barra de desplazamiento desvanecida, o sea invisible para
+    /// alguien no técnico.
     ///
     /// Solo AVISA con el enlace: igual que el CLI, la GUI nunca descarga ni se reemplaza sola (ese
-    /// patrón es el que disparaba al antivirus). Va únicamente en el primer paso: interrumpir a
-    /// alguien a mitad de un rescate para ofrecerle otra descarga sería exactamente el peor momento.
-    fn ui_update_banner(&mut self, ui: &mut egui::Ui) {
-        if self.update_dismissed {
-            return;
-        }
-        let Some(info) = self.update_info.as_ref() else {
-            return;
-        };
-        let (version, url) = (info.version.clone(), info.url.clone());
-
-        egui::Frame::none()
-            .fill(theme::BRAND_TINT)
-            .stroke(egui::Stroke::new(1.0_f32, theme::BRAND))
-            .rounding(6.0)
-            .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Hay una versión más nueva de RecupeGhost ({version}). Tienes la \
-                         v{}.",
-                        crate::banner::VERSION
-                    ))
+    /// patrón es el que disparaba al antivirus). Y la URL la arma `updater` desde el tag; la que
+    /// manda la red nunca se reenvía.
+    fn ui_update_banner(&mut self, ui: &mut egui::Ui, version: &str, url: &str) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!("Hay una versión más nueva ({version})."))
                     .color(theme::TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(
-                        "Puedes seguir usando esta sin problema; la nueva se descarga e instala a mano.",
-                    )
-                    .color(theme::TEXT_WEAK),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Ver la versión nueva").clicked() {
-                        crate::ui::open_url(&url);
-                    }
-                    if ui.button("Ahora no").clicked() {
-                        self.update_dismissed = true;
-                    }
-                });
-            });
-        ui.add_space(10.0);
+            );
+            if ui.button("Ver cuál es").clicked() {
+                crate::ui::open_url(url);
+            }
+            if ui.button("Ahora no").clicked() {
+                self.update_dismissed = true;
+            }
+        });
     }
 
     /// Barra de pasos del asistente. Responde sin que haya que preguntar "¿cuánto falta?", que es
@@ -907,7 +887,6 @@ impl RecupeGhostApp {
         // (medio segundo o dos después de abrir), o sea con la persona ya mirando la lista de
         // discos. Puesto arriba, empujaba la lista hacia abajo justo cuando se iba a hacer clic y
         // el clic caía en otro disco — y esta es la pantalla que decide QUÉ se escanea.
-        self.ui_update_banner(ui);
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -1771,6 +1750,34 @@ impl eframe::App for RecupeGhostApp {
         // de protección de datos no puede quedar dando vueltas mientras el estado que la motivó
         // cambia atrás.
         let blocked = self.pending_warning.is_some();
+
+        // El aviso de versión nueva va en su propio panel al pie: así no mueve nada del asistente
+        // cuando llega, y se ve entero siempre (ver `ui_update_banner`).
+        let aviso = match (
+            &self.phase,
+            self.update_dismissed,
+            self.update_info.as_ref(),
+        ) {
+            (Phase::Setup(Step::Source), false, Some(info)) => {
+                Some((info.version.clone(), info.url.clone()))
+            }
+            _ => None,
+        };
+        if let Some((version, url)) = aviso {
+            egui::TopBottomPanel::bottom("aviso_version")
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme::BRAND_TINT)
+                        .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+                )
+                .show(ctx, |ui| {
+                    if blocked {
+                        ui.disable();
+                    }
+                    self.ui_update_banner(ui, &version, &url);
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if blocked {
                 ui.disable();

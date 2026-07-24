@@ -196,11 +196,12 @@ pub struct FrameChain {
     pub sample_rate: Option<u32>,
 }
 
-/// Largo del frame MPEG Audio que empieza en `pos`, y su índice de sample rate.
+/// Largo del frame MPEG Audio que empieza en `pos`, y su sample rate en Hz.
 ///
-/// El largo sale de la fórmula estándar de MPEG1 Layer III
-/// (144000 * bitrate_kbps / sample_rate_hz + padding) con los campos del propio header. Devuelve
-/// `None` si ahí no hay un header estructuralmente válido (o si no quedan bytes para leerlo).
+/// El largo depende de la VERSIÓN y la CAPA, que se leen del propio header: las muestras por frame
+/// son 384 en Layer I, 1152 en Layer II, y 1152 o 576 en Layer III según sea MPEG-1 o MPEG-2/2.5.
+/// Devuelve `None` si ahí no hay un header estructuralmente válido (o si no quedan bytes para
+/// leerlo).
 fn mpeg_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u32)> {
     let h = bytes.get(pos..pos.checked_add(4)?)?;
     if h[0] != 0xFF || (h[1] & 0xE0) != 0xE0 {
@@ -258,7 +259,7 @@ fn mpeg_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u32)> {
     Some((frame_len, sample_rate_hz))
 }
 
-/// Largo del frame ADTS (AAC) que empieza en `pos`, y su índice de sample rate.
+/// Largo del frame ADTS (AAC) que empieza en `pos`, y su sample rate en Hz.
 ///
 /// A diferencia de MP3, ADTS trae el largo EXPLÍCITO en 13 bits repartidos en los bytes 3-5.
 fn adts_frame_at(bytes: &[u8], pos: usize) -> Option<(usize, u32)> {
@@ -461,13 +462,19 @@ pub const ISOBMFF_MIN_BOXES: usize = 2;
 /// 3 MB "encadena" con cualquier cosa que parezca una caja al final de ese rango, se declara
 /// contenedor confiable, y `suppress_contained` borra las fotos REALES que quedaron adentro. En la
 /// prueba desaparecían 6 JPEG sin ningún aviso.
-pub const ISOBMFF_MAX_FTYP: u64 = 1024;
+pub const ISOBMFF_MAX_FTYP: u64 = 4096;
 
-/// Tope de cajas a recorrer. Sin esto, un candidato falso cuyas "cajas" midan el mínimo de 8 bytes
-/// obliga a 268 millones de lecturas de 16 bytes para agotar los 2 GB de `max_size` de un MP4:
-/// medido, 8.5 segundos por candidato con solo 50 MB de cajas mínimas. Ningún archivo real anda
-/// cerca de este número (un MP4 normal tiene unas pocas cajas de nivel superior).
-pub const ISOBMFF_MAX_BOXES: usize = 4096;
+/// Tope de cajas MIENTRAS no se haya visto el índice (`moov`/`moof`/`meta`). Acota el costo de un
+/// candidato falso —que sin esto obliga a millones de lecturas para agotar los 2 GB de `max_size` de
+/// un MP4— sin estorbar a los archivos reales: un MP4 normal tiene 3 o 4 cajas de nivel superior, y
+/// uno fragmentado encuentra su `moof` en la segunda.
+pub const ISOBMFF_MAX_BOXES_SIN_INDICE: usize = 64;
+
+/// Tope una vez visto el índice, o sea cuando ya se sabe que se está recorriendo un archivo de
+/// verdad. Un tope bajo acá fue un bug REAL: con 4096, un MP4 FRAGMENTADO (un par `moof`+`mdat` por
+/// fragmento) se pasaba a los 68 segundos de grabación a 30 fps, y a partir de ahí el archivo se
+/// carveaba hasta el tope de la firma. Medido: un video real de 908 KB salía como 100.9 MB.
+pub const ISOBMFF_MAX_BOXES: usize = 1_000_000;
 
 /// Resultado de leer el header de una caja.
 pub enum BoxLen {
@@ -519,12 +526,18 @@ fn isobmff_box_type_at(bytes: &[u8], pos: usize) -> Option<[u8; 4]> {
 
 /// Largo de la caja que empieza al inicio de `bytes`, para quien lee de a un header por vez del
 /// disco.
-pub fn isobmff_box_len_at(bytes: &[u8]) -> BoxLen {
-    isobmff_box_len(bytes, 0)
+pub fn isobmff_box_len_at(bytes: &[u8], primera: bool) -> BoxLen {
+    isobmff_box_len(bytes, 0, primera)
 }
 
 /// Largo de la caja que empieza en `pos`.
-fn isobmff_box_len(bytes: &[u8], pos: usize) -> BoxLen {
+///
+/// `primera` indica si es la caja inicial del archivo (el `ftyp`): ahí `size == 0` —"esta caja
+/// llega hasta el fin del archivo"— es IMPOSIBLE por norma, porque `ftyp` nunca es la última caja
+/// y siempre tiene contenido. Aceptarlo fue un bug: los 8 bytes `00 00 00 00 "ftyp"` aparecen a
+/// montones dentro de binarios normales, y cada uno se convertía en un "video" carveado hasta el
+/// tope de la firma. Medido sobre 414 MB de binarios del sistema: 1530 MB de MP4 falsos.
+fn isobmff_box_len(bytes: &[u8], pos: usize, primera: bool) -> BoxLen {
     let Some(end) = pos.checked_add(ISOBMFF_BOX_HEADER) else {
         return BoxLen::Invalid;
     };
@@ -554,6 +567,7 @@ fn isobmff_box_len(bytes: &[u8], pos: usize) -> BoxLen {
                 None => BoxLen::Invalid,
             }
         }
+        0 if primera => BoxLen::Invalid,
         0 => BoxLen::ToEndOfFile,
         // Una caja no puede medir menos que su propio header.
         s if s < ISOBMFF_BOX_HEADER as u64 => BoxLen::Invalid,
@@ -587,7 +601,12 @@ pub fn walk_isobmff_boxes(bytes: &[u8], max_boxes: usize) -> BoxChain {
     let mut to_end_of_file = false;
 
     let stop = loop {
-        if boxes >= max_boxes.min(ISOBMFF_MAX_BOXES) {
+        let tope = if has_index {
+            ISOBMFF_MAX_BOXES
+        } else {
+            ISOBMFF_MAX_BOXES_SIN_INDICE
+        };
+        if boxes >= max_boxes.min(tope) {
             break ChainStop::Capped;
         }
         if pos.saturating_add(ISOBMFF_BOX_HEADER) > bytes.len() {
@@ -604,7 +623,7 @@ pub fn walk_isobmff_boxes(bytes: &[u8], max_boxes: usize) -> BoxChain {
             // Empieza el archivo siguiente: este termina acá, y termina limpio.
             break ChainStop::BadData;
         }
-        match isobmff_box_len(bytes, pos) {
+        match isobmff_box_len(bytes, pos, boxes == 0) {
             BoxLen::Bytes(len) => {
                 if boxes == 0 && len > ISOBMFF_MAX_FTYP {
                     // Un `ftyp` enorme no es un archivo: es un falso positivo que englobaría a los
@@ -657,9 +676,11 @@ pub fn isobmff_end(bytes: &[u8], at_source_end: bool) -> Option<usize> {
         return None;
     }
     if chain.to_end_of_file {
-        // La última caja llega "hasta el final del archivo", pero en una imagen de disco no hay
-        // forma de saber dónde termina de verdad: lo que sigue puede ser el archivo siguiente. No se
-        // afirma nada — se recupera igual (queda como no verificable), sin declararlo íntegro.
+        // La última caja llega "hasta el final del archivo", y en una imagen de disco no hay forma
+        // de saber dónde es eso: lo que sigue puede ser el archivo siguiente, o relleno. Ni siquiera
+        // cuando los datos disponibles se acaban ahí se puede afirmar — el final de lo LEÍDO no es
+        // el final del ARCHIVO. El pase de refinamiento lo resuelve como tamaño supuesto: se
+        // recupera, sin declararlo íntegro.
         let _ = at_source_end;
         return None;
     }

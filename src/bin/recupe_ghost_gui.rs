@@ -38,7 +38,7 @@ fn main() {
                  virtuales, escritorio remoto o computadoras viejas). Prueba actualizar Windows y \
                  los drivers de video, y vuelve a intentar.\n\nMientras tanto puedes usar la versión \
                  de línea de comandos (recupe_ghost.exe), que hace lo mismo sin necesitar video.\n\n\
-                 Detalle técnico (por si pedís ayuda):\n{e}"
+                 Detalle técnico (por si pides ayuda):\n{e}"
             ))
             .show();
         std::process::exit(1);
